@@ -9,9 +9,11 @@ license.workspace = true
 ahash.workspace = true
 arrow.workspace = true
 chrono.workspace = true
+datafusion.workspace = true
 pest.workspace = true
 pest_derive.workspace = true
 rkyv.workspace = true
+tokio.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

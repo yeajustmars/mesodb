@@ -23,6 +23,12 @@ pub enum MesoError {
 
     #[error("I/O Error: {0}")]
     Io(#[from] io::Error),
+
+    #[error("Query Planning Error: {0}")]
+    PlanError(String),
+
+    #[error("DataFusion Execution Error: {0}")]
+    DataFusion(#[from] datafusion::error::DataFusionError),
 }
 
 pub type Result<T> = std::result::Result<T, MesoError>;
