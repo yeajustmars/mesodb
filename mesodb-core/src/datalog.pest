@@ -1,0 +1,54 @@
+// mesodb-core/src/datalog.pest
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" | "," }
+
+// --- Primitives ---
+ident    = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_" | "-")* }
+variable = @{ "?" ~ ident }
+keyword  = @{ ":" ~ ident ~ ("/" ~ ident)? }
+blank    = { "_" }
+boolean  = { "true" | "false" }
+data_src = { "$" | "%" }
+
+float    = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+integer  = @{ "-"? ~ ASCII_DIGIT+ }
+
+inner    = @{ (!"\"" ~ ANY)* }
+string   = ${ "\"" ~ inner ~ "\"" }
+
+// Added `data_src` so functions can accept `$` as an argument
+term = { blank | boolean | variable | keyword | string | float | integer | data_src }
+
+// --- Find Clause ---
+pull_attr    = { keyword | pull_map }
+pull_map     = { "{" ~ keyword ~ pull_pattern ~ "}" }
+pull_pattern = { "[" ~ pull_attr+ ~ "]" }
+pull_expr    = { "(" ~ "pull" ~ variable ~ pull_pattern ~ ")" }
+
+aggr_expr    = { "(" ~ ident ~ variable ~ ")" }
+
+find_elem    = { pull_expr | aggr_expr | variable }
+find_clause  = { ":find" ~ find_elem+ }
+
+// --- In Clause ---
+in_elem      = { data_src | variable }
+in_clause    = { ":in" ~ in_elem+ }
+
+// --- Where Clause ---
+data_pattern = { "[" ~ term ~ term ~ term ~ term? ~ "]" }
+rule_expr    = { "(" ~ ident ~ term+ ~ ")" }
+
+// --- NEW: Function Expressions & Bindings ---
+fn_expr        = { "(" ~ ident ~ term+ ~ ")" }
+binding_rel    = { "[[" ~ variable+ ~ "]]" }
+binding_tuple  = { "[" ~ variable+ ~ "]" }
+binding_scalar = { variable }
+binding        = { binding_rel | binding_tuple | binding_scalar }
+fn_clause      = { "[" ~ fn_expr ~ binding ~ "]" }
+
+// Added fn_clause to the possible elements
+where_elem   = { fn_clause | data_pattern | rule_expr }
+where_clause = { ":where" ~ where_elem+ }
+
+// --- Root ---
+query = { SOI ~ "[" ~ find_clause ~ in_clause? ~ where_clause ~ "]" ~ EOI }

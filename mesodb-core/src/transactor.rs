@@ -1,6 +1,7 @@
+use std::path::Path;
+
 use ahash::AHashMap;
 use chrono::Utc;
-use std::path::Path;
 
 use crate::datom::Datom;
 use crate::error::{MesoError, Result};
@@ -199,6 +200,7 @@ impl Transactor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::f64::consts::PI;
     use tempfile::NamedTempFile;
 
     /// Helper to boot a fresh Transactor with a comprehensive schema for testing.
@@ -467,7 +469,7 @@ mod tests {
         t.transact(vec![Fact {
             e: 1,
             ident: ":math/pi".to_string(),
-            v: Value::Float64(std::f64::consts::PI),
+            v: Value::Float64(PI),
             op: true,
         }])
         .unwrap();
@@ -475,7 +477,7 @@ mod tests {
         let result = t.transact(vec![Fact {
             e: 2,
             ident: ":math/pi".to_string(),
-            v: Value::Float64(std::f64::consts::PI),
+            v: Value::Float64(PI),
             op: true,
         }]);
 

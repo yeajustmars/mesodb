@@ -21,6 +21,10 @@ ahash = "0.8.12"
 chrono = "0.4.44"
 rkyv = "0.8.16"
 
+# Parsing & Query
+pest = "2.8.6"
+pest_derive = "2.8.6"
+
 # Async & Web
 tokio = { version = "1.52.2", features = ["full"] }
 axum = "0.8.9"

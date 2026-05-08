@@ -6,10 +6,11 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-# Inherited dependencies
-arrow.workspace = true
 ahash.workspace = true
+arrow.workspace = true
 chrono.workspace = true
+pest.workspace = true
+pest_derive.workspace = true
 rkyv.workspace = true
 thiserror.workspace = true
 
