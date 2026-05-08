@@ -1,0 +1,19 @@
+2. The "Context Memo"
+If you start a new chat, copy and paste this "MesoDB Status Report" to me (or any Gemini instance). It contains the technical context needed to resume immediately:
+
+Project: MesoDB (Datalog on Apache Arrow/DataFusion)
+Current Status: > - Storage: Write-Ahead Log (WAL) + Arrow MemTable (Wide-column layout: e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid, t, op).
+
+Parsing: Pest-based grammar supporting Datalog basics, Pull syntax, :in variables, and Function Expressions (Full-text search).
+
+Planning: Query Planner translates AST to DataFusion LogicalPlan using a column-aliasing strategy to handle duplicate variable joins (DataFusion v53.1.0 compatible).
+
+CLI: Functional REPL using rustyline and comfy-table.
+Next Milestone: Implementing MemTable rotation/snapshots (to allow multiple queries without memory loss) or building the HTTP Server.
+
+3. Keep the Chat History
+If you are using the Gemini web interface, this conversation is saved in your History sidebar on the left. You can simply click back into this specific chat thread tomorrow, and I will remember every line of code we've written together.
+
+Rest up! Whenever you're ready to come back, we’ll be standing right at the edge of turning this from a CLI tool into a networked HTTP Database Server.
+
+See you then!
