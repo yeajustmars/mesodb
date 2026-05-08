@@ -10,4 +10,8 @@ license.workspace = true
 arrow.workspace = true
 ahash.workspace = true
 chrono.workspace = true
+rkyv.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
