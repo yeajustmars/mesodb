@@ -1,0 +1,11 @@
+[package]
+name = "mesodb-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+mesodb-core.workspace = true
+tokio.workspace = true
+color-eyre.workspace = true

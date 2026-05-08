@@ -1,0 +1,13 @@
+[package]
+name = "mesodb-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Inherited dependencies
+arrow.workspace = true
+ahash.workspace = true
+chrono.workspace = true
+thiserror.workspace = true

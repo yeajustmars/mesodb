@@ -1,0 +1,17 @@
+[package]
+name = "mesodb-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+# Link to our core library using the workspace path
+mesodb-core.workspace = true
+
+# Inherited binary dependencies
+tokio.workspace = true
+axum.workspace = true
+color-eyre.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
