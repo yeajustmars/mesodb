@@ -1,3 +1,2 @@
 # MesoDB
 
-MesoDB is a high-performance, distributed database designed for handling large volumes of data with low latency. It is built on top of a scalable architecture that allows it to efficiently manage and query data across multiple nodes. MesoDB is inspired by Datomic, Datahike, DataScript and XTDB, and incorporates features such as immutability, time-travel queries, and a flexible schema. It is suitable for a wide range of applications, including real-time analytics, event sourcing, and complex data modeling. MesoDB is open-source and can be easily integrated into existing systems, providing a powerful solution for modern data management needs.
