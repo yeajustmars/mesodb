@@ -118,4 +118,29 @@ mod tests {
         // 4. Test missing lookup
         assert!(schema.get_by_ident(":does/not_exist").is_none());
     }
+
+    #[test]
+    fn test_schema_auto_increment() {
+        let mut schema = SchemaMap::new();
+
+        let a1 = schema.add_attribute(":sys/a", ValueType::Boolean, false);
+        let a2 = schema.add_attribute(":sys/b", ValueType::Boolean, false);
+        let a3 = schema.add_attribute(":sys/c", ValueType::Boolean, false);
+
+        assert_eq!(a1.id, 100);
+        assert_eq!(a2.id, 101);
+        assert_eq!(a3.id, 102);
+    }
+
+    #[test]
+    fn test_schema_contains_and_missing() {
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/name", ValueType::String, false);
+
+        assert!(schema.contains_ident(":user/name"));
+        assert!(!schema.contains_ident(":user/ghost"));
+
+        assert!(schema.get_by_ident(":user/ghost").is_none());
+        assert!(schema.get_by_id(9999).is_none());
+    }
 }

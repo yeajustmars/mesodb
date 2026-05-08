@@ -216,4 +216,39 @@ mod tests {
             &DataType::FixedSizeBinary(16)
         );
     }
+
+    #[test]
+    fn test_memtable_alignment_all_types() {
+        let mut memtable = MemTable::new(10);
+        let now = Utc::now().timestamp_micros();
+
+        // Insert one of EVERY type to ensure the null-padding aligns perfectly
+        memtable.append(Datom::assert(1, 1, Value::Boolean(true), 1, now));
+        memtable.append(Datom::assert(1, 2, Value::Int64(42), 1, now));
+        memtable.append(Datom::assert(1, 3, Value::Float64(4.14), 1, now));
+        memtable.append(Datom::assert(1, 4, Value::String("test".into()), 1, now));
+        memtable.append(Datom::assert(1, 5, Value::Ref(99), 1, now));
+        memtable.append(Datom::assert(1, 6, Value::Timestamp(now), 1, now));
+        memtable.append(Datom::assert(1, 7, Value::Uuid([2u8; 16]), 1, now));
+
+        let batch = memtable.finish().expect("Failed to build batch");
+
+        // If the arrays were misaligned (e.g., forgot an append_null), finish() would have panicked.
+        assert_eq!(batch.num_rows(), 7);
+        assert_eq!(batch.num_columns(), 13);
+    }
+
+    #[test]
+    fn test_memtable_capacity_growth() {
+        // Intentionally start with a tiny capacity
+        let mut memtable = MemTable::new(2);
+
+        // Force it to reallocate multiple times
+        for i in 0..100 {
+            memtable.append(Datom::assert(i, 10, Value::Int64(i as i64), 1, 0));
+        }
+
+        let batch = memtable.finish().unwrap();
+        assert_eq!(batch.num_rows(), 100);
+    }
 }

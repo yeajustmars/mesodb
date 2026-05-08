@@ -102,4 +102,47 @@ mod tests {
         assert_eq!(recovered[1].v, Value::String("Alice".to_string()));
         assert_eq!(recovered[2].e, 2);
     }
+
+    #[test]
+    fn test_wal_empty_batch() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut wal = Wal::open(temp_file.path()).unwrap();
+
+        // Appending an empty vector should instantly return Ok(()) without writing bytes
+        assert!(wal.append_batch(&vec![]).is_ok());
+
+        let mut recovering_wal = Wal::open(temp_file.path()).unwrap();
+        let recovered = recovering_wal.recover().unwrap();
+        assert!(recovered.is_empty());
+    }
+
+    #[test]
+    fn test_wal_corruption_resistance() {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut wal = Wal::open(temp_file.path()).unwrap();
+
+        // 1. Write a valid batch
+        let valid_batch = vec![Datom::assert(1, 10, Value::Int64(100), 1, 1000)];
+        wal.append_batch(&valid_batch).unwrap();
+
+        // 2. Simulate disk corruption by writing garbage directly to the file
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(temp_file.path())
+            .unwrap();
+        // Write a fake length prefix (4 bytes) then some garbage
+        file.write_all(&9u32.to_le_bytes()).unwrap();
+        file.write_all(b"BAD_BYTES").unwrap();
+
+        // 3. Attempt recovery
+        let mut recovering_wal = Wal::open(temp_file.path()).unwrap();
+        let result = recovering_wal.recover();
+
+        // The bytecheck validation should catch the corruption and return an Err
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
 }
