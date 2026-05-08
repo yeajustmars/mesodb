@@ -12,6 +12,7 @@ use crate::types::Value;
 /// The in-memory Arrow builder for MesoDB's bitemporal data.
 /// It converts row-based `Datom` structs into a strictly typed,
 /// columnar `RecordBatch` optimized for zero-copy Parquet flushes.
+#[derive(Debug)]
 pub struct MemTable {
     // Core Datom Identity
     e: UInt64Builder,

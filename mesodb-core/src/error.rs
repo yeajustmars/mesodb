@@ -1,6 +1,8 @@
 use std::io;
+
 use thiserror::Error;
 
+use crate::parser::ParseError;
 use crate::schema::ValueType;
 use crate::types::Value;
 
@@ -29,6 +31,13 @@ pub enum MesoError {
 
     #[error("DataFusion Execution Error: {0}")]
     DataFusion(#[from] datafusion::error::DataFusionError),
+
+    // Inside pub enum MesoError { ... }
+    #[error("Parse Error: {0}")]
+    Parser(#[from] ParseError),
+
+    #[error("Arrow Error: {0}")]
+    Arrow(#[from] datafusion::arrow::error::ArrowError),
 }
 
 pub type Result<T> = std::result::Result<T, MesoError>;

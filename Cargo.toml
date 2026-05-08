@@ -36,5 +36,10 @@ color-eyre = "0.6.5"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
+# CLI
+# TODO: replace with clap
+rustyline = "14.0.0" # TODO: update to most recent version
+comfy-table = "7.1.1" # TODO: update to most recent version
+
 # Testing, dev, misc.
 tempfile = "3.27.0"

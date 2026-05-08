@@ -9,3 +9,8 @@ license.workspace = true
 mesodb-core.workspace = true
 tokio.workspace = true
 color-eyre.workspace = true
+
+# TODO: look if we need these after basic test
+rustyline.workspace = true
+comfy-table.workspace = true
+datafusion.workspace = true
