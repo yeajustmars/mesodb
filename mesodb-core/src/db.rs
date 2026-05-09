@@ -18,8 +18,22 @@ pub struct MesoDB {
 
 impl MesoDB {
     pub fn open<P: AsRef<Path>>(path: P, schema: SchemaMap) -> Result<Self> {
-        let transactor = Transactor::new(path, schema)?;
+        let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel(32);
+        let data_dir = path.as_ref().to_path_buf();
+
+        // Start the background persistence worker
+        tokio::spawn(async move {
+            let compactor = crate::storage::BackgroundCompactor::new(data_dir);
+            let mut batch_count = 0;
+            while let Some(batch) = flush_rx.recv().await {
+                let _ = compactor.flush_to_parquet(batch, batch_count);
+                batch_count += 1;
+            }
+        });
+
+        let transactor = Transactor::new(path, schema, flush_tx)?;
         let ctx = SessionContext::new();
+
         Ok(Self { transactor, ctx })
     }
 

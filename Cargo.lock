@@ -2316,6 +2316,7 @@ dependencies = [
  "chrono",
  "datafusion",
  "ordered-float 5.3.0",
+ "parquet",
  "pest",
  "pest_derive",
  "rkyv",

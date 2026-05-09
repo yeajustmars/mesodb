@@ -4,6 +4,7 @@ use arrow::record_batch::RecordBatch;
 use chrono::Utc;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
+use tokio::sync::mpsc::Sender;
 
 use crate::config::Config;
 use crate::datom::Datom;
@@ -37,10 +38,15 @@ pub struct Transactor {
     pub indices: IndexManager,
     pub frozen_history: Arc<RwLock<Vec<RecordBatch>>>,
     pub current_tx_id: TxId,
+    pub flush_tx: tokio::sync::mpsc::Sender<RecordBatch>,
 }
 
 impl Transactor {
-    pub fn new<P: AsRef<Path>>(wal_path: P, schema: SchemaMap) -> Result<Self> {
+    pub fn new<P: AsRef<Path>>(
+        wal_path: P,
+        schema: SchemaMap,
+        flush_tx: Sender<RecordBatch>,
+    ) -> Result<Self> {
         let config = Config::default(); // TODO: allow passing custom config
         let mut wal = Wal::open(wal_path)?;
         let mut active_memtable = MemTable::new(1024);
@@ -76,6 +82,7 @@ impl Transactor {
             indices,
             frozen_history: Arc::new(RwLock::new(Vec::new())),
             current_tx_id,
+            flush_tx,
         })
     }
 
@@ -193,15 +200,26 @@ impl Transactor {
 
     /// Freezes the current memtable and initializes a fresh one.
     fn rotate_active_memtable(&mut self) -> Result<()> {
-        // finish() converts builders into an immutable RecordBatch
+        // finish() converts builders into an immutable RecordBatch [cite: 241, 242]
         let batch = self.active_memtable.finish()?;
 
+        // 1. Keep in RAM for immediate query access
         {
             let mut history = self.frozen_history.write().unwrap();
-            history.push(batch);
+            history.push(batch.clone());
         }
 
-        // Reset with pre-allocated capacity from config
+        // 2. Send to background flusher (Non-blocking)
+        // Using try_send ensures the transactor never stalls if the disk is slow.
+        if let Err(e) = self.flush_tx.try_send(batch) {
+            // In production, we log this but keep going because the batch is safe in history RAM.
+            eprintln!(
+                "Warning: Background flusher busy, batch queued in RAM: {}",
+                e
+            );
+        }
+
+        // 3. Reset Builders with pre-allocated capacity from config [cite: 231, 232]
         self.active_memtable = MemTable::new(self.config.storage.memtable_initial_capacity);
 
         Ok(())
@@ -217,6 +235,7 @@ mod tests {
     fn setup_transactor() -> (Transactor, NamedTempFile) {
         let temp_file = NamedTempFile::new().unwrap();
         let mut schema = SchemaMap::new();
+
         schema.add_attribute(":user/name", ValueType::String, false);
         schema.add_attribute(":user/email", ValueType::String, true);
         schema.add_attribute(":user/age", ValueType::Int64, false);
@@ -224,7 +243,10 @@ mod tests {
         schema.add_attribute(":sys/uuid", ValueType::Uuid, true);
         schema.add_attribute(":user/friend", ValueType::Ref, false);
         schema.add_attribute(":flag/unique_bool", ValueType::Boolean, true);
-        let transactor = Transactor::new(temp_file.path(), schema).unwrap();
+
+        let (flush_tx, _flush_rx) = tokio::sync::mpsc::channel(1);
+        let transactor = Transactor::new(temp_file.path(), schema, flush_tx).unwrap();
+
         (transactor, temp_file)
     }
 
@@ -509,7 +531,8 @@ mod tests {
         let mut schema = SchemaMap::new();
         schema.add_attribute(":user/email", ValueType::String, true);
         {
-            let mut t1 = Transactor::new(temp_file.path(), schema.clone()).unwrap();
+            let (tx, _) = tokio::sync::mpsc::channel(1);
+            let mut t1 = Transactor::new(temp_file.path(), schema.clone(), tx).unwrap();
             t1.transact(vec![Fact {
                 e: 10,
                 ident: ":user/email".into(),
@@ -518,7 +541,8 @@ mod tests {
             }])
             .unwrap();
         }
-        let mut t2 = Transactor::new(temp_file.path(), schema).unwrap();
+        let (tx2, _) = tokio::sync::mpsc::channel(1);
+        let mut t2 = Transactor::new(temp_file.path(), schema, tx2).unwrap();
         assert!(
             t2.transact(vec![Fact {
                 e: 11,

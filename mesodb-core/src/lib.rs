@@ -9,6 +9,7 @@ pub mod memtable;
 pub mod parser;
 pub mod planner;
 pub mod schema;
+pub mod storage;
 pub mod transactor;
 pub mod types;
 pub mod wal;

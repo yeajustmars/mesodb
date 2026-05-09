@@ -38,6 +38,9 @@ pub enum MesoError {
 
     #[error("Arrow Error: {0}")]
     Arrow(#[from] datafusion::arrow::error::ArrowError),
+
+    #[error("Parquet Error: {0}")]
+    Parquet(#[from] parquet::errors::ParquetError), // Add this line
 }
 
 pub type Result<T> = std::result::Result<T, MesoError>;
