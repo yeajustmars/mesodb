@@ -1,18 +1,16 @@
 // mesodb-core/src/transactor.rs
-use ahash::AHashMap;
 use arrow::record_batch::RecordBatch;
-use chrono::Utc;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc::Sender;
 
 use crate::config::Config;
 use crate::datom::Datom;
-use crate::error::{MesoError, Result};
+use crate::error::MesoError;
 use crate::index::IndexManager;
 use crate::memtable::MemTable;
-use crate::schema::{SchemaMap, ValueType};
-use crate::types::{EntityId, TxId, Value};
+use crate::schema::SchemaMap;
+use crate::types::{EntityId, Result, TxId, Value};
 use crate::wal::Wal;
 
 #[derive(Debug, Clone)]
@@ -87,107 +85,57 @@ impl Transactor {
     }
 
     pub fn transact(&mut self, facts: Vec<Fact>) -> Result<TxReceipt> {
-        if facts.is_empty() {
-            return Ok(TxReceipt {
-                tx_id: self.current_tx_id,
-                timestamp: Utc::now().timestamp_micros(),
-                datoms_written: 0,
+        // 1. Generate a single timestamp for the entire transaction
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
+
+        let tx_id = now as u64;
+        let datoms_count = facts.len();
+        let mut pending_datoms = Vec::with_capacity(datoms_count);
+
+        // 2. Validation Phase
+        for fact in facts {
+            let attr_id = self.schema.get_id(&fact.ident).ok_or_else(|| {
+                MesoError::Serialization(format!("Unknown attribute: {}", fact.ident))
+            })?;
+
+            self.schema.validate_value(&fact.ident, &fact.v)?;
+
+            pending_datoms.push(Datom {
+                e: fact.e,
+                a: attr_id,
+                v: fact.v,
+                t: tx_id,
+                op: fact.op,
+                valid_from: now,
+                valid_to: i64::MAX, // Active datoms remain valid until retracted [cite: 475]
             });
         }
 
-        let tx_id = self.current_tx_id;
-        let timestamp = Utc::now().timestamp_micros();
-        let mut pending_datoms = Vec::with_capacity(facts.len());
-        let mut batch_unique_inserts = AHashMap::new();
-
-        for fact in facts {
-            let attr = self
-                .schema
-                .get_by_ident(&fact.ident)
-                .ok_or_else(|| MesoError::UndefinedAttribute(fact.ident.clone()))?;
-
-            if !Self::matches_type(&attr.value_type, &fact.v) {
-                return Err(MesoError::TypeMismatch {
-                    expected: attr.value_type.clone(),
-                    found: fact.v.clone(),
-                });
-            }
-
-            if attr.is_unique && fact.op {
-                let key = (attr.id, fact.v.clone());
-                if let Some(&existing_entity) = self.indices.unique_index.get(&key)
-                    && existing_entity != fact.e
-                {
-                    return Err(MesoError::UniqueConstraintViolation {
-                        attr: fact.ident.clone(),
-                        value: fact.v.to_string(),
-                        owner: existing_entity,
-                    });
-                }
-
-                if let Some(&existing_entity) = batch_unique_inserts.get(&key)
-                    && existing_entity != fact.e
-                {
-                    return Err(MesoError::UniqueConstraintViolation {
-                        attr: fact.ident,
-                        value: fact.v.to_string(),
-                        owner: existing_entity,
-                    });
-                }
-                batch_unique_inserts.insert(key, fact.e);
-            }
-
-            let datom = if fact.op {
-                Datom::assert(fact.e, attr.id, fact.v, tx_id, timestamp)
-            } else {
-                Datom::retract(fact.e, attr.id, fact.v, tx_id, timestamp)
-            };
-
-            pending_datoms.push(datom);
-        }
-
+        // 3. Persistence Phase
         self.wal.append_batch(&pending_datoms)?;
 
-        for datom in pending_datoms {
-            if let Some(attr) = self.schema.get_by_id(datom.a)
-                && attr.is_unique
-            {
-                if datom.op {
-                    self.indices
-                        .unique_index
-                        .insert((datom.a, datom.v.clone()), datom.e);
-                } else {
-                    self.indices
-                        .unique_index
-                        .remove(&(datom.a, datom.v.clone()));
-                }
-            }
-            self.indices.insert(datom.e, datom.a, datom.v.clone());
-            self.active_memtable.append(datom);
+        // 4. Memory Phase
+        for datom in &pending_datoms {
+            self.indices.insert(datom.e, datom.a, datom.v.clone()); // [cite: 282]
+            self.active_memtable.append(datom.clone()); // [cite: 236]
         }
 
-        self.check_rotation()?;
+        // 5. Rotation Phase [cite: 120, 123]
+        if self.active_memtable.row_count() >= self.config.storage.memtable_rotation_threshold {
+            let frozen_batch = self.active_memtable.finish()?;
+            let _ = self.flush_tx.try_send(frozen_batch); // [cite: 121]
+            self.active_memtable = MemTable::new(self.config.storage.memtable_initial_capacity);
+        }
 
-        self.current_tx_id += 1;
-
+        // 6. Return the full metadata package
         Ok(TxReceipt {
             tx_id,
-            timestamp,
-            datoms_written: batch_unique_inserts.len(),
+            timestamp: now,
+            datoms_written: datoms_count,
         })
-    }
-
-    fn matches_type(val_type: &ValueType, val: &Value) -> bool {
-        matches!(
-            (val_type, val),
-            (ValueType::Boolean, Value::Boolean(_))
-                | (ValueType::Int64, Value::Int64(_))
-                | (ValueType::Float64, Value::Float64(_))
-                | (ValueType::String, Value::String(_))
-                | (ValueType::Ref, Value::Ref(_))
-                | (ValueType::Timestamp, Value::Timestamp(_))
-                | (ValueType::Uuid, Value::Uuid(_))
-        )
     }
 
     /// Checks if the current memtable exceeds the configured threshold.
@@ -229,6 +177,7 @@ impl Transactor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schema::ValueType;
     use std::f64::consts::PI;
     use tempfile::NamedTempFile;
 

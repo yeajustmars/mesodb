@@ -3,6 +3,10 @@ use rkyv::{Archive, Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fmt;
 
+use crate::error::MesoError;
+
+pub type Result<T> = std::result::Result<T, MesoError>;
+
 pub type EntityId = u64;
 pub type AttributeId = u32;
 pub type TxId = u64;

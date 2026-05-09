@@ -1,7 +1,6 @@
 // mesodb-core/src/memtable.rs
 use crate::datom::Datom;
-use crate::error::Result;
-use crate::types::Value;
+use crate::types::{Result, Value};
 use arrow::array::*;
 use arrow::datatypes::*;
 use arrow::record_batch::RecordBatch;

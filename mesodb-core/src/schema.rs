@@ -1,7 +1,8 @@
 use ahash::AHashMap;
 use std::sync::Arc;
 
-use crate::types::AttributeId;
+use crate::error::MesoError;
+use crate::types::{AttributeId, Result};
 
 /// Represents the physical data types that MesoDB supports.
 /// This maps directly to our `Value` enum and Arrow MemTable arrays.
@@ -86,6 +87,30 @@ impl SchemaMap {
     /// Checks if a string identifier already exists.
     pub fn contains_ident(&self, ident: &str) -> bool {
         self.by_ident.contains_key(ident)
+    }
+
+    pub fn validate_value(&self, ident: &str, value: &crate::types::Value) -> Result<()> {
+        let attr = self
+            .by_ident
+            .get(ident)
+            .ok_or_else(|| MesoError::Serialization(format!("Attribute {} not found", ident)))?;
+
+        match (&attr.value_type, value) {
+            (ValueType::Int64, crate::types::Value::Int64(_)) => Ok(()),
+            (ValueType::String, crate::types::Value::String(_)) => Ok(()),
+            (ValueType::Boolean, crate::types::Value::Boolean(_)) => Ok(()),
+            (ValueType::Float64, crate::types::Value::Float64(_)) => Ok(()),
+            (ValueType::Uuid, crate::types::Value::Uuid(_)) => Ok(()),
+            (ValueType::Ref, crate::types::Value::Ref(_)) => Ok(()),
+            (expected, found) => Err(MesoError::Serialization(format!(
+                "Type mismatch for {}: expected {:?}, found {:?}",
+                ident, expected, found
+            ))),
+        }
+    }
+
+    pub fn get_id(&self, ident: &str) -> Option<u32> {
+        self.by_ident.get(ident).map(|a| a.id)
     }
 }
 

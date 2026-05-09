@@ -6,7 +6,7 @@ use parquet::file::properties::WriterProperties;
 use std::fs::File;
 use std::path::PathBuf;
 
-use crate::error::Result;
+use crate::types::Result;
 
 pub struct BackgroundCompactor {
     data_dir: PathBuf,

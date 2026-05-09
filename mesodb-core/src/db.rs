@@ -7,11 +7,11 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{Sender, channel};
 
 use crate::config::Config;
-use crate::error::Result;
 use crate::parser::parse_query;
 use crate::planner::QueryPlanner;
 use crate::schema::SchemaMap;
 use crate::transactor::{Fact, Transactor, TxReceipt};
+use crate::types::Result;
 
 pub struct MesoDB {
     pub transactor: Transactor,

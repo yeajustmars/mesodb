@@ -6,8 +6,9 @@ use datafusion::logical_expr::{JoinType, col, lit};
 use datafusion::prelude::*;
 
 use crate::ast::{FindSpec, Query, Term, WhereClause};
-use crate::error::{MesoError, Result};
+use crate::error::MesoError;
 use crate::schema::{SchemaMap, ValueType};
+use crate::types::Result;
 
 /// Translates a Datalog AST Query into an executable DataFusion DataFrame.
 pub struct QueryPlanner<'a> {

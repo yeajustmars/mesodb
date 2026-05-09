@@ -3,7 +3,8 @@ use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::datom::Datom;
-use crate::error::{MesoError, Result};
+use crate::error::MesoError;
+use crate::types::Result;
 
 pub struct Wal {
     file: File,

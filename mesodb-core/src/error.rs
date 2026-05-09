@@ -46,8 +46,6 @@ pub enum MesoError {
     Serialization(String),
 }
 
-pub type Result<T> = std::result::Result<T, MesoError>;
-
 impl MesoError {
     /// Helper to access the IO kind if the error is an IO variant
     pub fn io_kind(&self) -> Option<std::io::ErrorKind> {
