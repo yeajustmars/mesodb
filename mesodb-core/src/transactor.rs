@@ -85,23 +85,63 @@ impl Transactor {
     }
 
     pub fn transact(&mut self, facts: Vec<Fact>) -> Result<TxReceipt> {
-        // 1. Generate a single timestamp for the entire transaction
+        // If no facts are provided, return current state without incrementing
+        if facts.is_empty() {
+            return Ok(TxReceipt {
+                tx_id: self.current_tx_id,
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_micros() as i64,
+                datoms_written: 0,
+            });
+        }
+
+        let tx_id = self.current_tx_id;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_micros() as i64;
 
-        let tx_id = now as u64;
         let datoms_count = facts.len();
         let mut pending_datoms = Vec::with_capacity(datoms_count);
 
-        // 2. Validation Phase
+        // Track uniqueness within THIS batch to catch intra-batch collisions
+        let mut batch_uniques = std::collections::HashSet::new();
+
         for fact in facts {
             let attr_id = self.schema.get_id(&fact.ident).ok_or_else(|| {
                 MesoError::Serialization(format!("Unknown attribute: {}", fact.ident))
             })?;
 
             self.schema.validate_value(&fact.ident, &fact.v)?;
+
+            // Check Uniqueness (Cite: index.rs unique_index [source 280])
+            if let Some(attr) = self.schema.get_by_id(attr_id)
+                && attr.is_unique
+                && fact.op
+            {
+                let key = (attr_id, fact.v.clone());
+
+                // 1. Check existing global index
+                if let Some(&owner) = self.indices.unique_index.get(&key)
+                    && owner != fact.e
+                {
+                    return Err(MesoError::UniqueConstraintViolation {
+                        attr: fact.ident.clone(),
+                        value: fact.v.to_string(),
+                        owner,
+                    });
+                }
+
+                // 2. Check for collisions within the same transaction batch
+                if !batch_uniques.insert(key) {
+                    return Err(MesoError::Serialization(format!(
+                        "Duplicate unique value in batch for attribute {}",
+                        fact.ident
+                    )));
+                }
+            }
 
             pending_datoms.push(Datom {
                 e: fact.e,
@@ -110,25 +150,38 @@ impl Transactor {
                 t: tx_id,
                 op: fact.op,
                 valid_from: now,
-                valid_to: i64::MAX, // Active datoms remain valid until retracted [cite: 475]
+                valid_to: if fact.op { i64::MAX } else { now },
             });
         }
 
-        // 3. Persistence Phase
         self.wal.append_batch(&pending_datoms)?;
 
-        // 4. Memory Phase
         for datom in &pending_datoms {
-            self.indices.insert(datom.e, datom.a, datom.v.clone()); // [cite: 282]
-            self.active_memtable.append(datom.clone()); // [cite: 236]
+            // Update global unique index if applicable [cite: 109, 110]
+            if let Some(attr) = self.schema.get_by_id(datom.a)
+                && attr.is_unique
+            {
+                if datom.op {
+                    self.indices
+                        .unique_index
+                        .insert((datom.a, datom.v.clone()), datom.e);
+                } else {
+                    self.indices
+                        .unique_index
+                        .remove(&(datom.a, datom.v.clone()));
+                }
+            }
+
+            self.indices.insert(datom.e, datom.a, datom.v.clone());
+            self.active_memtable.append(datom.clone());
         }
 
-        // 5. Lifecycle: Rotate if threshold reached
         if self.active_memtable.row_count() >= self.config.storage.memtable_rotation_threshold {
-            self.rotate_active_memtable()?; // Correctly snapshots to RAM history + Disk flusher
+            self.rotate_active_memtable()?;
         }
 
-        // 6. Return the full metadata package
+        self.current_tx_id += 1; // Increment for the next transaction [cite: 108]
+
         Ok(TxReceipt {
             tx_id,
             timestamp: now,
