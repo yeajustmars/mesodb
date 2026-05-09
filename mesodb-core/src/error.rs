@@ -40,7 +40,20 @@ pub enum MesoError {
     Arrow(#[from] datafusion::arrow::error::ArrowError),
 
     #[error("Parquet Error: {0}")]
-    Parquet(#[from] parquet::errors::ParquetError), // Add this line
+    Parquet(#[from] parquet::errors::ParquetError),
+
+    #[error("Serialization error: {0}")]
+    Serialization(String),
 }
 
 pub type Result<T> = std::result::Result<T, MesoError>;
+
+impl MesoError {
+    /// Helper to access the IO kind if the error is an IO variant
+    pub fn io_kind(&self) -> Option<std::io::ErrorKind> {
+        match self {
+            MesoError::Io(e) => Some(e.kind()),
+            _ => None,
+        }
+    }
+}

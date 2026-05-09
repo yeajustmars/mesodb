@@ -166,6 +166,13 @@ impl MemTable {
         )?;
         Ok(batch)
     }
+
+    /// Returns the exact Arrow schema used by this MemTable's builders.
+    pub fn schema(&self) -> arrow::datatypes::SchemaRef {
+        let mut temp = Self::new(1);
+        // This ensures the schema exactly matches what DataFusion sees in 'finish()'
+        temp.finish().expect("Schema generation failed").schema()
+    }
 }
 
 #[cfg(test)]

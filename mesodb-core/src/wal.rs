@@ -1,75 +1,117 @@
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Write};
-use std::path::Path;
+use std::fs::File;
+use std::io::{Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 
 use crate::datom::Datom;
-use rkyv::{from_bytes, rancor::Error, to_bytes};
+use crate::error::{MesoError, Result};
 
 pub struct Wal {
     file: File,
+    path: PathBuf,
 }
 
 impl Wal {
-    pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
+    #[allow(clippy::suspicious_open_options)]
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let p = path.as_ref().to_path_buf();
+        let file = std::fs::OpenOptions::new()
             .read(true)
-            .open(path)?;
+            .write(true)
+            .create(true)
+            // WARNING: Do not listen to Clippy here. We intentionally do NOT want to truncate or
+            // append. Again, Do NOT add truncate(true) or append(true) here!
+            // read + write + manual seek is the way to handle WALs
+            // that need to both recover (read) and persist (write).
+            .open(&p)?;
 
-        Ok(Self { file })
+        Ok(Self { file, path: p })
     }
 
-    // Notice we changed `&[Datom]` to `&Vec<Datom>` to provide a Sized type
-    pub fn append_batch(&mut self, batch: &Vec<Datom>) -> io::Result<()> {
-        if batch.is_empty() {
+    pub fn append_batch(&mut self, datoms: &Vec<Datom>) -> Result<()> {
+        if datoms.is_empty() {
             return Ok(());
         }
 
-        let bytes = to_bytes::<Error>(batch).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("WAL serialization failed: {}", e),
-            )
-        })?;
+        // 1. Position at the very end to ensure we aren't overwriting
+        self.file.seek(SeekFrom::End(0))?;
 
-        let len = bytes.len() as u32;
-        self.file.write_all(&len.to_le_bytes())?;
+        // 2. Serialize the batch
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(datoms)
+            .map_err(|e| MesoError::Serialization(e.to_string()))?;
+
+        // 3. Safety Check: Ensure we aren't writing something suspiciously large
+        // (Though unlikely during write, it catches logic errors early)
+        let len = bytes.len() as u64;
+        if len == 0 {
+            return Err(MesoError::Serialization(
+                "Serialized batch was empty".into(),
+            ));
+        }
+
+        // 4. Atomic-style write: Length header followed by data
+        // We use Native Endian (ne) to match the recovery logic
+        self.file.write_all(&len.to_ne_bytes())?;
         self.file.write_all(&bytes)?;
-        self.file.sync_data()?;
+
+        // 5. Force the OS to flush buffers to physical disk
+        self.file.sync_all()?;
 
         Ok(())
     }
 
-    pub fn recover(&mut self) -> io::Result<Vec<Datom>> {
-        use std::io::{Seek, SeekFrom};
+    pub fn recover(&mut self) -> Result<Vec<Datom>> {
+        use std::io::{Read, Seek, SeekFrom};
         self.file.seek(SeekFrom::Start(0))?;
 
-        let mut recovered = Vec::new();
-        let mut length_buf = [0u8; 4];
+        let mut all_datoms = Vec::new();
+        let file_len = self.file.metadata()?.len();
 
-        loop {
-            match self.file.read_exact(&mut length_buf) {
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(e) => return Err(e),
+        while self.file.stream_position()? < file_len {
+            let mut len_bytes = [0u8; 8];
+            // If we can't read 8 bytes, we've hit the end or a partial write
+            if self.file.read_exact(&mut len_bytes).is_err() {
+                break;
+            }
+            let len = u64::from_ne_bytes(len_bytes);
+
+            // --- PRO-LEVEL SAFETY CHECK ---
+            // If the encoded length is greater than the remaining file size,
+            // it's corrupted or we're reading junk. Stop here instead of crashing.
+            let current_pos = self.file.stream_position()?;
+            if len > (file_len - current_pos) {
+                eprintln!(
+                    "WAL Recovery: Found corrupted entry length {}, stopping.",
+                    len
+                );
+                break;
             }
 
-            let len = u32::from_le_bytes(length_buf) as usize;
-            let mut payload = vec![0u8; len];
-            self.file.read_exact(&mut payload)?;
+            let mut buffer = vec![0u8; len as usize];
+            if self.file.read_exact(&mut buffer).is_err() {
+                break;
+            }
 
-            let batch: Vec<Datom> = from_bytes::<Vec<Datom>, Error>(&payload).map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("WAL corruption detected: {}", e),
-                )
-            })?;
-
-            recovered.extend(batch);
+            // Try to deserialize. If junk, break the loop.
+            let batch: Vec<Datom> =
+                match rkyv::from_bytes::<Vec<Datom>, rkyv::rancor::Error>(&buffer) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        eprintln!("WAL Recovery: Failed to deserialize batch, stopping.");
+                        break;
+                    }
+                };
+            all_datoms.extend(batch);
         }
 
-        Ok(recovered)
+        self.file.seek(SeekFrom::End(0))?;
+        Ok(all_datoms)
+    }
+
+    pub fn data_dir(&self) -> PathBuf {
+        self.path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."))
     }
 }
 
@@ -138,11 +180,12 @@ mod tests {
         file.write_all(b"BAD_BYTES").unwrap();
 
         // 3. Attempt recovery
-        let mut recovering_wal = Wal::open(temp_file.path()).unwrap();
-        let result = recovering_wal.recover();
+        let _recovering_wal = Wal::open(temp_file.path()).unwrap();
+        let result = wal.recover();
 
-        // The bytecheck validation should catch the corruption and return an Err
-        assert!(result.is_err());
-        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        assert!(result.is_ok()); // Change from is_err()
+        //
+        let recovered = result.unwrap();
+        assert_eq!(recovered.len(), 1); // Should only have the first valid datom
     }
 }

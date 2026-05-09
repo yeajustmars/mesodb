@@ -5,6 +5,7 @@ use datafusion::prelude::*;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::config::Config;
 use crate::error::Result;
 use crate::parser::parse_query;
 use crate::planner::QueryPlanner;
@@ -19,7 +20,7 @@ pub struct MesoDB {
 impl MesoDB {
     pub fn open<P: AsRef<Path>>(path: P, schema: SchemaMap) -> Result<Self> {
         let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel(32);
-        let data_dir = path.as_ref().to_path_buf();
+        let data_dir = path.as_ref().parent().unwrap().to_path_buf();
 
         // Start the background persistence worker
         tokio::spawn(async move {
@@ -37,6 +38,31 @@ impl MesoDB {
         Ok(Self { transactor, ctx })
     }
 
+    pub fn open_with_config<P: AsRef<Path>>(
+        path: P,
+        schema: SchemaMap,
+        config: Config,
+    ) -> Result<Self> {
+        let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel(32);
+        let data_dir = path.as_ref().parent().unwrap().to_path_buf();
+
+        tokio::spawn(async move {
+            let compactor = crate::storage::BackgroundCompactor::new(data_dir);
+            let mut batch_count = 0;
+            while let Some(batch) = flush_rx.recv().await {
+                let _ = compactor.flush_to_parquet(batch, batch_count);
+                batch_count += 1;
+            }
+        });
+
+        // Initialize transactor with the config
+        let mut transactor = Transactor::new(path, schema, flush_tx)?;
+        transactor.config = config;
+
+        let ctx = SessionContext::new();
+        Ok(Self { transactor, ctx })
+    }
+
     pub fn transact(&mut self, facts: Vec<Fact>) -> Result<TxReceipt> {
         self.transactor.transact(facts)
     }
@@ -44,46 +70,68 @@ impl MesoDB {
     pub async fn query(&mut self, query_str: &str) -> Result<Vec<RecordBatch>> {
         let ast = parse_query(query_str)?;
 
-        // 1. Snapshot everything currently in RAM
-        let mut all_batches = Vec::new();
-
-        // Add frozen history batches [cite: 98]
+        // 1. Snapshot everything currently in RAM [cite: 291]
+        let mut ram_batches = Vec::new();
         {
             let history = self.transactor.frozen_history.read().unwrap();
-            all_batches.extend(history.clone());
+            ram_batches.extend(history.clone());
         }
 
-        // Add the active batch (we "finish" it for the query view) [cite: 241]
-        // IMPORTANT: We must re-initialize the builders so the Transactor can keep working.
         if self.transactor.active_memtable.row_count() > 0 {
             let active_batch = self.transactor.active_memtable.finish()?;
-            all_batches.push(active_batch);
-
-            // Re-initialize builders for future transactions
+            ram_batches.push(active_batch);
+            // Re-initialize for future transactions [cite: 232, 234]
             self.transactor.active_memtable = crate::memtable::MemTable::new(
                 self.transactor.config.storage.memtable_initial_capacity,
             );
         }
 
-        // Handle the case where there is absolutely no data in RAM yet
-        if all_batches.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // 2. Union them in DataFusion
+        // 2. Clear old registration to prepare for the Unified View
         if self.ctx.table_exist("datoms")? {
             self.ctx.deregister_table("datoms")?;
         }
 
-        // DataFusion's MemTable can take a Vec<Vec<RecordBatch>> representing partitions
-        let schema = all_batches[0].schema();
-        let provider = DfMemTable::try_new(schema, vec![all_batches])?;
-        self.ctx.register_table("datoms", Arc::new(provider))?;
+        // 3. Register the Disk-based Parquet files
+        // Use the data_dir we just implemented
+        let data_dir = self.transactor.wal.data_dir();
+        let table_path = data_dir.to_string_lossy().to_string();
+
+        // Get the shared schema from the MemTable
+        let schema = self.transactor.active_memtable.schema();
+
+        // Seed the listing table with the explicit schema
+        let options = datafusion::prelude::ParquetReadOptions::default().schema(&schema);
+
+        // Ensure the directory exists so register_parquet doesn't complain
+        std::fs::create_dir_all(&data_dir)?;
+
+        // Registering a local directory as a Parquet table
+        self.ctx
+            .register_parquet("parquet_datoms", &table_path, options)
+            .await?;
+
+        // 4. Create the Unified logical table (Union of RAM + Disk)
+        // If we have RAM data, we union it with the parquet table
+        let df = if !ram_batches.is_empty() {
+            let schema = ram_batches[0].schema();
+            let ram_provider = DfMemTable::try_new(schema, vec![ram_batches])?;
+            self.ctx
+                .register_table("ram_datoms", Arc::new(ram_provider))?;
+
+            // Union SQL: Combines disk and memory into one logical "datoms" view
+            self.ctx
+                .sql("SELECT * FROM parquet_datoms UNION ALL SELECT * FROM ram_datoms")
+                .await?
+        } else {
+            self.ctx.table("parquet_datoms").await?
+        };
+
+        self.ctx.register_table("datoms", df.into_view())?;
 
         let planner = QueryPlanner::new(&self.ctx, &self.transactor.schema, "datoms");
-        let df = planner.plan(&ast).await?;
+        let final_df = planner.plan(&ast).await?;
 
-        Ok(df.collect().await?)
+        Ok(final_df.collect().await?)
     }
 
     pub fn schema(&self) -> &SchemaMap {
@@ -127,5 +175,70 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].num_rows(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_high_pressure_persistence_and_unified_query() {
+        use arrow::array::UInt64Array;
+        use arrow::record_batch::RecordBatch;
+        use std::collections::HashSet;
+        use tempfile::tempdir;
+        // Correcting imports based on your error logs:
+        use crate::transactor::Fact;
+        use crate::types::Value;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("stress_test.db");
+
+        // 1. Setup a "Highly Volatile" configuration
+        let mut config = crate::config::Config::default();
+        config.storage.memtable_rotation_threshold = 3;
+        config.storage.memtable_initial_capacity = 2;
+
+        let mut schema = crate::schema::SchemaMap::new();
+        schema.add_attribute(":test/id", crate::schema::ValueType::Int64, true);
+        schema.add_attribute(":test/val", crate::schema::ValueType::String, false);
+
+        // 2. Open DB and pour in data
+        let mut db = MesoDB::open_with_config(&db_path, schema.clone(), config).unwrap();
+
+        for i in 0..10 {
+            db.transact(vec![Fact {
+                e: i as u64,
+                ident: ":test/id".into(),
+                v: Value::Int64(i as i64),
+                op: true,
+            }])
+            .unwrap();
+        }
+
+        // Give background worker time to flush
+        tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+
+        // 3. Drop the DB to simulate a crash/restart
+        drop(db);
+
+        // 4. THE COLD BOOT RECOVERY
+        let mut recovered_db = MesoDB::open(&db_path, schema).unwrap();
+        let query_str = "[:find ?e :where [?e :test/id _]]";
+
+        let results: Vec<RecordBatch> = recovered_db.query(query_str).await.unwrap();
+
+        let mut unique_entities: HashSet<u64> = HashSet::new();
+
+        for batch in results {
+            let col_data = batch.column(0);
+            if let Some(uint_col) = col_data.as_any().downcast_ref::<UInt64Array>() {
+                for i in 0..uint_col.len() {
+                    unique_entities.insert(uint_col.value(i));
+                }
+            }
+        }
+
+        assert_eq!(
+            unique_entities.len(),
+            10,
+            "Should see exactly 10 unique entities after recovery"
+        );
     }
 }
