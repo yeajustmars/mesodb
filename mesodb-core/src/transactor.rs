@@ -5,6 +5,7 @@ use chrono::Utc;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
+use crate::config::Config;
 use crate::datom::Datom;
 use crate::error::{MesoError, Result};
 use crate::index::IndexManager;
@@ -29,6 +30,7 @@ pub struct TxReceipt {
 }
 
 pub struct Transactor {
+    pub config: Config,
     pub wal: Wal,
     pub active_memtable: MemTable,
     pub schema: SchemaMap,
@@ -39,6 +41,7 @@ pub struct Transactor {
 
 impl Transactor {
     pub fn new<P: AsRef<Path>>(wal_path: P, schema: SchemaMap) -> Result<Self> {
+        let config = Config::default(); // TODO: allow passing custom config
         let mut wal = Wal::open(wal_path)?;
         let mut active_memtable = MemTable::new(1024);
         let mut indices = IndexManager::default();
@@ -66,6 +69,7 @@ impl Transactor {
         }
 
         Ok(Self {
+            config,
             wal,
             active_memtable,
             schema,
@@ -131,6 +135,7 @@ impl Transactor {
             } else {
                 Datom::retract(fact.e, attr.id, fact.v, tx_id, timestamp)
             };
+
             pending_datoms.push(datom);
         }
 
@@ -154,7 +159,10 @@ impl Transactor {
             self.active_memtable.append(datom);
         }
 
+        self.check_rotation()?;
+
         self.current_tx_id += 1;
+
         Ok(TxReceipt {
             tx_id,
             timestamp,
@@ -173,6 +181,30 @@ impl Transactor {
                 | (ValueType::Timestamp, Value::Timestamp(_))
                 | (ValueType::Uuid, Value::Uuid(_))
         )
+    }
+
+    /// Checks if the current memtable exceeds the configured threshold.
+    pub fn check_rotation(&mut self) -> Result<()> {
+        if self.active_memtable.row_count() >= self.config.storage.memtable_rotation_threshold {
+            self.rotate_active_memtable()?;
+        }
+        Ok(())
+    }
+
+    /// Freezes the current memtable and initializes a fresh one.
+    fn rotate_active_memtable(&mut self) -> Result<()> {
+        // finish() converts builders into an immutable RecordBatch
+        let batch = self.active_memtable.finish()?;
+
+        {
+            let mut history = self.frozen_history.write().unwrap();
+            history.push(batch);
+        }
+
+        // Reset with pre-allocated capacity from config
+        self.active_memtable = MemTable::new(self.config.storage.memtable_initial_capacity);
+
+        Ok(())
     }
 }
 

@@ -1,5 +1,6 @@
 // mesodb_core
 pub mod ast;
+pub mod config;
 pub mod datom;
 pub mod db;
 pub mod error;

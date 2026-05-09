@@ -23,6 +23,7 @@ pub struct MemTable {
     op: BooleanBuilder,
     valid_from: TimestampMicrosecondBuilder,
     valid_to: TimestampMicrosecondBuilder,
+    row_count: usize,
 }
 
 impl MemTable {
@@ -70,7 +71,12 @@ impl MemTable {
             op: BooleanBuilder::with_capacity(capacity),
             valid_from: TimestampMicrosecondBuilder::with_capacity(capacity),
             valid_to: TimestampMicrosecondBuilder::with_capacity(capacity),
+            row_count: 0,
         }
+    }
+
+    pub fn row_count(&self) -> usize {
+        self.row_count
     }
 
     pub fn append(&mut self, datom: Datom) {
@@ -111,6 +117,8 @@ impl MemTable {
                 self.null_all_except(6);
             }
         }
+
+        self.row_count += 1;
     }
 
     fn null_all_except(&mut self, idx: usize) {
