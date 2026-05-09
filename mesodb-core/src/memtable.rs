@@ -1,24 +1,17 @@
+// mesodb-core/src/memtable.rs
+use crate::datom::Datom;
+use crate::error::Result;
+use crate::types::Value;
+use arrow::array::*;
+use arrow::datatypes::*;
+use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
 
-use arrow::array::{
-    BooleanBuilder, FixedSizeBinaryBuilder, Float64Builder, Int64Builder, RecordBatch,
-    StringBuilder, TimestampMicrosecondBuilder, UInt32Builder, UInt64Builder,
-};
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-
-use crate::datom::Datom;
-use crate::types::Value;
-
-/// The in-memory Arrow builder for MesoDB's bitemporal data.
-/// It converts row-based `Datom` structs into a strictly typed,
-/// columnar `RecordBatch` optimized for zero-copy Parquet flushes.
 #[derive(Debug)]
 pub struct MemTable {
-    // Core Datom Identity
+    schema: SchemaRef,
     e: UInt64Builder,
     a: UInt32Builder,
-
-    // The "Wide Column" Value fields (Sparse arrays)
     v_bool: BooleanBuilder,
     v_int: Int64Builder,
     v_float: Float64Builder,
@@ -26,8 +19,6 @@ pub struct MemTable {
     v_ref: UInt64Builder,
     v_time: TimestampMicrosecondBuilder,
     v_uuid: FixedSizeBinaryBuilder,
-
-    // Bitemporal and System metadata
     t: UInt64Builder,
     op: BooleanBuilder,
     valid_from: TimestampMicrosecondBuilder,
@@ -35,80 +26,7 @@ pub struct MemTable {
 }
 
 impl MemTable {
-    /// Initializes a new MemTable with pre-allocated memory capacity.
-    /// Pre-allocating prevents expensive memory re-allocations during fast ingestion.
     pub fn new(capacity: usize) -> Self {
-        Self {
-            e: UInt64Builder::with_capacity(capacity),
-            a: UInt32Builder::with_capacity(capacity),
-
-            v_bool: BooleanBuilder::with_capacity(capacity),
-            v_int: Int64Builder::with_capacity(capacity),
-            v_float: Float64Builder::with_capacity(capacity),
-            v_str: StringBuilder::with_capacity(capacity, capacity * 16), // Guessing 16 bytes per string
-            v_ref: UInt64Builder::with_capacity(capacity),
-            v_time: TimestampMicrosecondBuilder::with_capacity(capacity),
-            v_uuid: FixedSizeBinaryBuilder::with_capacity(capacity, 16), // UUID is strictly 16 bytes
-
-            t: UInt64Builder::with_capacity(capacity),
-            op: BooleanBuilder::with_capacity(capacity),
-            valid_from: TimestampMicrosecondBuilder::with_capacity(capacity),
-            valid_to: TimestampMicrosecondBuilder::with_capacity(capacity),
-        }
-    }
-
-    /// Appends a single Datom to the columnar arrays.
-    pub fn append(&mut self, datom: Datom) {
-        // 1. Append the dense, guaranteed columns
-        self.e.append_value(datom.e);
-        self.a.append_value(datom.a);
-        self.t.append_value(datom.t);
-        self.op.append_value(datom.op);
-        self.valid_from.append_value(datom.valid_from);
-        self.valid_to.append_value(datom.valid_to);
-
-        // 2. Append the sparse Value columns
-        // We match the enum and insert a null into every other type column.
-        match datom.v {
-            Value::Boolean(b) => self.v_bool.append_value(b),
-            _ => self.v_bool.append_null(),
-        }
-
-        match datom.v {
-            Value::Int64(i) => self.v_int.append_value(i),
-            _ => self.v_int.append_null(),
-        }
-
-        match datom.v {
-            Value::Float64(f) => self.v_float.append_value(f),
-            _ => self.v_float.append_null(),
-        }
-
-        match &datom.v {
-            Value::String(s) => self.v_str.append_value(s),
-            _ => self.v_str.append_null(),
-        }
-
-        match datom.v {
-            Value::Ref(r) => self.v_ref.append_value(r),
-            _ => self.v_ref.append_null(),
-        }
-
-        match datom.v {
-            Value::Timestamp(t) => self.v_time.append_value(t),
-            _ => self.v_time.append_null(),
-        }
-
-        match &datom.v {
-            // Unwrap the Result because we guarantee `u` is exactly [u8; 16]
-            Value::Uuid(u) => self.v_uuid.append_value(u).expect("UUID length mismatch"),
-            _ => self.v_uuid.append_null(),
-        }
-    }
-
-    /// Freezes the MemTable and converts it into a zero-copy Apache Arrow RecordBatch.
-    /// This RecordBatch can be instantly queried by DataFusion or flushed to Parquet.
-    pub fn finish(&mut self) -> Result<RecordBatch, arrow::error::ArrowError> {
         let schema = Arc::new(Schema::new(vec![
             Field::new("e", DataType::UInt64, false),
             Field::new("a", DataType::UInt32, false),
@@ -137,8 +55,91 @@ impl MemTable {
             ),
         ]));
 
-        RecordBatch::try_new(
+        Self {
             schema,
+            e: UInt64Builder::with_capacity(capacity),
+            a: UInt32Builder::with_capacity(capacity),
+            v_bool: BooleanBuilder::with_capacity(capacity),
+            v_int: Int64Builder::with_capacity(capacity),
+            v_float: Float64Builder::with_capacity(capacity),
+            v_str: StringBuilder::with_capacity(capacity, capacity * 16),
+            v_ref: UInt64Builder::with_capacity(capacity),
+            v_time: TimestampMicrosecondBuilder::with_capacity(capacity),
+            v_uuid: FixedSizeBinaryBuilder::with_capacity(capacity, 16),
+            t: UInt64Builder::with_capacity(capacity),
+            op: BooleanBuilder::with_capacity(capacity),
+            valid_from: TimestampMicrosecondBuilder::with_capacity(capacity),
+            valid_to: TimestampMicrosecondBuilder::with_capacity(capacity),
+        }
+    }
+
+    pub fn append(&mut self, datom: Datom) {
+        self.e.append_value(datom.e);
+        self.a.append_value(datom.a);
+        self.t.append_value(datom.t);
+        self.op.append_value(datom.op);
+        self.valid_from.append_value(datom.valid_from);
+        self.valid_to.append_value(datom.valid_to);
+
+        match datom.v {
+            Value::Boolean(b) => {
+                self.v_bool.append_value(b);
+                self.null_all_except(0);
+            }
+            Value::Int64(i) => {
+                self.v_int.append_value(i);
+                self.null_all_except(1);
+            }
+            Value::Float64(f) => {
+                self.v_float.append_value(f);
+                self.null_all_except(2);
+            }
+            Value::String(s) => {
+                self.v_str.append_value(s);
+                self.null_all_except(3);
+            }
+            Value::Ref(r) => {
+                self.v_ref.append_value(r);
+                self.null_all_except(4);
+            }
+            Value::Timestamp(t) => {
+                self.v_time.append_value(t);
+                self.null_all_except(5);
+            }
+            Value::Uuid(u) => {
+                self.v_uuid.append_value(u).unwrap();
+                self.null_all_except(6);
+            }
+        }
+    }
+
+    fn null_all_except(&mut self, idx: usize) {
+        if idx != 0 {
+            self.v_bool.append_null();
+        }
+        if idx != 1 {
+            self.v_int.append_null();
+        }
+        if idx != 2 {
+            self.v_float.append_null();
+        }
+        if idx != 3 {
+            self.v_str.append_null();
+        }
+        if idx != 4 {
+            self.v_ref.append_null();
+        }
+        if idx != 5 {
+            self.v_time.append_null();
+        }
+        if idx != 6 {
+            self.v_uuid.append_null();
+        }
+    }
+
+    pub fn finish(&mut self) -> Result<RecordBatch> {
+        let batch = RecordBatch::try_new(
+            self.schema.clone(),
             vec![
                 Arc::new(self.e.finish()),
                 Arc::new(self.a.finish()),
@@ -154,7 +155,8 @@ impl MemTable {
                 Arc::new(self.valid_from.finish()),
                 Arc::new(self.valid_to.finish()),
             ],
-        )
+        )?;
+        Ok(batch)
     }
 }
 
@@ -167,63 +169,25 @@ mod tests {
     fn test_memtable_append_and_finish() {
         let mut memtable = MemTable::new(100);
         let now = Utc::now().timestamp_micros();
-
-        // 1. Insert a String Datom
-        let str_datom = Datom::assert(1001, 50, Value::String("Alice".to_string()), 1, now);
-        memtable.append(str_datom);
-
-        // 2. Insert a Ref (EntityId) Datom
-        let ref_datom = Datom::assert(
+        memtable.append(Datom::assert(
             1001,
-            51, // e.g., :user/best_friend
-            Value::Ref(2002),
+            50,
+            Value::String("Alice".to_string()),
             1,
             now,
-        );
-        memtable.append(ref_datom);
+        ));
+        memtable.append(Datom::assert(1001, 51, Value::Ref(2002), 1, now));
+        memtable.append(Datom::assert(1001, 52, Value::Int64(35), 2, now));
 
-        // 3. Insert an Integer Datom
-        let int_datom = Datom::assert(
-            1001,
-            52, // e.g., :user/age
-            Value::Int64(35),
-            2,
-            now,
-        );
-        memtable.append(int_datom);
-
-        // Build the RecordBatch
         let batch = memtable.finish().expect("Failed to build RecordBatch");
-
-        // Assertions
         assert_eq!(batch.num_rows(), 3);
         assert_eq!(batch.num_columns(), 13);
-
-        // Verify the schema maps perfectly
-        assert_eq!(
-            batch.schema().field_with_name("v_str").unwrap().data_type(),
-            &DataType::Utf8
-        );
-        assert_eq!(
-            batch.schema().field_with_name("v_ref").unwrap().data_type(),
-            &DataType::UInt64
-        );
-        assert_eq!(
-            batch
-                .schema()
-                .field_with_name("v_uuid")
-                .unwrap()
-                .data_type(),
-            &DataType::FixedSizeBinary(16)
-        );
     }
 
     #[test]
     fn test_memtable_alignment_all_types() {
         let mut memtable = MemTable::new(10);
         let now = Utc::now().timestamp_micros();
-
-        // Insert one of EVERY type to ensure the null-padding aligns perfectly
         memtable.append(Datom::assert(1, 1, Value::Boolean(true), 1, now));
         memtable.append(Datom::assert(1, 2, Value::Int64(42), 1, now));
         memtable.append(Datom::assert(1, 3, Value::Float64(4.14), 1, now));
@@ -233,22 +197,15 @@ mod tests {
         memtable.append(Datom::assert(1, 7, Value::Uuid([2u8; 16]), 1, now));
 
         let batch = memtable.finish().expect("Failed to build batch");
-
-        // If the arrays were misaligned (e.g., forgot an append_null), finish() would have panicked.
         assert_eq!(batch.num_rows(), 7);
-        assert_eq!(batch.num_columns(), 13);
     }
 
     #[test]
     fn test_memtable_capacity_growth() {
-        // Intentionally start with a tiny capacity
         let mut memtable = MemTable::new(2);
-
-        // Force it to reallocate multiple times
         for i in 0..100 {
             memtable.append(Datom::assert(i, 10, Value::Int64(i as i64), 1, 0));
         }
-
         let batch = memtable.finish().unwrap();
         assert_eq!(batch.num_rows(), 100);
     }

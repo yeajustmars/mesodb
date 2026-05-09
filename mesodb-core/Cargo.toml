@@ -10,6 +10,7 @@ ahash.workspace = true
 arrow.workspace = true
 chrono.workspace = true
 datafusion.workspace = true
+ordered-float.workspace = true
 pest.workspace = true
 pest_derive.workspace = true
 rkyv.workspace = true
