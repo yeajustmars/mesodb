@@ -2,8 +2,9 @@
 use arrow::record_batch::RecordBatch;
 use datafusion::datasource::memory::MemTable as DfMemTable;
 use datafusion::prelude::*;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::sync::mpsc::{Sender, channel};
 
 use crate::config::Config;
 use crate::error::Result;
@@ -19,19 +20,8 @@ pub struct MesoDB {
 
 impl MesoDB {
     pub fn open<P: AsRef<Path>>(path: P, schema: SchemaMap) -> Result<Self> {
-        let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel(32);
         let data_dir = path.as_ref().parent().unwrap().to_path_buf();
-
-        // Start the background persistence worker
-        tokio::spawn(async move {
-            let compactor = crate::storage::BackgroundCompactor::new(data_dir);
-            let mut batch_count = 0;
-            while let Some(batch) = flush_rx.recv().await {
-                let _ = compactor.flush_to_parquet(batch, batch_count);
-                batch_count += 1;
-            }
-        });
-
+        let flush_tx = Self::spawn_background_worker(data_dir);
         let transactor = Transactor::new(path, schema, flush_tx)?;
         let ctx = SessionContext::new();
 
@@ -43,24 +33,45 @@ impl MesoDB {
         schema: SchemaMap,
         config: Config,
     ) -> Result<Self> {
-        let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel(32);
         let data_dir = path.as_ref().parent().unwrap().to_path_buf();
-
-        tokio::spawn(async move {
-            let compactor = crate::storage::BackgroundCompactor::new(data_dir);
-            let mut batch_count = 0;
-            while let Some(batch) = flush_rx.recv().await {
-                let _ = compactor.flush_to_parquet(batch, batch_count);
-                batch_count += 1;
-            }
-        });
-
-        // Initialize transactor with the config
+        let flush_tx = Self::spawn_background_worker(data_dir);
         let mut transactor = Transactor::new(path, schema, flush_tx)?;
         transactor.config = config;
 
         let ctx = SessionContext::new();
         Ok(Self { transactor, ctx })
+    }
+
+    /// Internal helper to initialize the background persistence and compaction loop.
+    fn spawn_background_worker(data_dir: PathBuf) -> Sender<RecordBatch> {
+        let (flush_tx, mut flush_rx) = channel(32);
+
+        tokio::spawn(async move {
+            let compactor = crate::storage::BackgroundCompactor::new(data_dir);
+            let mut batch_count = 0;
+            let mut pending_files = Vec::new();
+            let compaction_threshold = 10;
+
+            while let Some(batch) = flush_rx.recv().await {
+                // 1. Flush to disk
+                if let Ok(path) = compactor.flush_to_parquet(batch, batch_count) {
+                    pending_files.push(path);
+                    batch_count += 1;
+                }
+
+                // 2. Periodic Compaction
+                if pending_files.len() >= compaction_threshold {
+                    // Note: In a real 'North Star' implementation, we'd handle
+                    // the result of compaction to update our file tracking.
+                    if let Ok(new_path) = compactor.compact(&pending_files, batch_count).await {
+                        pending_files.clear();
+                        pending_files.push(new_path);
+                    }
+                }
+            }
+        });
+
+        flush_tx
     }
 
     pub fn transact(&mut self, facts: Vec<Fact>) -> Result<TxReceipt> {
