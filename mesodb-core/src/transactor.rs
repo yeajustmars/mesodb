@@ -123,11 +123,9 @@ impl Transactor {
             self.active_memtable.append(datom.clone()); // [cite: 236]
         }
 
-        // 5. Rotation Phase [cite: 120, 123]
+        // 5. Lifecycle: Rotate if threshold reached
         if self.active_memtable.row_count() >= self.config.storage.memtable_rotation_threshold {
-            let frozen_batch = self.active_memtable.finish()?;
-            let _ = self.flush_tx.try_send(frozen_batch); // [cite: 121]
-            self.active_memtable = MemTable::new(self.config.storage.memtable_initial_capacity);
+            self.rotate_active_memtable()?; // Correctly snapshots to RAM history + Disk flusher
         }
 
         // 6. Return the full metadata package
