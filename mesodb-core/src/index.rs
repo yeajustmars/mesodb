@@ -2,6 +2,7 @@
 use crate::types::Value;
 use std::collections::{BTreeMap, HashSet};
 
+#[derive(Default)]
 pub struct IndexManager {
     /// AVET Index: Attribute -> Value -> Set of Entities
     pub avet: BTreeMap<u32, BTreeMap<Value, HashSet<u64>>>,

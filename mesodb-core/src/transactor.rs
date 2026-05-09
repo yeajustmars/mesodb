@@ -41,7 +41,7 @@ impl Transactor {
     pub fn new<P: AsRef<Path>>(wal_path: P, schema: SchemaMap) -> Result<Self> {
         let mut wal = Wal::open(wal_path)?;
         let mut active_memtable = MemTable::new(1024);
-        let mut indices = IndexManager::new();
+        let mut indices = IndexManager::default();
         let mut current_tx_id = 1;
 
         let recovered_datoms = wal.recover()?;
