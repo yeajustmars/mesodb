@@ -9,7 +9,7 @@ use crate::datom::Datom;
 use crate::error::MesoError;
 use crate::index::IndexManager;
 use crate::memtable::MemTable;
-use crate::schema::SchemaMap;
+use crate::schema::{SchemaMap, ValueType};
 use crate::types::{EntityId, Result, TxId, Value};
 use crate::wal::Wal;
 
@@ -109,14 +109,36 @@ impl Transactor {
         // Track uniqueness within THIS batch to catch intra-batch collisions
         let mut batch_uniques = std::collections::HashSet::new();
 
+        let allow_jit_schema = self.config.storage.allow_jit_schema;
+
         for fact in facts {
-            let attr_id = self.schema.get_id(&fact.ident).ok_or_else(|| {
-                MesoError::Serialization(format!("Unknown attribute: {}", fact.ident))
-            })?;
+            let attr_id = if let Some(id) = self.schema.get_id(&fact.ident) {
+                id
+            } else if allow_jit_schema {
+                // Infer type from the value
+                let inferred_type = match fact.v {
+                    Value::Boolean(_) => ValueType::Boolean,
+                    Value::Int64(_) => ValueType::Int64,
+                    Value::Float64(_) => ValueType::Float64,
+                    Value::Ref(_) => ValueType::Ref,
+                    Value::Timestamp(_) => ValueType::Timestamp,
+                    Value::Uuid(_) => ValueType::Uuid,
+                    _ => ValueType::String,
+                };
+                // Register dynamically
+                self.schema
+                    .add_attribute(&fact.ident, inferred_type, false)
+                    .id
+            } else {
+                return Err(MesoError::Serialization(format!(
+                    "Unknown attribute and JIT schema disabled: {}",
+                    fact.ident
+                )));
+            };
 
             self.schema.validate_value(&fact.ident, &fact.v)?;
 
-            // Check Uniqueness (Cite: index.rs unique_index [source 280])
+            // Check Uniqueness (Cite: index.rs unique_index [
             if let Some(attr) = self.schema.get_by_id(attr_id)
                 && attr.is_unique
                 && fact.op
@@ -157,7 +179,7 @@ impl Transactor {
         self.wal.append_batch(&pending_datoms)?;
 
         for datom in &pending_datoms {
-            // Update global unique index if applicable [cite: 109, 110]
+            // Update global unique index if applicable
             if let Some(attr) = self.schema.get_by_id(datom.a)
                 && attr.is_unique
             {
@@ -180,7 +202,7 @@ impl Transactor {
             self.rotate_active_memtable()?;
         }
 
-        self.current_tx_id += 1; // Increment for the next transaction [cite: 108]
+        self.current_tx_id += 1; // Increment for the next transaction
 
         Ok(TxReceipt {
             tx_id,
@@ -199,7 +221,7 @@ impl Transactor {
 
     /// Freezes the current memtable and initializes a fresh one.
     fn rotate_active_memtable(&mut self) -> Result<()> {
-        // finish() converts builders into an immutable RecordBatch [cite: 241, 242]
+        // finish() converts builders into an immutable RecordBatch
         let batch = self.active_memtable.finish()?;
 
         // 1. Keep in RAM for immediate query access
@@ -218,7 +240,7 @@ impl Transactor {
             );
         }
 
-        // 3. Reset Builders with pre-allocated capacity from config [cite: 231, 232]
+        // 3. Reset Builders with pre-allocated capacity from config
         self.active_memtable = MemTable::new(self.config.storage.memtable_initial_capacity);
 
         Ok(())
@@ -228,7 +250,6 @@ impl Transactor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::ValueType;
     use std::f64::consts::PI;
     use tempfile::NamedTempFile;
 
@@ -316,8 +337,11 @@ mod tests {
     }
 
     #[test]
-    fn test_tx_05_missing_schema_ident_fails() {
+    fn test_tx_05_missing_schema_ident_fails_when_jit_schema_flag_disabled() {
         let (mut t, _f) = setup_transactor();
+        // Force production-style rigidity [cite: 217]
+        t.config.storage.allow_jit_schema = false;
+
         let result = t.transact(vec![Fact {
             e: 1,
             ident: ":user/ghost".into(),
@@ -325,6 +349,41 @@ mod tests {
             op: true,
         }]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_tx_05b_missing_schema_ident_succeeds_when_jit_schema_flag_enabled() {
+        let (mut t, _f) = setup_transactor();
+        // allow_jit_schema is true by default in our config [cite: 218]
+
+        let result = t.transact(vec![Fact {
+            e: 1,
+            ident: ":user/new-dynamic-attr".into(),
+            v: Value::String("Dynamic!".into()),
+            op: true,
+        }]);
+
+        assert!(result.is_ok());
+        // Verify it was actually added to the schema [cite: 452]
+        assert!(t.schema.contains_ident(":user/new-dynamic-attr"));
+    }
+
+    #[test]
+    fn test_tx_05c_jit_defaults_to_string() {
+        let (mut t, _f) = setup_transactor();
+
+        // This ident doesn't exist, and we'll pass a value that
+        // might trigger the catch-all if we added one later.
+        let result = t.transact(vec![Fact {
+            e: 1,
+            ident: ":user/metadata".into(),
+            v: Value::String("some-random-data".into()),
+            op: true,
+        }]);
+
+        assert!(result.is_ok());
+        let attr = t.schema.get_by_ident(":user/metadata").unwrap();
+        assert_eq!(attr.value_type, ValueType::String);
     }
 
     #[test]

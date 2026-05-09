@@ -13,6 +13,9 @@ pub struct StorageConfig {
     pub memtable_rotation_threshold: usize,
     /// Pre-allocated capacity for new MemTables
     pub memtable_initial_capacity: usize,
+    /// Whether to allow the database to automatically create attributes
+    /// when they are first encountered in a transaction.
+    pub allow_jit_schema: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -29,6 +32,7 @@ impl Default for Config {
             storage: StorageConfig {
                 memtable_rotation_threshold: 100_000,
                 memtable_initial_capacity: 10_000,
+                allow_jit_schema: true, // Default to 'on' for developer velocity
             },
             compactor: CompactorConfig {
                 worker_threads: 4,
