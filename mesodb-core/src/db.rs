@@ -43,13 +43,41 @@ impl MesoDB {
 
     pub async fn query(&mut self, query_str: &str) -> Result<Vec<RecordBatch>> {
         let ast = parse_query(query_str)?;
-        let batch = self.transactor.active_memtable.finish()?;
 
+        // 1. Snapshot everything currently in RAM
+        let mut all_batches = Vec::new();
+
+        // Add frozen history batches [cite: 98]
+        {
+            let history = self.transactor.frozen_history.read().unwrap();
+            all_batches.extend(history.clone());
+        }
+
+        // Add the active batch (we "finish" it for the query view) [cite: 241]
+        // IMPORTANT: We must re-initialize the builders so the Transactor can keep working.
+        if self.transactor.active_memtable.row_count() > 0 {
+            let active_batch = self.transactor.active_memtable.finish()?;
+            all_batches.push(active_batch);
+
+            // Re-initialize builders for future transactions
+            self.transactor.active_memtable = crate::memtable::MemTable::new(
+                self.transactor.config.storage.memtable_initial_capacity,
+            );
+        }
+
+        // Handle the case where there is absolutely no data in RAM yet
+        if all_batches.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // 2. Union them in DataFusion
         if self.ctx.table_exist("datoms")? {
             self.ctx.deregister_table("datoms")?;
         }
 
-        let provider = DfMemTable::try_new(batch.schema(), vec![vec![batch]])?;
+        // DataFusion's MemTable can take a Vec<Vec<RecordBatch>> representing partitions
+        let schema = all_batches[0].schema();
+        let provider = DfMemTable::try_new(schema, vec![all_batches])?;
         self.ctx.register_table("datoms", Arc::new(provider))?;
 
         let planner = QueryPlanner::new(&self.ctx, &self.transactor.schema, "datoms");
