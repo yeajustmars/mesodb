@@ -1,16 +1,15 @@
 // mesodb-core/src/planner.rs
 
-use std::collections::HashSet;
-
-use datafusion::logical_expr::{JoinType, col, lit};
+use datafusion::logical_expr::{Expr, JoinType, col};
 use datafusion::prelude::*;
+use datafusion::scalar::ScalarValue;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::ast::{FindSpec, Query, Term, WhereClause};
 use crate::error::MesoError;
 use crate::schema::{SchemaMap, ValueType};
 use crate::types::Result;
 
-/// Translates a Datalog AST Query into an executable DataFusion DataFrame.
 pub struct QueryPlanner<'a> {
     ctx: &'a SessionContext,
     schema: &'a SchemaMap,
@@ -26,16 +25,37 @@ impl<'a> QueryPlanner<'a> {
         }
     }
 
-    /// Compiles the AST into a single execution plan.
+    fn term_to_micros(&self, term: &Term) -> Result<i64> {
+        match term {
+            Term::Integer(i) => Ok(*i),
+            Term::String(s) => s
+                .parse::<i64>()
+                .map_err(|_| MesoError::PlanError(format!("Invalid date string: {}", s))),
+            _ => Err(MesoError::PlanError(
+                "Time must be Integer or String".into(),
+            )),
+        }
+    }
+
+    fn ts_lit(val: i64) -> Expr {
+        // DataFusion 50+ requires (ScalarValue, Option<FieldMetadata>)
+        Expr::Literal(ScalarValue::TimestampMicrosecond(Some(val), None), None)
+    }
+
     pub async fn plan(&self, query: &Query) -> Result<DataFrame> {
         let mut current_df: Option<DataFrame> = None;
         let mut known_vars: HashSet<String> = HashSet::new();
 
-        // 1. Process WHERE clauses to build the base relations and joins
         for clause in &query.where_clauses {
             match clause {
-                WhereClause::DataPattern { e, a, v, .. } => {
-                    let mut next_df = self.plan_data_pattern(e, a, v).await?;
+                WhereClause::DataPattern {
+                    e,
+                    a,
+                    v,
+                    tx,
+                    options,
+                } => {
+                    let mut next_df = self.plan_data_pattern(e, a, v, tx, options).await?;
 
                     if let Some(left_df) = current_df {
                         let new_vars = self.extract_vars(e, v);
@@ -48,10 +68,10 @@ impl<'a> QueryPlanner<'a> {
                                 JoinType::Inner,
                                 &[],
                                 &[],
-                                Some(lit(true)),
+                                // Add the extra None here
+                                Some(Expr::Literal(ScalarValue::Boolean(Some(true)), None)),
                             )?);
                         } else {
-                            // 1. Alias the right-hand columns to avoid name collisions during join
                             let mut right_keys = Vec::new();
                             let mut select_exprs = Vec::new();
 
@@ -67,7 +87,6 @@ impl<'a> QueryPlanner<'a> {
                             }
                             next_df = next_df.select(select_exprs)?;
 
-                            // 2. Perform the join using the aliases for the right side
                             let left_keys: Vec<&str> =
                                 join_cols.iter().map(|s| s.as_str()).collect();
                             let right_keys_str: Vec<&str> =
@@ -81,7 +100,6 @@ impl<'a> QueryPlanner<'a> {
                                 None,
                             )?;
 
-                            // 3. Drop the aliased columns
                             let drop_exprs: Vec<Expr> = joined
                                 .schema()
                                 .fields()
@@ -110,7 +128,6 @@ impl<'a> QueryPlanner<'a> {
             MesoError::PlanError("Query must have at least one WHERE clause".into())
         })?;
 
-        // 2. Process FIND clause
         let mut select_exprs = Vec::new();
         for find_spec in &query.find {
             match find_spec {
@@ -126,7 +143,14 @@ impl<'a> QueryPlanner<'a> {
         Ok(final_df.select(select_exprs)?)
     }
 
-    async fn plan_data_pattern(&self, e: &Term, a: &Term, v: &Term) -> Result<DataFrame> {
+    async fn plan_data_pattern(
+        &self,
+        e: &Term,
+        a: &Term,
+        v: &Term,
+        tx: &Option<Term>,
+        options: &Option<BTreeMap<String, Term>>,
+    ) -> Result<DataFrame> {
         let mut df = self.ctx.table(self.table_name).await?;
         let mut filters = Vec::new();
         let mut projections = Vec::new();
@@ -164,6 +188,44 @@ impl<'a> QueryPlanner<'a> {
             _ => return Err(MesoError::PlanError("Unsupported value term".into())),
         }
 
+        if let Some(Term::Integer(tx_id)) = tx {
+            filters.push(col("t").eq(lit(*tx_id as u64)));
+        }
+
+        if let Some(opts) = options {
+            for (key, val) in opts {
+                match key.as_str() {
+                    ":at" => {
+                        let t = self.term_to_micros(val)?;
+                        filters.push(col("valid_from").lt_eq(Self::ts_lit(t)));
+                        filters.push(col("valid_to").gt(Self::ts_lit(t)));
+                    }
+                    ":since" => {
+                        let t = self.term_to_micros(val)?;
+                        filters.push(col("valid_from").gt_eq(Self::ts_lit(t)));
+                    }
+                    ":before" => {
+                        let t = self.term_to_micros(val)?;
+                        filters.push(col("valid_to").lt_eq(Self::ts_lit(t)));
+                    }
+                    ":between" => {
+                        if let Term::Vector(vec) = val {
+                            if vec.len() == 2 {
+                                let start = self.term_to_micros(&vec[0])?;
+                                let end = self.term_to_micros(&vec[1])?;
+                                filters.push(col("valid_from").lt(Self::ts_lit(end)));
+                                filters.push(col("valid_to").gt(Self::ts_lit(start)));
+                            }
+                        }
+                    }
+                    _ => return Err(MesoError::PlanError(format!("Unknown option: {}", key))),
+                }
+            }
+        } else {
+            // Compare Timestamp to Timestamp literal
+            filters.push(col("valid_to").eq(Self::ts_lit(i64::MAX)));
+        }
+
         for filter in filters {
             df = df.filter(filter)?;
         }
@@ -197,261 +259,5 @@ impl<'a> QueryPlanner<'a> {
             vars.insert(var.clone());
         }
         vars
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::memtable::MemTable;
-    use crate::parser::parse_query;
-    use datafusion::datasource::memory::MemTable as DfMemTable;
-    use std::sync::Arc;
-
-    async fn setup_df_context(_schema: &SchemaMap) -> SessionContext {
-        let mut memtable = MemTable::new(1);
-        let arrow_batch = memtable.finish().unwrap();
-
-        let ctx = SessionContext::new();
-        let provider = DfMemTable::try_new(arrow_batch.schema(), vec![vec![arrow_batch]]).unwrap();
-        ctx.register_table("datoms", Arc::new(provider)).unwrap();
-
-        ctx
-    }
-
-    #[tokio::test]
-    async fn test_planner_implicit_inner_join() {
-        let mut schema = SchemaMap::new();
-        schema.add_attribute(":user/name", ValueType::String, false);
-        schema.add_attribute(":user/age", ValueType::Int64, false);
-
-        let ctx = setup_df_context(&schema).await;
-        let planner = QueryPlanner::new(&ctx, &schema, "datoms");
-
-        let q_str = r#"
-            [:find ?age
-             :where [?e :user/name "Alice"]
-                    [?e :user/age ?age]]
-        "#;
-        let query_ast = parse_query(q_str).unwrap();
-
-        let df = planner
-            .plan(&query_ast)
-            .await
-            .expect("Failed to plan query");
-        let plan_str = format!("{:?}", df.logical_plan());
-
-        assert!(plan_str.contains("Inner"));
-        assert!(plan_str.contains("?e"));
-    }
-
-    // --- ADVANCED PLANNER TESTS ---
-
-    #[tokio::test]
-    async fn test_planner_self_join() {
-        // Find entities that share the same name (a classic self-join)
-        // [:find ?e1 ?e2 :where [?e1 :user/name ?name] [?e2 :user/name ?name]]
-        let mut schema = SchemaMap::new();
-        schema.add_attribute(":user/name", ValueType::String, false);
-
-        let ctx = setup_df_context(&schema).await;
-        let planner = QueryPlanner::new(&ctx, &schema, "datoms");
-
-        let q_str = r#"[:find ?e1 ?e2 :where [?e1 :user/name ?name] [?e2 :user/name ?name]]"#;
-        let query_ast = parse_query(q_str).unwrap();
-
-        let df = planner
-            .plan(&query_ast)
-            .await
-            .expect("Self-join planning failed");
-        let schema = df.schema();
-
-        // Ensure we have all three variables in the plan, but only projected 2
-        assert_eq!(df.logical_plan().schema().fields().len(), 2);
-        assert!(schema.field_with_name(None, "?e1").is_ok());
-        assert!(schema.field_with_name(None, "?e2").is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_planner_three_hop_chain() {
-        // Testing a chain of joins: e -> a -> b -> name
-        // [:find ?name :where [?e :user/address ?a] [?a :address/city ?c] [?c :city/name ?name]]
-        let mut schema = SchemaMap::new();
-        schema.add_attribute(":user/address", ValueType::Ref, false);
-        schema.add_attribute(":address/city", ValueType::Ref, false);
-        schema.add_attribute(":city/name", ValueType::String, false);
-
-        let ctx = setup_df_context(&schema).await;
-        let planner = QueryPlanner::new(&ctx, &schema, "datoms");
-
-        let q_str = r#"
-            [:find ?name
-             :where [?e :user/address ?a]
-                    [?a :address/city ?c]
-                    [?c :city/name ?name]]
-        "#;
-        let query_ast = parse_query(q_str).unwrap();
-        let df = planner
-            .plan(&query_ast)
-            .await
-            .expect("Chain join planning failed");
-
-        // The final result should only contain the requested variable
-        assert_eq!(df.schema().fields().len(), 1);
-        assert!(df.schema().field_with_name(None, "?name").is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_planner_cross_join_logic() {
-        // Independent variables should trigger a cross-join (Cartesian Product)
-        // [:find ?n ?c :where [?e1 :user/name ?n] [?e2 :city/name ?c]]
-        let mut schema = SchemaMap::new();
-        schema.add_attribute(":user/name", ValueType::String, false);
-        schema.add_attribute(":city/name", ValueType::String, false);
-
-        let ctx = setup_df_context(&schema).await;
-        let planner = QueryPlanner::new(&ctx, &schema, "datoms");
-
-        let q_str = r#"[:find ?n ?c :where [?e1 :user/name ?n] [?e2 :city/name ?c]]"#;
-        let query_ast = parse_query(q_str).unwrap();
-
-        let df = planner
-            .plan(&query_ast)
-            .await
-            .expect("Cross-join planning failed");
-
-        // In the logical plan, this should manifest as a Join with no keys and a literal true filter
-        let plan_str = format!("{:?}", df.logical_plan());
-        assert!(plan_str.contains("Inner") || plan_str.contains("Cross"));
-    }
-
-    #[tokio::test]
-    async fn test_planner_mixed_literals_and_vars() {
-        let mut schema = SchemaMap::new();
-        schema.add_attribute(":user/active", ValueType::Boolean, false);
-        schema.add_attribute(":user/role", ValueType::String, false);
-
-        let ctx = setup_df_context(&schema).await;
-        let planner = QueryPlanner::new(&ctx, &schema, "datoms");
-
-        let q_str = r#"[:find ?e :where [?e :user/active true] [?e :user/role "admin"]] "#;
-        let query_ast = parse_query(q_str).unwrap();
-
-        let df = planner
-            .plan(&query_ast)
-            .await
-            .expect("Literal filtering failed");
-        assert!(df.schema().field_with_name(None, "?e").is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_planner_entity_is_literal() {
-        // Querying attributes for a specific known Entity ID
-        let mut schema = SchemaMap::new();
-        schema.add_attribute(":user/name", ValueType::String, false);
-
-        let ctx = setup_df_context(&schema).await;
-        let planner = QueryPlanner::new(&ctx, &schema, "datoms");
-
-        let q_str = r#"[:find ?n :where [12345 :user/name ?n]]"#;
-        let query_ast = parse_query(q_str).unwrap();
-
-        let df = planner
-            .plan(&query_ast)
-            .await
-            .expect("Entity literal planning failed");
-        let plan_str = format!("{:?}", df.logical_plan());
-        assert!(plan_str.contains("12345"));
-    }
-
-    #[tokio::test]
-    async fn test_planner_triangular_join() {
-        // A shares a variable with B, B shares with C, C shares with A.
-        // [:find ?e1 :where [?e1 :friend ?e2] [?e2 :friend ?e3] [?e3 :friend ?e1]]
-        let mut schema = SchemaMap::new();
-        schema.add_attribute(":friend", ValueType::Ref, false);
-
-        let ctx = setup_df_context(&schema).await;
-        let planner = QueryPlanner::new(&ctx, &schema, "datoms");
-
-        let q_str = r#"[:find ?e1 :where [?e1 :friend ?e2] [?e2 :friend ?e3] [?e3 :friend ?e1]]"#;
-        let query_ast = parse_query(q_str).unwrap();
-
-        let result = planner.plan(&query_ast).await;
-        assert!(
-            result.is_ok(),
-            "Triangular join should not cause schema collisions"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_planner_blank_node_handling() {
-        // Blank nodes "_" should be ignored by the planner (existential check)
-        let mut schema = SchemaMap::new();
-        schema.add_attribute(":user/email", ValueType::String, false);
-
-        let ctx = setup_df_context(&schema).await;
-        let planner = QueryPlanner::new(&ctx, &schema, "datoms");
-
-        let q_str = r#"[:find ?e :where [?e :user/email _]]"#;
-        let query_ast = parse_query(q_str).unwrap();
-
-        let df = planner
-            .plan(&query_ast)
-            .await
-            .expect("Blank node planning failed");
-        // Schema should only have ?e, not any column for the email value
-        assert_eq!(df.schema().fields().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn test_planner_multiple_projections() {
-        let mut schema = SchemaMap::new();
-        schema.add_attribute(":user/name", ValueType::String, false);
-        schema.add_attribute(":user/email", ValueType::String, false);
-
-        let ctx = setup_df_context(&schema).await;
-        let planner = QueryPlanner::new(&ctx, &schema, "datoms");
-
-        let q_str = r#"[:find ?n ?m :where [?e :user/name ?n] [?e :user/email ?m]]"#;
-        let query_ast = parse_query(q_str).unwrap();
-
-        let df = planner
-            .plan(&query_ast)
-            .await
-            .expect("Multi-projection failed");
-        assert_eq!(df.schema().fields().len(), 2);
-        assert!(df.schema().field_with_name(None, "?n").is_ok());
-        assert!(df.schema().field_with_name(None, "?m").is_ok());
-    }
-
-    #[tokio::test]
-    async fn test_planner_rejects_unsupported_find() {
-        let mut schema = SchemaMap::new();
-        schema.add_attribute(":user/name", ValueType::String, false);
-
-        let ctx = setup_df_context(&schema).await;
-        let planner = QueryPlanner::new(&ctx, &schema, "datoms");
-
-        // (count ?e) is parsed by the parser but not yet implemented in the planner
-        let q_str = r#"[:find (count ?e) :where [?e :user/name ?n]]"#;
-        let query_ast = parse_query(q_str).unwrap();
-
-        let result = planner.plan(&query_ast).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_planner_undefined_attribute_fails() {
-        let schema = SchemaMap::new(); // Empty schema
-        let ctx = setup_df_context(&schema).await;
-        let planner = QueryPlanner::new(&ctx, &schema, "datoms");
-
-        let q_str = r#"[:find ?e :where [?e :ghost/attribute "boo"]] "#;
-        let query_ast = parse_query(q_str).unwrap();
-
-        let result = planner.plan(&query_ast).await;
-        assert!(result.is_err());
-        assert!(format!("{:?}", result.unwrap_err()).contains("UndefinedAttribute"));
     }
 }

@@ -73,7 +73,6 @@ pub fn parse_query(raw_query: &str) -> Result<Query, ParseError> {
                         Rule::data_pattern => {
                             let mut inner = elem_inner.into_inner();
 
-                            // E and A are mandatory. We use .next() safely.
                             let e = parse_term(inner.next().ok_or_else(|| {
                                 ParseError::InvalidSyntax("Missing Entity".into())
                             })?);
@@ -95,35 +94,35 @@ pub fn parse_query(raw_query: &str) -> Result<Query, ParseError> {
                                         let mut opts = BTreeMap::new();
                                         for entry in pair.into_inner() {
                                             let mut entry_inner = entry.into_inner();
-                                            let key =
-                                                entry_inner.next().unwrap().as_str().to_string();
-                                            let val_pair = entry_inner.next().unwrap();
+                                            let key_pair = entry_inner.next().unwrap();
+                                            let key = key_pair.as_str().to_string();
 
-                                            let val = match val_pair.as_rule() {
+                                            let val_wrapper = entry_inner.next().unwrap(); // This is the 'option_val' rule
+                                            let val_inner =
+                                                val_wrapper.into_inner().next().unwrap(); // Peel to 'term' or 'vector_2'
+
+                                            let val = match val_inner.as_rule() {
                                                 Rule::vector_2 => {
-                                                    let mut v_inner = val_pair.into_inner();
+                                                    let mut v_inner = val_inner.into_inner();
                                                     Term::Vector(vec![
                                                         parse_term(v_inner.next().unwrap()),
                                                         parse_term(v_inner.next().unwrap()),
                                                     ])
                                                 }
-                                                // If it's a standard term, use the existing helper
-                                                Rule::term => parse_term(val_pair),
-                                                _ => {
-                                                    // Defensive: skip or handle unexpected sub-rules
-                                                    continue;
-                                                }
+                                                Rule::term => parse_term(val_inner),
+                                                _ => unreachable!(
+                                                    "Unexpected rule inside option_val: {:?}",
+                                                    val_inner.as_rule()
+                                                ),
                                             };
                                             opts.insert(key, val);
                                         }
                                         options = Some(opts);
                                     }
-                                    // CRITICAL: Ignore whitespace/comments/EOI that Pest might yield
                                     _ => {}
                                 }
                             }
 
-                            // Assign positional terms (Arity 3 or 4)
                             if let Some(first) = extra_terms.get(0) {
                                 v = first.clone();
                             }
@@ -199,11 +198,14 @@ pub fn parse_query(raw_query: &str) -> Result<Query, ParseError> {
 }
 
 fn parse_term(pair: pest::iterators::Pair<Rule>) -> Term {
-    // The 'term' rule in pest is a wrapper. We need the actual primitive inside.
-    let inner = pair
-        .into_inner()
-        .next()
-        .expect("Term must have an inner value");
+    let inner = if pair.as_rule() == Rule::term {
+        pair.into_inner()
+            .next()
+            .expect("Term wrapper must have a primitive inside")
+    } else {
+        pair
+    };
+
     match inner.as_rule() {
         Rule::variable => Term::Variable(inner.as_str().to_string()),
         Rule::keyword => Term::Keyword(inner.as_str().to_string()),
@@ -213,11 +215,7 @@ fn parse_term(pair: pest::iterators::Pair<Rule>) -> Term {
         Rule::string => Term::String(inner.into_inner().next().unwrap().as_str().to_string()),
         Rule::blank => Term::Blank,
         Rule::data_src => Term::DataSource(inner.as_str().to_string()),
-        // If we reach here, a rule was passed to parse_term that shouldn't have been
-        _ => unreachable!(
-            "parse_term encountered unexpected rule: {:?}",
-            inner.as_rule()
-        ),
+        _ => unreachable!("parse_term got unexpected rule: {:?}", inner.as_rule()),
     }
 }
 
@@ -244,7 +242,6 @@ mod tests {
     use super::*;
     use crate::ast::*;
 
-    // --- Regression Group: Basic ID & In Clause ---
     #[test]
     fn test_parse_basic_id_1() {
         let q = r#"[:find ?e :where [?e :meso/id 1001]]"#;
@@ -267,7 +264,6 @@ mod tests {
         assert_eq!(in_vars[1], InSpec::Variable("?id".into()));
     }
 
-    // --- Regression Group: Predicates & Pull ---
     #[test]
     fn test_parse_predicate_string() {
         let q = r#"[:find ?e :where [?e :user/email "alice@test.com"]]"#;
@@ -287,14 +283,10 @@ mod tests {
         }
     }
 
-    // --- NEW PERMUTATIONS: MesoDB Bitemporal Options ---
-
     #[test]
     fn test_parse_jit_temporal_at() {
-        // Arity 3 + Options Map
         let q = r#"[:find ?n :where [?e :user/name ?n {:at 1600000000}]]"#;
         let ast = parse_query(q).unwrap();
-
         if let WhereClause::DataPattern { options, .. } = &ast.where_clauses[0] {
             let opts = options.as_ref().expect("Options map should exist");
             assert_eq!(opts.get(":at"), Some(&Term::Integer(1600000000)));
@@ -305,10 +297,8 @@ mod tests {
 
     #[test]
     fn test_parse_jit_temporal_since_with_tx() {
-        // Arity 4 + Options Map
         let q = r#"[:find ?e :where [?e :user/age _ 101 {:since "2024-01-01"}]]"#;
         let ast = parse_query(q).unwrap();
-
         if let WhereClause::DataPattern { v, tx, options, .. } = &ast.where_clauses[0] {
             assert_eq!(v, &Term::Blank);
             assert_eq!(tx.as_ref().unwrap(), &Term::Integer(101));
@@ -319,10 +309,8 @@ mod tests {
 
     #[test]
     fn test_parse_jit_temporal_between_vector() {
-        // Testing the vector_2 rule for ranges
         let q = r#"[:find ?e :where [?e :user/login _ {:between [1000 2000]}]]"#;
         let ast = parse_query(q).unwrap();
-
         if let WhereClause::DataPattern { options, .. } = &ast.where_clauses[0] {
             let opts = options.as_ref().unwrap();
             if let Some(Term::Vector(v)) = opts.get(":between") {
@@ -337,12 +325,9 @@ mod tests {
 
     #[test]
     fn test_parse_xtdb_style_short_pattern() {
-        // Arity 2 + Options Map
         let q = r#"[:find ?e :where [?e :user/active {:at "2023-05-01"}]]"#;
         let ast = parse_query(q).unwrap();
-
         if let WhereClause::DataPattern { v, options, .. } = &ast.where_clauses[0] {
-            // v should default to Blank when arity is 2
             assert_eq!(v, &Term::Blank);
             let opts = options.as_ref().unwrap();
             assert_eq!(opts.get(":at"), Some(&Term::String("2023-05-01".into())));
@@ -353,7 +338,6 @@ mod tests {
     fn test_parse_multiple_options() {
         let q = r#"[:find ?e :where [?e :user/name ?n {:at 500 :since 100}]]"#;
         let ast = parse_query(q).unwrap();
-
         if let WhereClause::DataPattern { options, .. } = &ast.where_clauses[0] {
             let opts = options.as_ref().unwrap();
             assert_eq!(opts.len(), 2);
@@ -364,7 +348,6 @@ mod tests {
 
     #[test]
     fn test_parse_fail_on_nested_map() {
-        // This should fail because our grammar only allows flat map_entry
         let q = r#"[:find ?e :where [?e :a ?v {:outer {:inner 1}}]]"#;
         let result = parse_query(q);
         assert!(result.is_err());
