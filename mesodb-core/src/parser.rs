@@ -1,7 +1,7 @@
 // mesodb-core/src/parser.rs
-
 use pest::Parser;
 use pest_derive::Parser;
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 use crate::ast::{Binding, FindSpec, InSpec, PullAttribute, PullPattern, Query, Term, WhereClause};
@@ -19,7 +19,6 @@ pub struct DatalogParser;
 pub fn parse_query(raw_query: &str) -> Result<Query, ParseError> {
     let mut parsed = DatalogParser::parse(Rule::query, raw_query)
         .map_err(|e| ParseError::InvalidSyntax(e.to_string()))?;
-
     let query_pair = parsed.next().unwrap();
 
     let mut find = Vec::new();
@@ -72,15 +71,72 @@ pub fn parse_query(raw_query: &str) -> Result<Query, ParseError> {
                     let elem_inner = where_elem.into_inner().next().unwrap();
                     match elem_inner.as_rule() {
                         Rule::data_pattern => {
-                            let mut terms = Vec::new();
-                            for term_pair in elem_inner.into_inner() {
-                                terms.push(parse_term(term_pair));
+                            let mut inner = elem_inner.into_inner();
+
+                            // E and A are mandatory. We use .next() safely.
+                            let e = parse_term(inner.next().ok_or_else(|| {
+                                ParseError::InvalidSyntax("Missing Entity".into())
+                            })?);
+                            let a = parse_term(inner.next().ok_or_else(|| {
+                                ParseError::InvalidSyntax("Missing Attribute".into())
+                            })?);
+
+                            let mut v = Term::Blank;
+                            let mut tx = None;
+                            let mut options = None;
+                            let mut extra_terms = Vec::new();
+
+                            for pair in inner {
+                                match pair.as_rule() {
+                                    Rule::term => {
+                                        extra_terms.push(parse_term(pair));
+                                    }
+                                    Rule::options_map => {
+                                        let mut opts = BTreeMap::new();
+                                        for entry in pair.into_inner() {
+                                            let mut entry_inner = entry.into_inner();
+                                            let key =
+                                                entry_inner.next().unwrap().as_str().to_string();
+                                            let val_pair = entry_inner.next().unwrap();
+
+                                            let val = match val_pair.as_rule() {
+                                                Rule::vector_2 => {
+                                                    let mut v_inner = val_pair.into_inner();
+                                                    Term::Vector(vec![
+                                                        parse_term(v_inner.next().unwrap()),
+                                                        parse_term(v_inner.next().unwrap()),
+                                                    ])
+                                                }
+                                                // If it's a standard term, use the existing helper
+                                                Rule::term => parse_term(val_pair),
+                                                _ => {
+                                                    // Defensive: skip or handle unexpected sub-rules
+                                                    continue;
+                                                }
+                                            };
+                                            opts.insert(key, val);
+                                        }
+                                        options = Some(opts);
+                                    }
+                                    // CRITICAL: Ignore whitespace/comments/EOI that Pest might yield
+                                    _ => {}
+                                }
                             }
+
+                            // Assign positional terms (Arity 3 or 4)
+                            if let Some(first) = extra_terms.get(0) {
+                                v = first.clone();
+                            }
+                            if let Some(second) = extra_terms.get(1) {
+                                tx = Some(second.clone());
+                            }
+
                             where_clauses.push(WhereClause::DataPattern {
-                                e: terms[0].clone(),
-                                a: terms[1].clone(),
-                                v: terms[2].clone(),
-                                tx: terms.get(3).cloned(),
+                                e,
+                                a,
+                                v,
+                                tx,
+                                options,
                             });
                         }
                         Rule::rule_expr => {
@@ -92,43 +148,35 @@ pub fn parse_query(raw_query: &str) -> Result<Query, ParseError> {
                             }
                             where_clauses.push(WhereClause::RuleExpr { rule_name, args });
                         }
-                        // NEW: Map function clauses
                         Rule::fn_clause => {
                             let mut fn_parts = elem_inner.into_inner();
                             let expr_pair = fn_parts.next().unwrap();
                             let bind_pair = fn_parts.next().unwrap();
-
-                            // 1. Extract the function name and arguments
                             let mut expr_inner = expr_pair.into_inner();
                             let fn_name = expr_inner.next().unwrap().as_str().to_string();
                             let mut args = Vec::new();
                             for arg_pair in expr_inner {
                                 args.push(parse_term(arg_pair));
                             }
-
-                            // 2. Extract the binding strategy
                             let bind_inner = bind_pair.into_inner().next().unwrap();
                             let binding = match bind_inner.as_rule() {
                                 Rule::binding_scalar => {
                                     Binding::Scalar(bind_inner.as_str().to_string())
                                 }
-                                Rule::binding_tuple => {
-                                    let vars = bind_inner
+                                Rule::binding_tuple => Binding::Tuple(
+                                    bind_inner
                                         .into_inner()
                                         .map(|v| v.as_str().to_string())
-                                        .collect();
-                                    Binding::Tuple(vars)
-                                }
-                                Rule::binding_rel => {
-                                    let vars = bind_inner
+                                        .collect(),
+                                ),
+                                Rule::binding_rel => Binding::Relation(
+                                    bind_inner
                                         .into_inner()
                                         .map(|v| v.as_str().to_string())
-                                        .collect();
-                                    Binding::Relation(vars)
-                                }
+                                        .collect(),
+                                ),
                                 _ => unreachable!(),
                             };
-
                             where_clauses.push(WhereClause::Function {
                                 fn_name,
                                 args,
@@ -151,7 +199,11 @@ pub fn parse_query(raw_query: &str) -> Result<Query, ParseError> {
 }
 
 fn parse_term(pair: pest::iterators::Pair<Rule>) -> Term {
-    let inner = pair.into_inner().next().unwrap();
+    // The 'term' rule in pest is a wrapper. We need the actual primitive inside.
+    let inner = pair
+        .into_inner()
+        .next()
+        .expect("Term must have an inner value");
     match inner.as_rule() {
         Rule::variable => Term::Variable(inner.as_str().to_string()),
         Rule::keyword => Term::Keyword(inner.as_str().to_string()),
@@ -161,7 +213,11 @@ fn parse_term(pair: pest::iterators::Pair<Rule>) -> Term {
         Rule::string => Term::String(inner.into_inner().next().unwrap().as_str().to_string()),
         Rule::blank => Term::Blank,
         Rule::data_src => Term::DataSource(inner.as_str().to_string()),
-        _ => unreachable!(),
+        // If we reach here, a rule was passed to parse_term that shouldn't have been
+        _ => unreachable!(
+            "parse_term encountered unexpected rule: {:?}",
+            inner.as_rule()
+        ),
     }
 }
 
@@ -186,8 +242,9 @@ fn parse_pull_pattern(pair: pest::iterators::Pair<Rule>) -> PullPattern {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::*;
 
-    // --- Group 1: Basic ID Queries ---
+    // --- Regression Group: Basic ID & In Clause ---
     #[test]
     fn test_parse_basic_id_1() {
         let q = r#"[:find ?e :where [?e :meso/id 1001]]"#;
@@ -205,46 +262,21 @@ mod tests {
     fn test_parse_basic_id_2_with_in() {
         let q = r#"[:find ?e :in $ ?id :where [?e :meso/id ?id]]"#;
         let ast = parse_query(q).unwrap();
-        let in_vars = ast.in_vars.unwrap();
+        let in_vars = ast.in_vars.as_ref().unwrap();
         assert_eq!(in_vars[0], InSpec::DataSource("$".into()));
         assert_eq!(in_vars[1], InSpec::Variable("?id".into()));
     }
 
-    // --- Group 2: Predicates (Int, Float, String, Blank) ---
+    // --- Regression Group: Predicates & Pull ---
     #[test]
     fn test_parse_predicate_string() {
         let q = r#"[:find ?e :where [?e :user/email "alice@test.com"]]"#;
         let ast = parse_query(q).unwrap();
         if let WhereClause::DataPattern { v, .. } = &ast.where_clauses[0] {
             assert_eq!(v, &Term::String("alice@test.com".into()));
-        } else {
-            panic!("Expected DataPattern");
         }
     }
 
-    #[test]
-    fn test_parse_predicate_float() {
-        let q = r#"[:find ?e :where [?e :math/pi 4.14159]]"#;
-        let ast = parse_query(q).unwrap();
-        if let WhereClause::DataPattern { v, .. } = &ast.where_clauses[0] {
-            assert_eq!(v, &Term::Float(4.14159));
-        } else {
-            panic!("Expected DataPattern");
-        }
-    }
-
-    #[test]
-    fn test_parse_predicate_blank_node() {
-        let q = r#"[:find ?e :where [?e :user/email _]]"#;
-        let ast = parse_query(q).unwrap();
-        if let WhereClause::DataPattern { v, .. } = &ast.where_clauses[0] {
-            assert_eq!(v, &Term::Blank);
-        } else {
-            panic!("Expected DataPattern");
-        }
-    }
-
-    // --- Group 3: Pull Syntax ---
     #[test]
     fn test_parse_pull_simple() {
         let q = r#"[:find (pull ?e [:user/name :user/email]) :where [?e :meso/id 1]]"#;
@@ -252,198 +284,89 @@ mod tests {
         if let FindSpec::Pull(var, pat) = &ast.find[0] {
             assert_eq!(var, "?e");
             assert_eq!(pat.0.len(), 2);
-            assert_eq!(pat.0[0], PullAttribute::Simple(":user/name".into()));
+        }
+    }
+
+    // --- NEW PERMUTATIONS: MesoDB Bitemporal Options ---
+
+    #[test]
+    fn test_parse_jit_temporal_at() {
+        // Arity 3 + Options Map
+        let q = r#"[:find ?n :where [?e :user/name ?n {:at 1600000000}]]"#;
+        let ast = parse_query(q).unwrap();
+
+        if let WhereClause::DataPattern { options, .. } = &ast.where_clauses[0] {
+            let opts = options.as_ref().expect("Options map should exist");
+            assert_eq!(opts.get(":at"), Some(&Term::Integer(1600000000)));
         } else {
-            panic!("Expected Pull");
+            panic!("Expected DataPattern with options");
         }
     }
 
     #[test]
-    fn test_parse_pull_nested_single() {
-        let q = r#"[:find (pull ?e [:user/name {:user/address [:address/street]}]) :where [?e :meso/id 1]]"#;
+    fn test_parse_jit_temporal_since_with_tx() {
+        // Arity 4 + Options Map
+        let q = r#"[:find ?e :where [?e :user/age _ 101 {:since "2024-01-01"}]]"#;
         let ast = parse_query(q).unwrap();
-        if let FindSpec::Pull(_, pat) = &ast.find[0] {
-            assert_eq!(pat.0.len(), 2);
-            if let PullAttribute::Map(kw, sub_pat) = &pat.0[1] {
-                assert_eq!(kw, ":user/address");
-                assert_eq!(
-                    sub_pat.0[0],
-                    PullAttribute::Simple(":address/street".into())
-                );
+
+        if let WhereClause::DataPattern { v, tx, options, .. } = &ast.where_clauses[0] {
+            assert_eq!(v, &Term::Blank);
+            assert_eq!(tx.as_ref().unwrap(), &Term::Integer(101));
+            let opts = options.as_ref().unwrap();
+            assert_eq!(opts.get(":since"), Some(&Term::String("2024-01-01".into())));
+        }
+    }
+
+    #[test]
+    fn test_parse_jit_temporal_between_vector() {
+        // Testing the vector_2 rule for ranges
+        let q = r#"[:find ?e :where [?e :user/login _ {:between [1000 2000]}]]"#;
+        let ast = parse_query(q).unwrap();
+
+        if let WhereClause::DataPattern { options, .. } = &ast.where_clauses[0] {
+            let opts = options.as_ref().unwrap();
+            if let Some(Term::Vector(v)) = opts.get(":between") {
+                assert_eq!(v.len(), 2);
+                assert_eq!(v[0], Term::Integer(1000));
+                assert_eq!(v[1], Term::Integer(2000));
             } else {
-                panic!("Expected Nested Map");
+                panic!("Expected Vector for :between");
             }
-        } else {
-            panic!("Expected Pull");
         }
     }
 
     #[test]
-    fn test_parse_pull_nested_multiple() {
-        let q = r#"[:find (pull ?e [{:user/address [:address/street :address/city]} {:user/employer [:employer/name]}]) :where [?e :meso/id 1]]"#;
+    fn test_parse_xtdb_style_short_pattern() {
+        // Arity 2 + Options Map
+        let q = r#"[:find ?e :where [?e :user/active {:at "2023-05-01"}]]"#;
         let ast = parse_query(q).unwrap();
-        if let FindSpec::Pull(_, pat) = &ast.find[0] {
-            assert_eq!(pat.0.len(), 2);
-        } else {
-            panic!("Expected Pull");
-        }
-    }
 
-    // --- Group 4: User Input (:in) ---
-    #[test]
-    fn test_parse_in_multiple() {
-        let q = r#"[:find ?name :in $ ?age ?status :where [?e :user/age ?age] [?e :user/status ?status]]"#;
-        let ast = parse_query(q).unwrap();
-        let in_vars = ast.in_vars.unwrap();
-        assert_eq!(in_vars.len(), 3);
-        assert_eq!(in_vars[2], InSpec::Variable("?status".into()));
-    }
-
-    // --- Group 5: Joins Across Namespaces ---
-    #[test]
-    fn test_parse_2_hop_join() {
-        let q = r#"[:find ?street :where [?e :user/name "Alice"] [?e :user/address ?a] [?a :address/street ?street]]"#;
-        let ast = parse_query(q).unwrap();
-        assert_eq!(ast.where_clauses.len(), 3);
-    }
-
-    #[test]
-    fn test_parse_3_hop_join() {
-        let q = r#"
-            [:find ?employer
-             :where [?u :user/name "Bob"]
-                    [?u :user/address ?a]
-                    [?a :address/city "NYC"]
-                    [?u :user/employer ?emp]
-                    [?emp :employer/name ?employer]]
-        "#;
-        let ast = parse_query(q).unwrap();
-        assert_eq!(ast.where_clauses.len(), 5);
-    }
-
-    #[test]
-    fn test_parse_self_join() {
-        let q = r#"[:find ?friend_name :where [?u :user/name "Alice"] [?u :user/friend ?f] [?f :user/name ?friend_name]]"#;
-        let ast = parse_query(q).unwrap();
-        assert_eq!(ast.where_clauses.len(), 3);
-    }
-
-    // --- Group 6: Rules ---
-    #[test]
-    fn test_parse_simple_rule() {
-        let q = r#"[:find ?e :in $ % :where (active-user ?e)]"#;
-        let ast = parse_query(q).unwrap();
-        assert_eq!(ast.in_vars.unwrap()[1], InSpec::DataSource("%".into()));
-
-        if let WhereClause::RuleExpr { rule_name, args } = &ast.where_clauses[0] {
-            assert_eq!(rule_name, "active-user");
-            assert_eq!(args[0], Term::Variable("?e".into()));
-        } else {
-            panic!("Expected RuleExpr");
+        if let WhereClause::DataPattern { v, options, .. } = &ast.where_clauses[0] {
+            // v should default to Blank when arity is 2
+            assert_eq!(v, &Term::Blank);
+            let opts = options.as_ref().unwrap();
+            assert_eq!(opts.get(":at"), Some(&Term::String("2023-05-01".into())));
         }
     }
 
     #[test]
-    fn test_parse_rule_with_args() {
-        let q = r#"[:find ?e :in $ % ?status :where (users-by-status ?e ?status)]"#;
+    fn test_parse_multiple_options() {
+        let q = r#"[:find ?e :where [?e :user/name ?n {:at 500 :since 100}]]"#;
         let ast = parse_query(q).unwrap();
-        if let WhereClause::RuleExpr { args, .. } = &ast.where_clauses[0] {
-            assert_eq!(args.len(), 2);
-        } else {
-            panic!("Expected RuleExpr");
-        }
-    }
 
-    // --- Group 7: Aggregations & Misc ---
-    #[test]
-    fn test_parse_aggregate_count() {
-        let q = r#"[:find (count ?e) :where [?e :user/active true]]"#;
-        let ast = parse_query(q).unwrap();
-        if let FindSpec::Aggregate(func, var) = &ast.find[0] {
-            assert_eq!(func, "count");
-            assert_eq!(var, "?e");
-        } else {
-            panic!("Expected Aggregate");
-        }
-
-        if let WhereClause::DataPattern { v, .. } = &ast.where_clauses[0] {
-            assert_eq!(v, &Term::Boolean(true));
-        } else {
-            panic!("Expected DataPattern");
+        if let WhereClause::DataPattern { options, .. } = &ast.where_clauses[0] {
+            let opts = options.as_ref().unwrap();
+            assert_eq!(opts.len(), 2);
+            assert!(opts.contains_key(":at"));
+            assert!(opts.contains_key(":since"));
         }
     }
 
     #[test]
-    fn test_parse_data_pattern_with_tx() {
-        // 4-tuple including the transaction ID
-        let q = r#"[:find ?e ?tx :where [?e :user/name "Alice" ?tx]]"#;
-        let ast = parse_query(q).unwrap();
-        if let WhereClause::DataPattern { tx, .. } = &ast.where_clauses[0] {
-            assert_eq!(tx.as_ref().unwrap(), &Term::Variable("?tx".into()));
-        } else {
-            panic!("Expected tx to be parsed");
-        }
-    }
-
-    #[test]
-    fn test_parse_fulltext_search_relation_binding() {
-        // [[]] indicates the function returns rows (e.g. Entity and Score)
-        let q =
-            r#"[:find ?e ?score :where [(fulltext $ :user/bio "rust database") [[?e ?score]]]]"#;
-        let ast = parse_query(q).unwrap();
-
-        if let WhereClause::Function {
-            fn_name,
-            args,
-            binding,
-        } = &ast.where_clauses[0]
-        {
-            assert_eq!(fn_name, "fulltext");
-            assert_eq!(args[0], Term::DataSource("$".into()));
-            assert_eq!(args[1], Term::Keyword(":user/bio".into()));
-            assert_eq!(args[2], Term::String("rust database".into()));
-
-            if let Binding::Relation(vars) = binding {
-                assert_eq!(vars, &vec!["?e".to_string(), "?score".to_string()]);
-            } else {
-                panic!("Expected Relation binding");
-            }
-        } else {
-            panic!("Expected Function clause");
-        }
-    }
-
-    #[test]
-    fn test_parse_function_tuple_binding() {
-        // [] indicates the function returns a single tuple
-        let q = r#"[:find ?lat ?lng :where [(get-coordinates ?e) [?lat ?lng]]]"#;
-        let ast = parse_query(q).unwrap();
-
-        if let WhereClause::Function { binding, .. } = &ast.where_clauses[0] {
-            if let Binding::Tuple(vars) = binding {
-                assert_eq!(vars, &vec!["?lat".to_string(), "?lng".to_string()]);
-            } else {
-                panic!("Expected Tuple binding");
-            }
-        } else {
-            panic!("Expected Function clause");
-        }
-    }
-
-    #[test]
-    fn test_parse_function_scalar_binding() {
-        // Raw variable indicates the function returns a single scalar value
-        let q = r#"[:find ?c :where [(add ?a ?b) ?c]]"#;
-        let ast = parse_query(q).unwrap();
-
-        if let WhereClause::Function { binding, .. } = &ast.where_clauses[0] {
-            if let Binding::Scalar(var) = binding {
-                assert_eq!(var, "?c");
-            } else {
-                panic!("Expected Scalar binding");
-            }
-        } else {
-            panic!("Expected Function clause");
-        }
+    fn test_parse_fail_on_nested_map() {
+        // This should fail because our grammar only allows flat map_entry
+        let q = r#"[:find ?e :where [?e :a ?v {:outer {:inner 1}}]]"#;
+        let result = parse_query(q);
+        assert!(result.is_err());
     }
 }

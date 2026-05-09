@@ -1,4 +1,5 @@
 // mesodb-core/src/ast.rs
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Term {
@@ -9,15 +10,15 @@ pub enum Term {
     Float(f64),
     Boolean(bool),
     Blank,
-    DataSource(String), // NEW: e.g., "$" or "%"
+    DataSource(String),
+    Vector(Vec<Term>), // Added for :between [start end]
 }
 
-// NEW: Represents how a function output binds to variables
 #[derive(Debug, Clone, PartialEq)]
 pub enum Binding {
-    Scalar(String),        // e.g., ?c
-    Tuple(Vec<String>),    // e.g., [?x ?y]
-    Relation(Vec<String>), // e.g., [[?e ?score]]
+    Scalar(String),
+    Tuple(Vec<String>),
+    Relation(Vec<String>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -49,12 +50,12 @@ pub enum WhereClause {
         a: Term,
         v: Term,
         tx: Option<Term>,
+        options: Option<BTreeMap<String, Term>>,
     },
     RuleExpr {
         rule_name: String,
         args: Vec<Term>,
     },
-    // NEW: The AST node for fulltext search and other functions
     Function {
         fn_name: String,
         args: Vec<Term>,
