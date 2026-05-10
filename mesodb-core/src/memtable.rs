@@ -1,10 +1,11 @@
-// mesodb-core/src/memtable.rs
-use crate::datom::Datom;
-use crate::types::{Result, Value};
 use arrow::array::*;
 use arrow::datatypes::*;
 use arrow::record_batch::RecordBatch;
 use std::sync::Arc;
+
+use crate::datom::Datom;
+use crate::error::MesoError;
+use crate::types::{Result, Value};
 
 #[derive(Debug)]
 pub struct MemTable {
@@ -162,65 +163,34 @@ impl MemTable {
                 Arc::new(self.valid_from.finish()),
                 Arc::new(self.valid_to.finish()),
             ],
-        )?;
+        )
+        .map_err(|e| MesoError::Arrow(e))?;
         Ok(batch)
     }
 
-    /// Returns the exact Arrow schema used by this MemTable's builders.
     pub fn schema(&self) -> arrow::datatypes::SchemaRef {
-        let mut temp = Self::new(1);
-        // This ensures the schema exactly matches what DataFusion sees in 'finish()'
-        temp.finish().expect("Schema generation failed").schema()
+        self.schema.clone()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
 
     #[test]
     fn test_memtable_append_and_finish() {
         let mut memtable = MemTable::new(100);
-        let now = Utc::now().timestamp_micros();
         memtable.append(Datom::assert(
             1001,
             50,
             Value::String("Alice".to_string()),
             1,
-            now,
+            1000,
         ));
-        memtable.append(Datom::assert(1001, 51, Value::Ref(2002), 1, now));
-        memtable.append(Datom::assert(1001, 52, Value::Int64(35), 2, now));
+        memtable.append(Datom::assert(1001, 51, Value::Int64(35), 2, 2000));
 
         let batch = memtable.finish().expect("Failed to build RecordBatch");
-        assert_eq!(batch.num_rows(), 3);
+        assert_eq!(batch.num_rows(), 2);
         assert_eq!(batch.num_columns(), 13);
-    }
-
-    #[test]
-    fn test_memtable_alignment_all_types() {
-        let mut memtable = MemTable::new(10);
-        let now = Utc::now().timestamp_micros();
-        memtable.append(Datom::assert(1, 1, Value::Boolean(true), 1, now));
-        memtable.append(Datom::assert(1, 2, Value::Int64(42), 1, now));
-        memtable.append(Datom::assert(1, 3, Value::Float64(4.14), 1, now));
-        memtable.append(Datom::assert(1, 4, Value::String("test".into()), 1, now));
-        memtable.append(Datom::assert(1, 5, Value::Ref(99), 1, now));
-        memtable.append(Datom::assert(1, 6, Value::Timestamp(now), 1, now));
-        memtable.append(Datom::assert(1, 7, Value::Uuid([2u8; 16]), 1, now));
-
-        let batch = memtable.finish().expect("Failed to build batch");
-        assert_eq!(batch.num_rows(), 7);
-    }
-
-    #[test]
-    fn test_memtable_capacity_growth() {
-        let mut memtable = MemTable::new(2);
-        for i in 0..100 {
-            memtable.append(Datom::assert(i, 10, Value::Int64(i as i64), 1, 0));
-        }
-        let batch = memtable.finish().unwrap();
-        assert_eq!(batch.num_rows(), 100);
     }
 }

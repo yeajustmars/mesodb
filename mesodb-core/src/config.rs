@@ -1,4 +1,3 @@
-// mesodb-core/src/config.rs
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -9,34 +8,32 @@ pub struct Config {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct StorageConfig {
-    /// Max rows in a MemTable before rotating to a frozen batch
-    pub memtable_rotation_threshold: usize,
-    /// Pre-allocated capacity for new MemTables
-    pub memtable_initial_capacity: usize,
-    /// Whether to allow the database to automatically create attributes
-    /// when they are first encountered in a transaction.
+    /// How many datoms the active MemTable can hold before it is sealed
+    /// and a new WorldView is published.
+    pub memtable_max_rows: usize,
+    /// Allow JIT schema creation during transactions.
     pub allow_jit_schema: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct CompactorConfig {
-    /// Number of background threads for Parquet conversion/merging
+    /// Number of background threads dedicated to Parquet merging and interval closing.
     pub worker_threads: usize,
-    /// How many frozen batches to keep in RAM before forcing a disk flush
-    pub max_frozen_batches_in_ram: usize,
+    /// If this many sealed MemTables are waiting in RAM to be written to disk,
+    /// the Transactor will experience backpressure to prevent OOM errors.
+    pub backpressure_threshold: usize,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             storage: StorageConfig {
-                memtable_rotation_threshold: 100_000,
-                memtable_initial_capacity: 10_000,
-                allow_jit_schema: true, // Default to 'on' for developer velocity
+                memtable_max_rows: 50_000, // Small, fast snapshots
+                allow_jit_schema: true,
             },
             compactor: CompactorConfig {
-                worker_threads: 4,
-                max_frozen_batches_in_ram: 5,
+                worker_threads: 2,
+                backpressure_threshold: 10, // Protects laptop memory
             },
         }
     }

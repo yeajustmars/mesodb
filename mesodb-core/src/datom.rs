@@ -27,7 +27,7 @@ impl Datom {
             t,
             op: true,
             valid_from,
-            valid_to: i64::MAX,
+            valid_to: i64::MAX, // Assertions are valid until the end of time (or until retracted)
         }
     }
 
@@ -45,7 +45,7 @@ impl Datom {
             t,
             op: false,
             valid_from,
-            valid_to: valid_from,
+            valid_to: valid_from, // Retractions immediately close their own interval
         }
     }
 }
@@ -53,22 +53,26 @@ impl Datom {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use crate::types::Value;
 
     #[test]
     fn test_datom_assertion_creation() {
-        let now = Utc::now().timestamp_micros();
+        let now = 1600000000;
         let datom = Datom::assert(1001, 50, Value::String("Alice".to_string()), 1, now);
+
         assert_eq!(datom.e, 1001);
         assert!(datom.op);
+        assert_eq!(datom.valid_from, now);
         assert_eq!(datom.valid_to, i64::MAX);
     }
 
     #[test]
     fn test_datom_retraction_creation() {
-        let ret_time = Utc::now().timestamp_micros();
+        let ret_time = 1600000500;
         let datom = Datom::retract(1001, 50, Value::String("Alice".to_string()), 2, ret_time);
+
         assert!(!datom.op);
+        assert_eq!(datom.valid_from, ret_time);
         assert_eq!(datom.valid_to, ret_time);
     }
 
@@ -80,19 +84,5 @@ mod tests {
 
         assert_eq!(d1, d2);
         assert_ne!(d1, d3);
-    }
-
-    #[test]
-    fn test_datom_validity_bounds() {
-        let now = 10000;
-        let assertion = Datom::assert(1, 10, Value::Boolean(true), 1, now);
-        let retraction = Datom::retract(1, 10, Value::Boolean(true), 2, now + 500);
-
-        // Assertions are valid from their timestamp to infinity
-        assert!(assertion.valid_from < assertion.valid_to);
-        assert_eq!(assertion.valid_to, i64::MAX);
-
-        // Retractions form a closed boundary
-        assert_eq!(retraction.valid_from, retraction.valid_to);
     }
 }

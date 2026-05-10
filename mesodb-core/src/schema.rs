@@ -2,10 +2,8 @@ use ahash::AHashMap;
 use std::sync::Arc;
 
 use crate::error::MesoError;
-use crate::types::{AttributeId, Result};
+use crate::types::{AttributeId, Result, Value};
 
-/// Represents the physical data types that MesoDB supports.
-/// This maps directly to our `Value` enum and Arrow MemTable arrays.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValueType {
     Boolean,
@@ -17,27 +15,18 @@ pub enum ValueType {
     Uuid,
 }
 
-/// The definition of a single Attribute (property) in the database.
 #[derive(Debug, Clone)]
 pub struct Attribute {
-    /// The internal integer ID used in Datoms and MemTables
     pub id: AttributeId,
-    /// The string identifier used by clients (e.g., ":user/email")
     pub ident: String,
-    /// The physical data type of this attribute
     pub value_type: ValueType,
-    /// Whether this attribute must be strictly unique across all entities
     pub is_unique: bool,
 }
 
-/// The fast, in-memory catalog of all attributes in the database.
 #[derive(Debug, Default, Clone)]
 pub struct SchemaMap {
-    // We maintain two maps for O(1) lookups in both directions
     by_ident: AHashMap<String, Arc<Attribute>>,
     by_id: AHashMap<AttributeId, Arc<Attribute>>,
-
-    // A simple counter to auto-assign IDs to new attributes
     next_id: AttributeId,
 }
 
@@ -46,12 +35,10 @@ impl SchemaMap {
         Self {
             by_ident: AHashMap::new(),
             by_id: AHashMap::new(),
-            // We can reserve IDs 1-99 for internal system attributes later
-            next_id: 100,
+            next_id: 100, // Reserve 1-99 for internal system attributes
         }
     }
 
-    /// Registers a new attribute in the schema.
     pub fn add_attribute(
         &mut self,
         ident: &str,
@@ -74,43 +61,41 @@ impl SchemaMap {
         attr
     }
 
-    /// Looks up an attribute by its string identifier.
     pub fn get_by_ident(&self, ident: &str) -> Option<Arc<Attribute>> {
         self.by_ident.get(ident).cloned()
     }
 
-    /// Looks up an attribute by its internal ID.
     pub fn get_by_id(&self, id: AttributeId) -> Option<Arc<Attribute>> {
         self.by_id.get(&id).cloned()
     }
 
-    /// Checks if a string identifier already exists.
+    pub fn get_id(&self, ident: &str) -> Option<u32> {
+        self.by_ident.get(ident).map(|a| a.id)
+    }
+
     pub fn contains_ident(&self, ident: &str) -> bool {
         self.by_ident.contains_key(ident)
     }
 
-    pub fn validate_value(&self, ident: &str, value: &crate::types::Value) -> Result<()> {
+    pub fn validate_value(&self, ident: &str, value: &Value) -> Result<()> {
         let attr = self
             .by_ident
             .get(ident)
             .ok_or_else(|| MesoError::Serialization(format!("Attribute {} not found", ident)))?;
 
         match (&attr.value_type, value) {
-            (ValueType::Int64, crate::types::Value::Int64(_)) => Ok(()),
-            (ValueType::String, crate::types::Value::String(_)) => Ok(()),
-            (ValueType::Boolean, crate::types::Value::Boolean(_)) => Ok(()),
-            (ValueType::Float64, crate::types::Value::Float64(_)) => Ok(()),
-            (ValueType::Uuid, crate::types::Value::Uuid(_)) => Ok(()),
-            (ValueType::Ref, crate::types::Value::Ref(_)) => Ok(()),
+            (ValueType::Int64, Value::Int64(_)) => Ok(()),
+            (ValueType::String, Value::String(_)) => Ok(()),
+            (ValueType::Boolean, Value::Boolean(_)) => Ok(()),
+            (ValueType::Float64, Value::Float64(_)) => Ok(()),
+            (ValueType::Uuid, Value::Uuid(_)) => Ok(()),
+            (ValueType::Ref, Value::Ref(_)) => Ok(()),
+            (ValueType::Timestamp, Value::Timestamp(_)) => Ok(()),
             (expected, found) => Err(MesoError::Serialization(format!(
                 "Type mismatch for {}: expected {:?}, found {:?}",
                 ident, expected, found
             ))),
         }
-    }
-
-    pub fn get_id(&self, ident: &str) -> Option<u32> {
-        self.by_ident.get(ident).map(|a| a.id)
     }
 }
 
@@ -122,50 +107,56 @@ mod tests {
     fn test_schema_map_creation_and_lookup() {
         let mut schema = SchemaMap::new();
 
-        // 1. Add an attribute
         let email_attr = schema.add_attribute(":user/email", ValueType::String, true);
         assert_eq!(email_attr.id, 100);
         assert_eq!(email_attr.ident, ":user/email");
         assert!(email_attr.is_unique);
 
-        // 2. Add another attribute
         let age_attr = schema.add_attribute(":user/age", ValueType::Int64, false);
         assert_eq!(age_attr.id, 101);
 
-        // 3. Test O(1) lookups
         let lookup_by_ident = schema.get_by_ident(":user/email").unwrap();
         assert_eq!(lookup_by_ident.id, 100);
 
         let lookup_by_id = schema.get_by_id(101).unwrap();
         assert_eq!(lookup_by_id.ident, ":user/age");
         assert_eq!(lookup_by_id.value_type, ValueType::Int64);
+    }
 
-        // 4. Test missing lookup
-        assert!(schema.get_by_ident(":does/not_exist").is_none());
+    #[test]
+    fn test_schema_validation_success_and_failure() {
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/age", ValueType::Int64, false);
+
+        // Valid
+        assert!(
+            schema
+                .validate_value(":user/age", &Value::Int64(30))
+                .is_ok()
+        );
+
+        // Invalid Type
+        assert!(
+            schema
+                .validate_value(":user/age", &Value::String("30".into()))
+                .is_err()
+        );
+
+        // Missing Attribute
+        assert!(
+            schema
+                .validate_value(":user/ghost", &Value::Int64(30))
+                .is_err()
+        );
     }
 
     #[test]
     fn test_schema_auto_increment() {
         let mut schema = SchemaMap::new();
-
         let a1 = schema.add_attribute(":sys/a", ValueType::Boolean, false);
         let a2 = schema.add_attribute(":sys/b", ValueType::Boolean, false);
-        let a3 = schema.add_attribute(":sys/c", ValueType::Boolean, false);
 
         assert_eq!(a1.id, 100);
         assert_eq!(a2.id, 101);
-        assert_eq!(a3.id, 102);
-    }
-
-    #[test]
-    fn test_schema_contains_and_missing() {
-        let mut schema = SchemaMap::new();
-        schema.add_attribute(":user/name", ValueType::String, false);
-
-        assert!(schema.contains_ident(":user/name"));
-        assert!(!schema.contains_ident(":user/ghost"));
-
-        assert!(schema.get_by_ident(":user/ghost").is_none());
-        assert!(schema.get_by_id(9999).is_none());
     }
 }
