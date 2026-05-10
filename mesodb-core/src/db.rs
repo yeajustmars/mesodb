@@ -155,16 +155,18 @@ mod tests {
     use super::*;
     use crate::schema::ValueType;
     use crate::types::Value;
-    use tempfile::NamedTempFile;
+    use arrow::array::Array;
 
     #[tokio::test]
     async fn test_end_to_end_query() {
-        let temp_file = NamedTempFile::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+
         let mut schema = SchemaMap::new();
         schema.add_attribute(":user/name", ValueType::String, false);
         schema.add_attribute(":user/age", ValueType::Int64, false);
 
-        let mut db = MesoDB::open(temp_file.path(), schema).unwrap();
+        let mut db = MesoDB::open(db_path, schema).unwrap();
         db.transact(vec![
             Fact {
                 e: 1,
@@ -184,8 +186,20 @@ mod tests {
         let query = r#"[:find ?n ?a :where [?e :user/name ?n] [?e :user/age ?a]]"#;
         let results = db.query(query).await.unwrap();
 
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].num_rows(), 1);
+        // Verify total row count across all potential batches
+        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 1, "Should see exactly one result row for Alice");
+
+        // Verify the data within the batches
+        let name_found = results.iter().any(|batch| {
+            let col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .unwrap();
+            (0..col.len()).any(|i| col.value(i) == "Alice")
+        });
+        assert!(name_found);
     }
 
     #[tokio::test]
