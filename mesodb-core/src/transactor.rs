@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn test_engine_raw_bitemporal_arrow_output() {
-        use arrow::array::{BooleanArray, Int64Array, StringArray, TimestampMicrosecondArray};
+        use arrow::array::{BooleanArray, StringArray, TimestampMicrosecondArray};
 
         let (mut t, _f) = setup_transactor();
 
