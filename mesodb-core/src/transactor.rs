@@ -267,4 +267,77 @@ mod tests {
 
         assert!(err.is_err());
     }
+
+    #[test]
+    fn test_engine_raw_bitemporal_arrow_output() {
+        use arrow::array::{BooleanArray, Int64Array, StringArray, TimestampMicrosecondArray};
+
+        let (mut t, _f) = setup_transactor();
+
+        // 1. Assert Alice at T=100
+        t.transact_at(
+            vec![Fact {
+                e: 1,
+                ident: ":user/name".into(),
+                v: Value::String("Alice".into()),
+                op: true,
+            }],
+            100,
+        )
+        .unwrap();
+
+        // 2. Overwrite with Bob at T=200
+        let report = t
+            .transact_at(
+                vec![Fact {
+                    e: 1,
+                    ident: ":user/name".into(),
+                    v: Value::String("Bob".into()),
+                    op: true,
+                }],
+                200,
+            )
+            .unwrap();
+
+        let batch = report.batch;
+
+        // Downcast the raw Arrow columns
+        let op_col = batch
+            .column(10)
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        let from_col = batch
+            .column(11)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        let to_col = batch
+            .column(12)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        let val_col = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap(); // v_str
+
+        // We expect EXACTLY 2 rows in this batch:
+        // Row 0: The retraction of Alice
+        // Row 1: The assertion of Bob
+        assert_eq!(batch.num_rows(), 2);
+
+        // Verify Row 0 (Retraction of Alice)
+        assert_eq!(val_col.value(0), "Alice");
+        assert_eq!(op_col.value(0), false); // op = false
+        assert_eq!(from_col.value(0), 200);
+        assert_eq!(to_col.value(0), 200); // Retractions close their own bounds immediately
+
+        // Verify Row 1 (Assertion of Bob)
+        assert_eq!(val_col.value(1), "Bob");
+        assert_eq!(op_col.value(1), true); // op = true
+        assert_eq!(from_col.value(1), 200);
+        assert_eq!(to_col.value(1), i64::MAX); // New assertion is valid until the end of time
+    }
 }
