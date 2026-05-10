@@ -1,8 +1,12 @@
+pub mod ast;
 pub mod config;
 pub mod datom;
+pub mod db;
 pub mod error;
 pub mod index;
 pub mod memtable;
+pub mod parser;
+pub mod planner;
 pub mod schema;
 pub mod transactor;
 pub mod types;
