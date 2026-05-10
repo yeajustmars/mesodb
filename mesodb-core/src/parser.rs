@@ -123,7 +123,7 @@ pub fn parse_query(raw_query: &str) -> Result<Query, ParseError> {
                                 }
                             }
 
-                            if let Some(first) = extra_terms.get(0) {
+                            if let Some(first) = extra_terms.first() {
                                 v = first.clone();
                             }
                             if let Some(second) = extra_terms.get(1) {

@@ -5,7 +5,7 @@ use datafusion::dataframe::DataFrameWriteOptions;
 use datafusion::prelude::*;
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::file::properties::WriterProperties;
-use std::fs::File;
+use std::fs::{File, create_dir_all};
 use std::path::PathBuf;
 
 use crate::error::MesoError;
@@ -17,7 +17,7 @@ pub struct BackgroundCompactor {
 
 impl BackgroundCompactor {
     pub fn new(data_dir: PathBuf) -> Self {
-        std::fs::create_dir_all(&data_dir).expect("Failed to create data directory");
+        create_dir_all(&data_dir).expect("Failed to create data directory");
         Self { data_dir }
     }
 
@@ -52,10 +52,10 @@ impl BackgroundCompactor {
             .data_dir
             .join(format!("compacted-{:012}.parquet", output_id));
 
-        let paths: Vec<String> = file_paths
+        let paths = file_paths
             .iter()
             .map(|p| p.to_string_lossy().to_string())
-            .collect();
+            .collect::<Vec<String>>();
 
         let df = ctx.read_parquet(paths, Default::default()).await?;
 

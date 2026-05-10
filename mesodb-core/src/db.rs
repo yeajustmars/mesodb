@@ -4,6 +4,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion::datasource::memory::MemTable as DfMemTable;
 use datafusion::prelude::*;
 use std::collections::BTreeMap;
+use std::fs::create_dir_all;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tokio::sync::{Mutex, mpsc};
@@ -15,24 +16,6 @@ use crate::schema::SchemaMap;
 use crate::storage::BackgroundCompactor;
 use crate::transactor::{Fact, Transactor, TxReport};
 use crate::types::Result;
-
-/// A lightweight, lock-free snapshot of the database at a specific point in time.
-#[derive(Clone)]
-pub struct WorldView {
-    /// A thread-safe map of transactions currently sitting in RAM. Keyed by TxId.
-    pub ram_batches: Arc<BTreeMap<u64, RecordBatch>>,
-    /// The physical location of the disk storage (Parquet files).
-    pub data_dir: PathBuf,
-    /// A snapshot of the schema at this moment in time.
-    pub schema: Arc<SchemaMap>,
-}
-
-/// Global options applied to the entire query execution.
-#[derive(Debug, Default, Clone)]
-pub struct QueryOptions {
-    /// If provided, rewinds the entire database to this timestamp before querying.
-    pub as_of: Option<i64>,
-}
 
 pub struct MesoDB {
     /// The transactor is the single writer, guarded by a Tokio Mutex.
@@ -46,7 +29,7 @@ pub struct MesoDB {
 impl MesoDB {
     pub fn open<P: AsRef<Path>>(path: P, schema: SchemaMap, config: Config) -> Result<Self> {
         let data_dir = path.as_ref().parent().unwrap().to_path_buf();
-        std::fs::create_dir_all(&data_dir)?;
+        create_dir_all(&data_dir)?;
 
         let transactor = Transactor::new(path, schema.clone(), config.clone())?;
 
@@ -173,14 +156,13 @@ impl MesoDB {
     ) -> Result<Vec<RecordBatch>> {
         let ast = parse_query(query_str)?;
 
-        // 1. Take a nanosecond snapshot of the world
+        // 1. Take a snapshot of the world
         let view = { self.world_view.read().unwrap().clone() };
-
         let ctx = SessionContext::new();
 
         // 2. Register Disk Data (Parquet)
         let schema = view.ram_batches.get(&0).unwrap().schema();
-        let pq_options = datafusion::prelude::ParquetReadOptions::default().schema(&schema);
+        let pq_options = ParquetReadOptions::default().schema(&schema);
         let table_path = view.data_dir.to_string_lossy().to_string();
         ctx.register_parquet("parquet_datoms", &table_path, pq_options)
             .await?;
@@ -240,10 +222,38 @@ impl MesoDB {
 
         // 6. Plan & Execute against the perfectly resolved intervals
         let planner = QueryPlanner::new(&ctx, view.schema.as_ref(), "resolved_datoms");
-        let final_df: datafusion::dataframe::DataFrame = planner.plan(&ast).await?;
+        let final_df: DataFrame = planner.plan(&ast).await?;
 
         Ok(final_df.collect().await?)
     }
+}
+
+/// A lightweight, lock-free snapshot of the database at a specific point in time.
+#[derive(Clone)]
+pub struct WorldView {
+    /// A thread-safe map of transactions currently sitting in RAM. Keyed by TxId.
+    pub ram_batches: Arc<BTreeMap<u64, RecordBatch>>,
+    /// The physical location of the disk storage (Parquet files).
+    pub data_dir: PathBuf,
+    /// A snapshot of the schema at this moment in time.
+    pub schema: Arc<SchemaMap>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum OutputFormat {
+    #[default]
+    Tabular,
+    Json,
+    Edn,
+}
+
+/// Global options applied to the entire query execution.
+#[derive(Debug, Default, Clone)]
+pub struct QueryOptions {
+    /// If provided, rewinds the entire database to this timestamp before querying.
+    pub as_of: Option<i64>,
+    /// The serialization format for the output, strictly enforced.
+    pub format: OutputFormat,
 }
 
 #[cfg(test)]
@@ -444,7 +454,10 @@ mod tests {
         let query = r#"[:find ?n :where [10 :user/name ?n]]"#;
 
         // 1. Query with global `as_of` = 150
-        let opts_150 = QueryOptions { as_of: Some(150) };
+        let opts_150 = QueryOptions {
+            as_of: Some(150),
+            format: OutputFormat::Tabular,
+        };
         let res_150 = db.query_with_options(query, opts_150).await.unwrap();
         let col_150 = res_150[0]
             .column(0)

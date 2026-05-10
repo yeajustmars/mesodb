@@ -164,7 +164,7 @@ impl MemTable {
                 Arc::new(self.valid_to.finish()),
             ],
         )
-        .map_err(|e| MesoError::Arrow(e))?;
+        .map_err(MesoError::Arrow)?;
         Ok(batch)
     }
 

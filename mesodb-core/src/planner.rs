@@ -25,6 +25,7 @@ impl<'a> QueryPlanner<'a> {
         }
     }
 
+    // TODO: allow ISO8601 datetime strings here
     fn term_to_micros(&self, term: &Term) -> Result<i64> {
         match term {
             Term::Integer(i) => Ok(*i),
@@ -209,13 +210,13 @@ impl<'a> QueryPlanner<'a> {
                         filters.push(col("valid_to").lt_eq(Self::ts_lit(t)));
                     }
                     ":between" => {
-                        if let Term::Vector(vec) = val {
-                            if vec.len() == 2 {
-                                let start = self.term_to_micros(&vec[0])?;
-                                let end = self.term_to_micros(&vec[1])?;
-                                filters.push(col("valid_from").lt(Self::ts_lit(end)));
-                                filters.push(col("valid_to").gt(Self::ts_lit(start)));
-                            }
+                        if let Term::Vector(vec) = val
+                            && vec.len() == 2
+                        {
+                            let start = self.term_to_micros(&vec[0])?;
+                            let end = self.term_to_micros(&vec[1])?;
+                            filters.push(col("valid_from").lt(Self::ts_lit(end)));
+                            filters.push(col("valid_to").gt(Self::ts_lit(start)));
                         }
                     }
                     _ => return Err(MesoError::PlanError(format!("Unknown option: {}", key))),

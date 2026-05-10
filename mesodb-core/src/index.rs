@@ -31,10 +31,10 @@ impl IndexManager {
     /// Removes a datom from the writer's memory state (e.g., during a retraction).
     pub fn remove(&mut self, e: EntityId, a: AttributeId, v: &Value, is_unique: bool) {
         if let Some(attrs) = self.eavt.get_mut(&e) {
-            if let Some(existing_v) = attrs.get(&a) {
-                if existing_v == v {
-                    attrs.remove(&a);
-                }
+            if let Some(existing_v) = attrs.get(&a)
+                && existing_v == v
+            {
+                attrs.remove(&a);
             }
             // Cleanup empty maps to prevent memory leaks
             if attrs.is_empty() {

@@ -20,6 +20,7 @@ impl Wal {
             .write(true)
             .create(true)
             // We intentionally avoid truncate/append here to allow manual seeking for recovery
+            // Do NOT remove suspicious_open_options above and follow Clippy's advise.
             .open(&p)?;
 
         Ok(Self { file, path: p })

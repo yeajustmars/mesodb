@@ -1,7 +1,9 @@
 // mesodb-core/src/transactor.rs
 
 use arrow::record_batch::RecordBatch;
+use std::collections::HashSet;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
 use crate::datom::Datom;
@@ -11,23 +13,6 @@ use crate::memtable::MemTable;
 use crate::schema::{SchemaMap, ValueType};
 use crate::types::{EntityId, Result, TxId, Value};
 use crate::wal::Wal;
-
-#[derive(Debug, Clone)]
-pub struct Fact {
-    pub e: EntityId,
-    pub ident: String,
-    pub v: Value,
-    pub op: bool,
-}
-
-#[derive(Debug)]
-pub struct TxReport {
-    pub tx_id: TxId,
-    pub timestamp: i64,
-    pub datoms_written: usize,
-    /// The immutable Arrow batch for this specific transaction
-    pub batch: RecordBatch,
-}
 
 pub struct Transactor {
     pub config: Config,
@@ -68,8 +53,8 @@ impl Transactor {
     }
 
     pub fn transact(&mut self, facts: Vec<Fact>) -> Result<TxReport> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_micros() as i64;
         self.execute(facts, now)
@@ -92,7 +77,7 @@ impl Transactor {
 
         let tx_id = self.current_tx_id;
         let mut pending_datoms = Vec::with_capacity(facts.len() * 2); // Room for retractions
-        let mut batch_uniques = std::collections::HashSet::new();
+        let mut batch_uniques = HashSet::new();
 
         // --- PHASE 1: Validation & Bitemporal Resolution ---
         for fact in facts {
@@ -125,14 +110,14 @@ impl Transactor {
                 // Assertions
                 if is_unique {
                     let key = (attr_id, fact.v.clone());
-                    if let Some(owner) = self.indices.get_owner_of_unique(attr_id, &fact.v) {
-                        if owner != fact.e {
-                            return Err(MesoError::UniqueConstraintViolation {
-                                attr: fact.ident,
-                                value: fact.v.to_string(),
-                                owner,
-                            });
-                        }
+                    if let Some(owner) = self.indices.get_owner_of_unique(attr_id, &fact.v)
+                        && owner != fact.e
+                    {
+                        return Err(MesoError::UniqueConstraintViolation {
+                            attr: fact.ident,
+                            value: fact.v.to_string(),
+                            owner,
+                        });
                     }
                     if !batch_uniques.insert(key) {
                         return Err(MesoError::Serialization(format!(
@@ -160,10 +145,10 @@ impl Transactor {
                 pending_datoms.push(Datom::assert(fact.e, attr_id, fact.v, tx_id, now));
             } else {
                 // Retractions
-                if let Some(existing_v) = self.indices.get_current_value(fact.e, attr_id) {
-                    if existing_v == &fact.v {
-                        pending_datoms.push(Datom::retract(fact.e, attr_id, fact.v, tx_id, now));
-                    }
+                if let Some(existing_v) = self.indices.get_current_value(fact.e, attr_id)
+                    && existing_v == &fact.v
+                {
+                    pending_datoms.push(Datom::retract(fact.e, attr_id, fact.v, tx_id, now));
                 }
             }
         }
@@ -194,6 +179,23 @@ impl Transactor {
             batch, // Ready to be consumed lock-free by readers!
         })
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct Fact {
+    pub e: EntityId,
+    pub ident: String,
+    pub v: Value,
+    pub op: bool,
+}
+
+#[derive(Debug)]
+pub struct TxReport {
+    pub tx_id: TxId,
+    pub timestamp: i64,
+    pub datoms_written: usize,
+    /// The immutable Arrow batch for this specific transaction
+    pub batch: RecordBatch,
 }
 
 #[cfg(test)]
@@ -330,13 +332,13 @@ mod tests {
 
         // Verify Row 0 (Retraction of Alice)
         assert_eq!(val_col.value(0), "Alice");
-        assert_eq!(op_col.value(0), false); // op = false
+        assert!(!op_col.value(0)); // op = false
         assert_eq!(from_col.value(0), 200);
         assert_eq!(to_col.value(0), 200); // Retractions close their own bounds immediately
 
         // Verify Row 1 (Assertion of Bob)
         assert_eq!(val_col.value(1), "Bob");
-        assert_eq!(op_col.value(1), true); // op = true
+        assert!(op_col.value(1)); // op = true
         assert_eq!(from_col.value(1), 200);
         assert_eq!(to_col.value(1), i64::MAX); // New assertion is valid until the end of time
     }
