@@ -159,8 +159,7 @@ impl MesoDB {
 
         // 3. Register RAM Data
         let ram_vec: Vec<RecordBatch> = view.ram_batches.values().cloned().collect();
-        let ram_provider =
-            DfMemTable::try_new(schema, vec![ram_vec]).map_err(MesoError::DataFusion)?;
+        let ram_provider = DfMemTable::try_new(schema, vec![ram_vec])?;
 
         ctx.register_table("ram_datoms", Arc::new(ram_provider))
             .map_err(MesoError::DataFusion)?;
