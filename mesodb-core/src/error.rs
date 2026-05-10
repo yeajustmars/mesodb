@@ -13,4 +13,13 @@ pub enum MesoError {
 
     #[error("Arrow Error: {0}")]
     Arrow(#[from] arrow::error::ArrowError),
+
+    #[error(
+        "Unique constraint violation: Value '{value}' for attribute '{attr}' is already held by Entity {owner}"
+    )]
+    UniqueConstraintViolation {
+        attr: String,
+        value: String,
+        owner: u64,
+    },
 }
