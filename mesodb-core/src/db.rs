@@ -27,6 +27,13 @@ pub struct WorldView {
     pub schema: Arc<SchemaMap>,
 }
 
+/// Global options applied to the entire query execution.
+#[derive(Debug, Default, Clone)]
+pub struct QueryOptions {
+    /// If provided, rewinds the entire database to this timestamp before querying.
+    pub as_of: Option<i64>,
+}
+
 pub struct MesoDB {
     /// The transactor is the single writer, guarded by a Tokio Mutex.
     transactor: Mutex<Transactor>,
@@ -152,8 +159,18 @@ impl MesoDB {
         Ok(report)
     }
 
-    /// Pure read-only query. Completely lock-free.
+    /// Pure read-only query using default options (current time). Completely lock-free.
     pub async fn query(&self, query_str: &str) -> Result<Vec<RecordBatch>> {
+        self.query_with_options(query_str, QueryOptions::default())
+            .await
+    }
+
+    /// Read-only query with global execution options (e.g., time travel).
+    pub async fn query_with_options(
+        &self,
+        query_str: &str,
+        options: QueryOptions,
+    ) -> Result<Vec<RecordBatch>> {
         let ast = parse_query(query_str)?;
 
         // 1. Take a nanosecond snapshot of the world
@@ -163,10 +180,9 @@ impl MesoDB {
 
         // 2. Register Disk Data (Parquet)
         let schema = view.ram_batches.get(&0).unwrap().schema();
-        let options = datafusion::prelude::ParquetReadOptions::default().schema(&schema);
+        let pq_options = datafusion::prelude::ParquetReadOptions::default().schema(&schema);
         let table_path = view.data_dir.to_string_lossy().to_string();
-
-        ctx.register_parquet("parquet_datoms", &table_path, options)
+        ctx.register_parquet("parquet_datoms", &table_path, pq_options)
             .await?;
 
         // 3. Register RAM Data
@@ -180,25 +196,46 @@ impl MesoDB {
             .await?;
         ctx.register_table("raw_datoms", df.into_view())?;
 
-        // 5. THE BITEMPORAL VIEW: Dynamically resolve overlapping intervals using LEAD
-        let resolved_sql = r#"
-            WITH bounds AS (
+        // 5. THE BITEMPORAL VIEW
+        // If an `as_of` option is provided, we physically ignore any facts asserted AFTER that time
+        // before we even calculate the bitemporal overlap.
+        let time_filter = match options.as_of {
+            Some(t) => format!("WHERE CAST(valid_from AS BIGINT) <= {}", t),
+            None => "".to_string(),
+        };
+
+        // We also filter the resolved view to ensure we only see facts that were valid AT the target time
+        let resolved_time_filter = match options.as_of {
+            Some(t) => format!(
+                "AND CAST(valid_from AS BIGINT) <= {t} AND CAST(COALESCE(next_from, valid_to) AS BIGINT) > {t}"
+            ),
+            None => "".to_string(),
+        };
+
+        let resolved_sql = format!(
+            r#"
+            WITH raw_filtered AS (
+                SELECT * FROM raw_datoms {}
+            ),
+            bounds AS (
                 SELECT
                     *,
                     LEAD(valid_from) OVER (
                         PARTITION BY e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid
                         ORDER BY valid_from ASC, t ASC
                     ) as next_from
-                FROM raw_datoms
+                FROM raw_filtered
             )
             SELECT
                 e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid, t, op, valid_from,
                 COALESCE(next_from, valid_to) as valid_to
             FROM bounds
-            WHERE op = true
-        "#;
+            WHERE op = true {}
+        "#,
+            time_filter, resolved_time_filter
+        );
 
-        let resolved_df = ctx.sql(resolved_sql).await?;
+        let resolved_df = ctx.sql(&resolved_sql).await?;
         ctx.register_table("resolved_datoms", resolved_df.into_view())?;
 
         // 6. Plan & Execute against the perfectly resolved intervals
@@ -355,5 +392,82 @@ mod tests {
             "Should find exactly 1 record for present time"
         );
         assert_eq!(col_now.value(0), "Bob");
+    }
+
+    #[tokio::test]
+    async fn test_global_query_options_time_travel() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = MesoDB::open(
+            dir.path().join("global_time.db"),
+            SchemaMap::new(),
+            Config::default(),
+        )
+        .unwrap();
+
+        // Setup schema
+        db.transact(vec![Fact {
+            e: 1,
+            ident: ":sys/init".into(),
+            v: Value::Boolean(true),
+            op: true,
+        }])
+        .await
+        .unwrap();
+
+        // T = 100: Assert Alice
+        db.transact_at(
+            vec![Fact {
+                e: 10,
+                ident: ":user/name".into(),
+                v: Value::String("Alice".into()),
+                op: true,
+            }],
+            100,
+        )
+        .await
+        .unwrap();
+
+        // T = 200: Overwrite with Alice-Revised
+        db.transact_at(
+            vec![Fact {
+                e: 10,
+                ident: ":user/name".into(),
+                v: Value::String("Alice-Revised".into()),
+                op: true,
+            }],
+            200,
+        )
+        .await
+        .unwrap();
+
+        // Standard Datalog Query (No inline options)
+        let query = r#"[:find ?n :where [10 :user/name ?n]]"#;
+
+        // 1. Query with global `as_of` = 150
+        let opts_150 = QueryOptions { as_of: Some(150) };
+        let res_150 = db.query_with_options(query, opts_150).await.unwrap();
+        let col_150 = res_150[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(
+            col_150.value(0),
+            "Alice",
+            "Global option should rewind to T=150"
+        );
+
+        // 2. Query with default options (Current Time)
+        let res_now = db.query(query).await.unwrap();
+        let col_now = res_now[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(
+            col_now.value(0),
+            "Alice-Revised",
+            "Default should see latest state"
+        );
     }
 }
