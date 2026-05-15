@@ -1,7 +1,6 @@
 use std::io;
 use thiserror::Error;
 
-use crate::parser::ParseError;
 use crate::schema::ValueType;
 use crate::types::Value;
 
@@ -16,9 +15,8 @@ pub enum MesoError {
     #[error("I/O Error: {0}")]
     Io(#[from] io::Error),
 
-    // Inside pub enum MesoError { ... }
     #[error("Parse Error: {0}")]
-    Parser(#[from] ParseError),
+    ParseError(String),
 
     #[error("Parquet Error: {0}")]
     Parquet(#[from] parquet::errors::ParquetError),

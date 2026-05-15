@@ -2,187 +2,121 @@
 use pest::Parser;
 use pest_derive::Parser;
 use std::collections::BTreeMap;
-use thiserror::Error;
 
-use crate::ast::{Binding, FindSpec, InSpec, PullAttribute, PullPattern, Query, Term, WhereClause};
-
-#[derive(Error, Debug)]
-pub enum ParseError {
-    #[error("Failed to parse query: {0}")]
-    InvalidSyntax(String),
-}
+use crate::ast::*;
+use crate::error::MesoError;
 
 #[derive(Parser)]
 #[grammar = "datalog.pest"]
 pub struct DatalogParser;
 
-pub fn parse_query(raw_query: &str) -> Result<Query, ParseError> {
-    let mut parsed = DatalogParser::parse(Rule::query, raw_query)
-        .map_err(|e| ParseError::InvalidSyntax(e.to_string()))?;
+pub fn parse_query(query_str: &str) -> Result<Query, MesoError> {
+    let mut parsed = DatalogParser::parse(Rule::query, query_str)
+        .map_err(|e| MesoError::ParseError(e.to_string()))?;
+
     let query_pair = parsed.next().unwrap();
+    let mut query = Query::default();
 
-    let mut find = Vec::new();
-    let mut in_vars = None;
-    let mut where_clauses = Vec::new();
-
-    for inner_pair in query_pair.into_inner() {
-        match inner_pair.as_rule() {
+    for pair in query_pair.into_inner() {
+        match pair.as_rule() {
             Rule::find_clause => {
-                for find_elem in inner_pair.into_inner() {
-                    let elem_inner = find_elem.into_inner().next().unwrap();
-                    match elem_inner.as_rule() {
+                for find_elem in pair.into_inner() {
+                    let inner = find_elem.into_inner().next().unwrap();
+                    match inner.as_rule() {
                         Rule::variable => {
-                            find.push(FindSpec::Variable(elem_inner.as_str().to_string()))
+                            query
+                                .find
+                                .push(FindSpec::Variable(inner.as_str().to_string()));
                         }
                         Rule::pull_expr => {
-                            let mut pull_parts = elem_inner.into_inner();
-                            let var = pull_parts.next().unwrap().as_str().to_string();
-                            let pat = parse_pull_pattern(pull_parts.next().unwrap());
-                            find.push(FindSpec::Pull(var, pat));
+                            let mut pull_inner = inner.into_inner();
+                            let var_name = pull_inner.next().unwrap().as_str().to_string();
+                            let pattern = parse_pull_pattern(pull_inner.next().unwrap());
+                            query.find.push(FindSpec::Pull(var_name, pattern));
                         }
                         Rule::aggr_expr => {
-                            let mut aggr_parts = elem_inner.into_inner();
-                            let func = aggr_parts.next().unwrap().as_str().to_string();
-                            let var = aggr_parts.next().unwrap().as_str().to_string();
-                            find.push(FindSpec::Aggregate(func, var));
+                            let mut aggr_inner = inner.into_inner();
+                            let aggr_name = aggr_inner.next().unwrap().as_str().to_string();
+                            let var_name = aggr_inner.next().unwrap().as_str().to_string();
+                            query.find.push(FindSpec::Aggregate(aggr_name, var_name));
                         }
-                        _ => unreachable!(),
+                        _ => {}
                     }
                 }
             }
             Rule::in_clause => {
-                let mut ins = Vec::new();
-                for in_elem in inner_pair.into_inner() {
-                    let elem_inner = in_elem.into_inner().next().unwrap();
-                    match elem_inner.as_rule() {
-                        Rule::data_src => {
-                            ins.push(InSpec::DataSource(elem_inner.as_str().to_string()))
-                        }
+                let mut in_vars = Vec::new();
+                for in_elem in pair.into_inner() {
+                    let inner = in_elem.into_inner().next().unwrap();
+                    match inner.as_rule() {
                         Rule::variable => {
-                            ins.push(InSpec::Variable(elem_inner.as_str().to_string()))
+                            in_vars.push(InSpec::Variable(inner.as_str().to_string()))
                         }
-                        _ => unreachable!(),
+                        Rule::data_src => {
+                            in_vars.push(InSpec::DataSource(inner.as_str().to_string()))
+                        }
+                        _ => {}
                     }
                 }
-                in_vars = Some(ins);
+                query.in_vars = Some(in_vars);
             }
             Rule::where_clause => {
-                for where_elem in inner_pair.into_inner() {
-                    let elem_inner = where_elem.into_inner().next().unwrap();
-                    match elem_inner.as_rule() {
+                for where_elem in pair.into_inner() {
+                    let inner = where_elem.into_inner().next().unwrap();
+                    match inner.as_rule() {
                         Rule::data_pattern => {
-                            let mut inner = elem_inner.into_inner();
-
-                            let e = parse_term(inner.next().ok_or_else(|| {
-                                ParseError::InvalidSyntax("Missing Entity".into())
-                            })?);
-                            let a = parse_term(inner.next().ok_or_else(|| {
-                                ParseError::InvalidSyntax("Missing Attribute".into())
-                            })?);
-
-                            let mut v = Term::Blank;
-                            let mut tx = None;
+                            let mut terms = Vec::new();
                             let mut options = None;
-                            let mut extra_terms = Vec::new();
 
-                            for pair in inner {
-                                match pair.as_rule() {
-                                    Rule::term => {
-                                        extra_terms.push(parse_term(pair));
-                                    }
-                                    Rule::options_map => {
-                                        let mut opts = BTreeMap::new();
-                                        for entry in pair.into_inner() {
-                                            let mut entry_inner = entry.into_inner();
-                                            let key_pair = entry_inner.next().unwrap();
-                                            let key = key_pair.as_str().to_string();
-
-                                            let val_wrapper = entry_inner.next().unwrap(); // This is the 'option_val' rule
-                                            let val_inner =
-                                                val_wrapper.into_inner().next().unwrap(); // Peel to 'term' or 'vector_2'
-
-                                            let val = match val_inner.as_rule() {
-                                                Rule::vector_2 => {
-                                                    let mut v_inner = val_inner.into_inner();
-                                                    Term::Vector(vec![
-                                                        parse_term(v_inner.next().unwrap()),
-                                                        parse_term(v_inner.next().unwrap()),
-                                                    ])
-                                                }
-                                                Rule::term => parse_term(val_inner),
-                                                _ => unreachable!(
-                                                    "Unexpected rule inside option_val: {:?}",
-                                                    val_inner.as_rule()
-                                                ),
-                                            };
-                                            opts.insert(key, val);
-                                        }
-                                        options = Some(opts);
-                                    }
-                                    _ => {}
+                            for part in inner.into_inner() {
+                                if part.as_rule() == Rule::options_map {
+                                    options = Some(parse_options_map(part));
+                                } else {
+                                    terms.push(parse_term(part));
                                 }
                             }
 
-                            if let Some(first) = extra_terms.first() {
-                                v = first.clone();
-                            }
-                            if let Some(second) = extra_terms.get(1) {
-                                tx = Some(second.clone());
-                            }
+                            if terms.len() >= 2 {
+                                let e = terms[0].clone();
+                                let a = terms[1].clone();
+                                let v = terms.get(2).cloned().unwrap_or(Term::Blank);
+                                let tx = terms.get(3).cloned();
 
-                            where_clauses.push(WhereClause::DataPattern {
-                                e,
-                                a,
-                                v,
-                                tx,
-                                options,
-                            });
+                                query.where_clauses.push(WhereClause::DataPattern {
+                                    e,
+                                    a,
+                                    v,
+                                    tx,
+                                    options,
+                                });
+                            }
                         }
                         Rule::rule_expr => {
-                            let mut rule_parts = elem_inner.into_inner();
-                            let rule_name = rule_parts.next().unwrap().as_str().to_string();
-                            let mut args = Vec::new();
-                            for arg_pair in rule_parts {
-                                args.push(parse_term(arg_pair));
-                            }
-                            where_clauses.push(WhereClause::RuleExpr { rule_name, args });
+                            let mut rule_inner = inner.into_inner();
+                            let rule_name = rule_inner.next().unwrap().as_str().to_string();
+                            let args = rule_inner.map(parse_term).collect();
+                            query
+                                .where_clauses
+                                .push(WhereClause::RuleExpr { rule_name, args });
                         }
                         Rule::fn_clause => {
-                            let mut fn_parts = elem_inner.into_inner();
-                            let expr_pair = fn_parts.next().unwrap();
-                            let bind_pair = fn_parts.next().unwrap();
-                            let mut expr_inner = expr_pair.into_inner();
-                            let fn_name = expr_inner.next().unwrap().as_str().to_string();
-                            let mut args = Vec::new();
-                            for arg_pair in expr_inner {
-                                args.push(parse_term(arg_pair));
-                            }
-                            let bind_inner = bind_pair.into_inner().next().unwrap();
-                            let binding = match bind_inner.as_rule() {
-                                Rule::binding_scalar => {
-                                    Binding::Scalar(bind_inner.as_str().to_string())
-                                }
-                                Rule::binding_tuple => Binding::Tuple(
-                                    bind_inner
-                                        .into_inner()
-                                        .map(|v| v.as_str().to_string())
-                                        .collect(),
-                                ),
-                                Rule::binding_rel => Binding::Relation(
-                                    bind_inner
-                                        .into_inner()
-                                        .map(|v| v.as_str().to_string())
-                                        .collect(),
-                                ),
-                                _ => unreachable!(),
-                            };
-                            where_clauses.push(WhereClause::Function {
+                            let mut fn_inner = inner.into_inner();
+                            let fn_expr = fn_inner.next().unwrap();
+                            let binding_expr = fn_inner.next().unwrap();
+
+                            let mut fn_args = fn_expr.into_inner();
+                            let fn_name = fn_args.next().unwrap().as_str().to_string();
+                            let args = fn_args.map(parse_term).collect();
+
+                            let binding = parse_binding(binding_expr);
+
+                            query.where_clauses.push(WhereClause::Function {
                                 fn_name,
                                 args,
                                 binding,
                             });
                         }
-                        _ => unreachable!(),
+                        _ => {}
                     }
                 }
             }
@@ -190,33 +124,7 @@ pub fn parse_query(raw_query: &str) -> Result<Query, ParseError> {
         }
     }
 
-    Ok(Query {
-        find,
-        in_vars,
-        where_clauses,
-    })
-}
-
-fn parse_term(pair: pest::iterators::Pair<Rule>) -> Term {
-    let inner = if pair.as_rule() == Rule::term {
-        pair.into_inner()
-            .next()
-            .expect("Term wrapper must have a primitive inside")
-    } else {
-        pair
-    };
-
-    match inner.as_rule() {
-        Rule::variable => Term::Variable(inner.as_str().to_string()),
-        Rule::keyword => Term::Keyword(inner.as_str().to_string()),
-        Rule::integer => Term::Integer(inner.as_str().parse().unwrap()),
-        Rule::float => Term::Float(inner.as_str().parse().unwrap()),
-        Rule::boolean => Term::Boolean(inner.as_str() == "true"),
-        Rule::string => Term::String(inner.into_inner().next().unwrap().as_str().to_string()),
-        Rule::blank => Term::Blank,
-        Rule::data_src => Term::DataSource(inner.as_str().to_string()),
-        _ => unreachable!("parse_term got unexpected rule: {:?}", inner.as_rule()),
-    }
+    Ok(query)
 }
 
 fn parse_pull_pattern(pair: pest::iterators::Pair<Rule>) -> PullPattern {
@@ -224,23 +132,95 @@ fn parse_pull_pattern(pair: pest::iterators::Pair<Rule>) -> PullPattern {
     for pull_attr in pair.into_inner() {
         let inner = pull_attr.into_inner().next().unwrap();
         match inner.as_rule() {
-            Rule::keyword => attrs.push(PullAttribute::Simple(inner.as_str().to_string())),
+            Rule::wildcard => {
+                attrs.push(PullAttribute::Wildcard);
+            }
+            Rule::keyword => {
+                attrs.push(PullAttribute::Simple(inner.as_str().to_string()));
+            }
             Rule::pull_map => {
                 let mut map_inner = inner.into_inner();
-                let kw = map_inner.next().unwrap().as_str().to_string();
-                let pat = parse_pull_pattern(map_inner.next().unwrap());
-                attrs.push(PullAttribute::Map(kw, pat));
+                let key = map_inner.next().unwrap().as_str().to_string();
+                let sub_pattern = parse_pull_pattern(map_inner.next().unwrap());
+                attrs.push(PullAttribute::Map(key, sub_pattern));
             }
-            _ => unreachable!(),
+            _ => {}
         }
     }
     PullPattern(attrs)
 }
 
+fn parse_term(pair: pest::iterators::Pair<Rule>) -> Term {
+    let inner = pair.into_inner().next().unwrap();
+    match inner.as_rule() {
+        Rule::variable => Term::Variable(inner.as_str().to_string()),
+        Rule::keyword => Term::Keyword(inner.as_str().to_string()),
+        Rule::string => {
+            let s = inner.into_inner().next().map(|p| p.as_str()).unwrap_or("");
+            Term::String(s.to_string())
+        }
+        Rule::integer => Term::Integer(inner.as_str().parse().unwrap()),
+        Rule::float => Term::Float(inner.as_str().parse().unwrap()),
+        Rule::boolean => Term::Boolean(inner.as_str() == "true"),
+        Rule::blank => Term::Blank,
+        Rule::data_src => Term::DataSource(inner.as_str().to_string()),
+        _ => Term::Blank,
+    }
+}
+
+fn parse_options_map(pair: pest::iterators::Pair<Rule>) -> BTreeMap<String, Term> {
+    let mut map = BTreeMap::new();
+    for entry in pair.into_inner() {
+        let mut entry_inner = entry.into_inner();
+
+        // FIX: Just call .as_str() directly on the option_key pair to keep the ":" prefix
+        let key = entry_inner.next().unwrap().as_str().to_string();
+
+        let val_pair = entry_inner.next().unwrap().into_inner().next().unwrap();
+        let val = if val_pair.as_rule() == Rule::vector_2 {
+            let mut vec_inner = val_pair.into_inner();
+            let t1 = parse_term(vec_inner.next().unwrap());
+            let t2 = parse_term(vec_inner.next().unwrap());
+            Term::Vector(vec![t1, t2])
+        } else {
+            parse_term(val_pair)
+        };
+
+        map.insert(key, val);
+    }
+    map
+}
+
+fn parse_binding(pair: pest::iterators::Pair<Rule>) -> Binding {
+    let inner = pair.into_inner().next().unwrap();
+    match inner.as_rule() {
+        Rule::binding_scalar => {
+            let var = inner.into_inner().next().unwrap().as_str().to_string();
+            Binding::Scalar(var)
+        }
+        Rule::binding_tuple => {
+            let vars = inner.into_inner().map(|p| p.as_str().to_string()).collect();
+            Binding::Tuple(vars)
+        }
+        Rule::binding_rel => {
+            let vars = inner.into_inner().map(|p| p.as_str().to_string()).collect();
+            Binding::Relation(vars)
+        }
+        _ => Binding::Scalar("?unknown".to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::*;
+
+    #[test]
+    fn test_parse_basic_id_0() {
+        let q = r#"[:find ?name :where [?e :user/name ?name]]"#;
+        let ast = parse_query(q).unwrap();
+        assert_eq!(ast.find, vec![FindSpec::Variable("?name".into())]);
+        assert_eq!(ast.where_clauses.len(), 1);
+    }
 
     #[test]
     fn test_parse_basic_id_1() {
@@ -351,5 +331,49 @@ mod tests {
         let q = r#"[:find ?e :where [?e :a ?v {:outer {:inner 1}}]]"#;
         let result = parse_query(q);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_datomic_pull_syntax() {
+        let q = r#"
+            [:find (pull ?order [:order/id
+                                 {:order/customer [:customer/name]}
+                                 {:order/items [:item/qty {:item/product [*]}]}])
+             :where [?order :order/id "123"]]
+        "#;
+
+        let ast = parse_query(q).unwrap();
+
+        let find_term = &ast.find[0];
+        if let FindSpec::Pull(var, pattern) = find_term {
+            assert_eq!(var, "?order");
+            assert_eq!(pattern.0.len(), 3);
+
+            assert_eq!(pattern.0[0], PullAttribute::Simple(":order/id".into()));
+
+            assert_eq!(
+                pattern.0[1],
+                PullAttribute::Map(
+                    ":order/customer".into(),
+                    PullPattern(vec![PullAttribute::Simple(":customer/name".into())])
+                )
+            );
+
+            assert_eq!(
+                pattern.0[2],
+                PullAttribute::Map(
+                    ":order/items".into(),
+                    PullPattern(vec![
+                        PullAttribute::Simple(":item/qty".into()),
+                        PullAttribute::Map(
+                            ":item/product".into(),
+                            PullPattern(vec![PullAttribute::Wildcard])
+                        )
+                    ])
+                )
+            );
+        } else {
+            panic!("Expected Pull term");
+        }
     }
 }

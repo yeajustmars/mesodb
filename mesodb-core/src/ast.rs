@@ -23,6 +23,7 @@ pub enum Binding {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PullAttribute {
+    Wildcard, // <-- ADDED: Supports [*]
     Simple(String),
     Map(String, PullPattern),
 }
@@ -63,7 +64,7 @@ pub enum WhereClause {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Query {
     pub find: Vec<FindSpec>,
     pub in_vars: Option<Vec<InSpec>>,

@@ -26,7 +26,8 @@ map_entry    = { option_key ~ option_val }
 options_map  = { "{" ~ map_entry+ ~ "}" }
 
 // --- Find Clause ---
-pull_attr    = { keyword | pull_map }
+wildcard     = { "*" } // <-- ADDED: Matches literal *
+pull_attr    = { wildcard | pull_map | keyword } // <-- UPDATED to include wildcard
 pull_map     = { "{" ~ keyword ~ pull_pattern ~ "}" }
 pull_pattern = { "[" ~ pull_attr+ ~ "]" }
 pull_expr    = { "(" ~ "pull" ~ variable ~ pull_pattern ~ ")" }
