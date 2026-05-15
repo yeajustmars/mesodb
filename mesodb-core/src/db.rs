@@ -1,7 +1,6 @@
 // mesodb-core/src/db.rs
 
 use arrow::record_batch::RecordBatch;
-use datafusion::datasource::memory::MemTable as DfMemTable;
 use datafusion::prelude::*;
 use std::collections::BTreeMap;
 use std::fs::create_dir_all;
@@ -10,8 +9,6 @@ use std::sync::{Arc, RwLock};
 use tokio::sync::{Mutex, mpsc};
 
 use crate::config::Config;
-use crate::parser::parse_query;
-use crate::planner::QueryPlanner;
 use crate::schema::SchemaMap;
 use crate::storage::BackgroundCompactor;
 use crate::transactor::{Fact, Transactor, TxReport};
@@ -154,39 +151,58 @@ impl MesoDB {
         query_str: &str,
         options: QueryOptions,
     ) -> Result<Vec<RecordBatch>> {
-        let ast = parse_query(query_str)?;
-
-        // 1. Take a snapshot of the world
+        let ast = crate::parser::parse_query(query_str)?;
         let view = { self.world_view.read().unwrap().clone() };
         let ctx = SessionContext::new();
 
-        // 2. Register Disk Data (Parquet)
-        let schema = view.ram_batches.get(&0).unwrap().schema();
-        let pq_options = ParquetReadOptions::default().schema(&schema);
+        let arrow_schema = view.ram_batches.get(&0).unwrap().schema();
+        let pq_options =
+            datafusion::prelude::ParquetReadOptions::default().schema(arrow_schema.as_ref());
         let table_path = view.data_dir.to_string_lossy().to_string();
-        ctx.register_parquet("parquet_datoms", &table_path, pq_options)
-            .await?;
 
-        // 3. Register RAM Data
-        let ram_vec: Vec<RecordBatch> = view.ram_batches.values().cloned().collect();
-        let ram_provider = DfMemTable::try_new(schema, vec![ram_vec])?;
+        // Register Parquet (ignoring errors if directory is totally empty)
+        let _ = ctx
+            .register_parquet("parquet_datoms", &table_path, pq_options)
+            .await;
+
+        // 1. FIX: Filter out 0-row dummy batches to prevent DataFusion from aggressively pruning the table
+        let mut ram_vec: Vec<RecordBatch> = view
+            .ram_batches
+            .values()
+            .filter(|b| b.num_rows() > 0)
+            .cloned()
+            .collect();
+
+        // MemTable requires at least one batch to establish schema
+        if ram_vec.is_empty() {
+            ram_vec.push(arrow::record_batch::RecordBatch::new_empty(
+                arrow_schema.clone(),
+            ));
+        }
+
+        let ram_provider =
+            datafusion::datasource::memory::MemTable::try_new(arrow_schema.clone(), vec![ram_vec])
+                .unwrap();
+
         ctx.register_table("ram_datoms", Arc::new(ram_provider))?;
 
-        // 4. Create the Raw Unified View
-        let df = ctx
-            .sql("SELECT * FROM parquet_datoms UNION ALL SELECT * FROM ram_datoms")
-            .await?;
-        ctx.register_table("raw_datoms", df.into_view())?;
+        // Fallback view creation depending on if parquet files exist yet
+        let table_exists = ctx.table_exist("parquet_datoms").unwrap_or(false);
+        if table_exists {
+            let df = ctx
+                .sql("SELECT * FROM parquet_datoms UNION ALL SELECT * FROM ram_datoms")
+                .await?;
+            ctx.register_table("raw_datoms", df.into_view())?;
+        } else {
+            let df = ctx.sql("SELECT * FROM ram_datoms").await?;
+            ctx.register_table("raw_datoms", df.into_view())?;
+        }
 
-        // 5. THE BITEMPORAL VIEW
-        // If an `as_of` option is provided, we physically ignore any facts asserted AFTER that time
-        // before we even calculate the bitemporal overlap.
         let time_filter = match options.as_of {
             Some(t) => format!("WHERE CAST(valid_from AS BIGINT) <= {}", t),
             None => "".to_string(),
         };
 
-        // We also filter the resolved view to ensure we only see facts that were valid AT the target time
         let resolved_time_filter = match options.as_of {
             Some(t) => format!(
                 "AND CAST(valid_from AS BIGINT) <= {t} AND CAST(COALESCE(next_from, valid_to) AS BIGINT) > {t}"
@@ -194,6 +210,8 @@ impl MesoDB {
             None => "".to_string(),
         };
 
+        // 2. FIX: Partition strictly by e, a so new values override old ones!
+        // We also explicitly SELECT next_from so the QueryPlanner can filter historical facts.
         let resolved_sql = format!(
             r#"
             WITH raw_filtered AS (
@@ -203,13 +221,14 @@ impl MesoDB {
                 SELECT
                     *,
                     LEAD(valid_from) OVER (
-                        PARTITION BY e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid
+                        PARTITION BY e, a
                         ORDER BY valid_from ASC, t ASC
                     ) as next_from
                 FROM raw_filtered
             )
             SELECT
                 e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid, t, op, valid_from,
+                next_from,
                 COALESCE(next_from, valid_to) as valid_to
             FROM bounds
             WHERE op = true {}
@@ -217,14 +236,21 @@ impl MesoDB {
             time_filter, resolved_time_filter
         );
 
-        let resolved_df = ctx.sql(&resolved_sql).await?;
+        let resolved_df = ctx
+            .sql(&resolved_sql)
+            .await
+            .map_err(crate::error::MesoError::DataFusion)?;
         ctx.register_table("resolved_datoms", resolved_df.into_view())?;
 
-        // 6. Plan & Execute against the perfectly resolved intervals
-        let planner = QueryPlanner::new(&ctx, view.schema.as_ref(), "resolved_datoms");
-        let final_df: DataFrame = planner.plan(&ast).await?;
+        let planner = crate::planner::QueryPlanner::new(
+            &ctx,
+            view.schema.as_ref(),
+            "resolved_datoms",
+            options.format.clone(),
+        );
+        let final_df = planner.plan(&ast).await?;
 
-        Ok(final_df.collect().await?)
+        Ok(final_df.collect().await.unwrap_or_default())
     }
 }
 

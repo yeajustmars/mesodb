@@ -41,6 +41,9 @@ pub enum MesoError {
         value: String,
         owner: u64,
     },
+
+    #[error("Invalid Query: {0}")]
+    InvalidQuery(String),
 }
 
 impl MesoError {
