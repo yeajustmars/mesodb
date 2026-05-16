@@ -15,3 +15,7 @@ tokio = { workspace = true, features = ["full"] }
 [[bench]]
 name = "ingestion"
 harness = false
+
+[[bench]]
+name = "query"
+harness = false
