@@ -55,5 +55,15 @@ fn_clause      = { "[" ~ fn_expr ~ binding ~ "]" }
 where_elem   = { fn_clause | data_pattern | rule_expr }
 where_clause = { ":where" ~ where_elem+ }
 
+// --- Rules ---
+// e.g., (ancestor ?child ?parent)
+rule_head = { "(" ~ ident ~ variable+ ~ ")" }
+
+// e.g., [(ancestor ?c ?p) [?c :person/parent ?p] (some-other-rule ?p)]
+rule_def  = { "[" ~ rule_head ~ where_elem+ ~ "]" }
+
+// A collection of rule definitions passed into the query via %
+ruleset   = { SOI ~ "[" ~ rule_def+ ~ "]" ~ EOI }
+
 // --- Root ---
 query = { SOI ~ "[" ~ find_clause ~ in_clause? ~ where_clause ~ "]" ~ EOI }

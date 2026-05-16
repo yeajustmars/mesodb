@@ -210,6 +210,77 @@ fn parse_binding(pair: pest::iterators::Pair<Rule>) -> Binding {
     }
 }
 
+pub fn parse_ruleset(rules_str: &str) -> Result<RuleSet, MesoError> {
+    let mut parsed = DatalogParser::parse(Rule::ruleset, rules_str)
+        .map_err(|e| MesoError::ParseError(e.to_string()))?;
+
+    let ruleset_pair = parsed.next().unwrap();
+    let mut rules = Vec::new();
+
+    for rule_def_pair in ruleset_pair.into_inner() {
+        if rule_def_pair.as_rule() == Rule::rule_def {
+            let mut inner = rule_def_pair.into_inner();
+
+            // Parse Head
+            let head_pair = inner.next().unwrap();
+            let mut head_inner = head_pair.into_inner();
+            let rule_name = head_inner.next().unwrap().as_str().to_string();
+            let args = head_inner.map(|v| v.as_str().to_string()).collect();
+
+            let head = RuleHead {
+                name: rule_name,
+                args,
+            };
+
+            // Parse Body (reusing our existing where_clause parser logic)
+            let mut body = Vec::new();
+            for where_elem in inner {
+                let elem_inner = where_elem.into_inner().next().unwrap();
+                match elem_inner.as_rule() {
+                    Rule::data_pattern => {
+                        let mut terms = Vec::new();
+                        let mut options = None;
+                        for part in elem_inner.into_inner() {
+                            if part.as_rule() == Rule::options_map {
+                                options = Some(parse_options_map(part));
+                            } else {
+                                terms.push(parse_term(part));
+                            }
+                        }
+                        if terms.len() >= 2 {
+                            let e = terms[0].clone();
+                            let a = terms[1].clone();
+                            let v = terms.get(2).cloned().unwrap_or(Term::Blank);
+                            let tx = terms.get(3).cloned();
+                            body.push(WhereClause::DataPattern {
+                                e,
+                                a,
+                                v,
+                                tx,
+                                options,
+                            });
+                        }
+                    }
+                    Rule::rule_expr => {
+                        let mut rule_inner = elem_inner.into_inner();
+                        let nested_rule_name = rule_inner.next().unwrap().as_str().to_string();
+                        let nested_args = rule_inner.map(parse_term).collect();
+                        body.push(WhereClause::RuleExpr {
+                            rule_name: nested_rule_name,
+                            args: nested_args,
+                        });
+                    }
+                    // Ignoring fn_clause in rule bodies for MVP
+                    _ => {}
+                }
+            }
+            rules.push(RuleDef { head, body });
+        }
+    }
+
+    Ok(RuleSet { rules })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,5 +446,25 @@ mod tests {
         } else {
             panic!("Expected Pull term");
         }
+    }
+
+    #[test]
+    fn test_parse_ruleset() {
+        let rules = r#"
+    [
+        [(ancestor ?child ?parent)
+         [?child :person/parent ?parent]]
+
+        [(ancestor ?child ?ancestor)
+         [?child :person/parent ?parent]
+         (ancestor ?parent ?ancestor)]
+    ]
+    "#;
+
+        let ruleset = parse_ruleset(rules).unwrap();
+        assert_eq!(ruleset.rules.len(), 2);
+        assert_eq!(ruleset.rules[0].head.name, "ancestor");
+        assert_eq!(ruleset.rules[0].body.len(), 1);
+        assert_eq!(ruleset.rules[1].body.len(), 2); // Pattern + Recursive RuleExpr
     }
 }

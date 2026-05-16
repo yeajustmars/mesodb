@@ -64,6 +64,23 @@ pub enum WhereClause {
     },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuleHead {
+    pub name: String,
+    pub args: Vec<String>, // The variables, e.g., ["?child", "?ancestor"]
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuleDef {
+    pub head: RuleHead,
+    pub body: Vec<WhereClause>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RuleSet {
+    pub rules: Vec<RuleDef>,
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Query {
     pub find: Vec<FindSpec>,
