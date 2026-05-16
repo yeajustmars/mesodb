@@ -17,8 +17,8 @@ fn setup_db(dir: &TempDir, sync_mode: WalSyncMode) -> MesoDB {
     let mut config = Config::default();
     config.storage.wal_sync_mode = sync_mode;
 
-    // We keep memtable rows high so we are strictly benchmarking
-    // the WAL/Transactor overhead, not the Parquet compactor.
+    // Set memtable capacity high so we strictly isolate
+    // transaction indexing speed without mixing compaction steps.
     config.storage.memtable_max_rows = 1_000_000;
 
     MesoDB::open(dir.path().join("bench.db"), schema, config).unwrap()
@@ -91,7 +91,7 @@ fn bench_ingestion(c: &mut Criterion) {
         let dir = tempfile::tempdir().unwrap();
         let db = setup_db(&dir, WalSyncMode::Background);
 
-        // Seed the database with 1000 static entities first
+        // Seed the 1,000 entities first
         rt.block_on(async {
             let initial_facts = generate_facts(1000, 0);
             db.transact(initial_facts).await.unwrap();
@@ -100,9 +100,9 @@ fn bench_ingestion(c: &mut Criterion) {
         let mut loop_counter = 0f64;
         b.to_async(&rt).iter(|| {
             loop_counter += 1.0;
-            // Continually hammer the exact same 1000 entities with updated readings.
-            // This forces the transactor to execute history lookups, timeline slicing,
-            // and write retractions on every step.
+
+            // Re-asserting updates onto the existing 1,000 entities.
+            // This isolates history timeline slicing performance.
             let mut update_facts = Vec::with_capacity(1000);
             for i in 0..1000 {
                 update_facts.push(Fact {

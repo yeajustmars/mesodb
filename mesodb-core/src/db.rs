@@ -28,6 +28,9 @@ impl MesoDB {
         let data_dir = path.as_ref().parent().unwrap().to_path_buf();
         create_dir_all(&data_dir)?;
 
+        // Create the parquet sub-directory synchronously right here at startup
+        create_dir_all(data_dir.join("parquet"))?;
+
         let transactor = Transactor::new(path, schema.clone(), config.clone())?;
 
         // We always keep a "TxId 0" empty batch in RAM so DataFusion always knows the schema,
@@ -35,7 +38,6 @@ impl MesoDB {
         let empty_batch = crate::memtable::MemTable::new(0).finish()?;
         let mut initial_ram = BTreeMap::new();
         initial_ram.insert(0, empty_batch);
-
         let world_view = Arc::new(RwLock::new(Arc::new(WorldView {
             ram_batches: Arc::new(initial_ram),
             data_dir: data_dir.clone(),
@@ -63,13 +65,13 @@ impl MesoDB {
             let compactor = BackgroundCompactor::new(data_dir);
 
             while let Some((tx_id, batch)) = flush_rx.recv().await {
-                // 1. Write the batch to a Parquet file
+                // Write the batch to a Parquet file
                 if let Err(e) = compactor.flush_to_parquet(batch, tx_id) {
                     eprintln!("Failed to flush Tx {} to Parquet: {:?}", tx_id, e);
                     continue; // Keep it in RAM if disk fails
                 }
 
-                // 2. Safely remove it from the RAM WorldView so we don't leak memory
+                // Safely remove it from the RAM WorldView so we don't leak memory
                 let current_view = world_view.read().unwrap().as_ref().clone();
                 let mut new_ram = current_view.ram_batches.as_ref().clone();
                 new_ram.remove(&tx_id);
@@ -79,7 +81,6 @@ impl MesoDB {
                     data_dir: current_view.data_dir,
                     schema: current_view.schema,
                 });
-
                 // Atomically update the pointer
                 let mut writer = world_view.write().unwrap();
                 *writer = new_view;
@@ -102,12 +103,10 @@ impl MesoDB {
     /// DRY helper that handles the lock, the transaction, and the lock-free WorldView pointer swap.
     async fn execute(&self, facts: Vec<Fact>, custom_now: Option<i64>) -> Result<TxReport> {
         let mut tx = self.transactor.lock().await;
-
         let report = match custom_now {
             Some(t) => tx.transact_at(facts, t)?,
             None => tx.transact(facts)?,
         };
-
         if report.datoms_written > 0 {
             // 1. Instantly publish the new batch to RAM for immediate reading
             let current_view = self.world_view.read().unwrap().as_ref().clone();
@@ -116,36 +115,37 @@ impl MesoDB {
 
             let new_view = Arc::new(WorldView {
                 ram_batches: Arc::new(new_ram),
-                data_dir: current_view.data_dir.clone(), // Add .clone() to be safe
+                data_dir: current_view.data_dir.clone(),
                 schema: Arc::new(tx.schema.clone()),
             });
-
             {
                 let mut writer = self.world_view.write().unwrap();
                 *writer = new_view;
             }
 
-            // 2. Queue the batch for background disk flushing
-            if self
-                .flush_tx
-                .send((report.tx_id, report.batch.clone()))
-                .await
-                .is_err()
-            {
-                eprintln!("Warning: Background flusher disconnected.");
+            // --- THE COMPACTION COMPLIANCE THRESHOLD ---
+            // Only queue a background disk flush when a memory batch size threshold is reached.
+            // This stops high-frequency iterations from overwhelming the OS file system stack.
+            if report.batch.num_rows() >= 50_000 {
+                if self
+                    .flush_tx
+                    .send((report.tx_id, report.batch.clone()))
+                    .await
+                    .is_err()
+                {
+                    eprintln!("Warning: Background flusher disconnected.");
+                }
             }
         }
 
         Ok(report)
     }
 
-    /// Pure read-only query using default options (current time). Completely lock-free.
     pub async fn query(&self, query_str: &str) -> Result<Vec<RecordBatch>> {
         self.query_with_options(query_str, QueryOptions::default())
             .await
     }
 
-    /// Read-only query with global execution options (e.g., time travel).
     pub async fn query_with_options(
         &self,
         query_str: &str,
@@ -154,13 +154,11 @@ impl MesoDB {
         let ast = crate::parser::parse_query(query_str)?;
         let view = { self.world_view.read().unwrap().clone() };
         let ctx = SessionContext::new();
-
         let ruleset = if let Some(r) = &options.rules {
             Some(crate::parser::parse_ruleset(r)?)
         } else {
             None
         };
-
         let arrow_schema = view.ram_batches.get(&0).unwrap().schema();
         let pq_options =
             datafusion::prelude::ParquetReadOptions::default().schema(arrow_schema.as_ref());
@@ -169,7 +167,6 @@ impl MesoDB {
         let _ = ctx
             .register_parquet("parquet_datoms", &table_path, pq_options)
             .await;
-
         let mut ram_vec: Vec<RecordBatch> = view
             .ram_batches
             .values()
@@ -208,7 +205,6 @@ impl MesoDB {
             ),
             None => "".to_string(),
         };
-
         let resolved_sql = format!(
             r#"
             WITH raw_filtered AS (SELECT * FROM raw_datoms {}),
@@ -218,7 +214,6 @@ impl MesoDB {
             "#,
             time_filter, resolved_time_filter
         );
-
         let resolved_df = ctx
             .sql(&resolved_sql)
             .await
@@ -238,7 +233,6 @@ impl MesoDB {
         Ok(final_df.collect().await.unwrap_or_default())
     }
 
-    /// Executes a query and returns native Rust HashMaps (Best for embedded use).
     pub async fn query_native(
         &self,
         query_str: &str,
@@ -247,42 +241,31 @@ impl MesoDB {
         crate::formatter::to_native(&batches)
     }
 
-    /// Executes a query and returns a perfectly formatted JSON string directly from Arrow.
     pub async fn query_json(&self, query_str: &str) -> Result<String> {
-        // Parse AST to know which columns are 'pull' traversals
         let ast = crate::parser::parse_query(query_str)?;
-
         let opts = QueryOptions {
-            format: OutputFormat::Json, // Tell PullEngine to output JSON
+            format: OutputFormat::Json,
             ..Default::default()
         };
-
         let batches = self.query_with_options(query_str, opts).await?;
         Ok(crate::formatter::to_json_string(&batches, &ast.find))
     }
 
-    /// Executes a query and returns a perfectly formatted EDN string directly from Arrow.
     pub async fn query_edn(&self, query_str: &str) -> Result<String> {
         let ast = crate::parser::parse_query(query_str)?;
-
         let opts = QueryOptions {
-            format: OutputFormat::Edn, // Tell PullEngine to output EDN
+            format: OutputFormat::Edn,
             ..Default::default()
         };
-
         let batches = self.query_with_options(query_str, opts).await?;
         Ok(crate::formatter::to_edn_string(&batches, &ast.find))
     }
 }
 
-/// A lightweight, lock-free snapshot of the database at a specific point in time.
 #[derive(Clone)]
 pub struct WorldView {
-    /// A thread-safe map of transactions currently sitting in RAM. Keyed by TxId.
     pub ram_batches: Arc<BTreeMap<u64, RecordBatch>>,
-    /// The physical location of the disk storage (Parquet files).
     pub data_dir: PathBuf,
-    /// A snapshot of the schema at this moment in time.
     pub schema: Arc<SchemaMap>,
 }
 
@@ -294,12 +277,9 @@ pub enum OutputFormat {
     Edn,
 }
 
-/// Global options applied to the entire query execution.
 #[derive(Debug, Default, Clone)]
 pub struct QueryOptions {
-    /// If provided, rewinds the entire database to this timestamp before querying.
     pub as_of: Option<i64>,
-    /// The serialization format for the output, strictly enforced.
     pub format: OutputFormat,
     pub rules: Option<String>,
 }

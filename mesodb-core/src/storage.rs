@@ -5,7 +5,7 @@ use datafusion::dataframe::DataFrameWriteOptions;
 use datafusion::prelude::*;
 use parquet::arrow::arrow_writer::ArrowWriter;
 use parquet::file::properties::WriterProperties;
-use std::fs::{File, create_dir_all};
+use std::fs::File;
 use std::path::PathBuf;
 
 use crate::error::MesoError;
@@ -17,19 +17,23 @@ pub struct BackgroundCompactor {
 
 impl BackgroundCompactor {
     pub fn new(data_dir: PathBuf) -> Self {
-        create_dir_all(&data_dir).expect("Failed to create data directory");
+        // 1. Ensure the base data directory exists
+        std::fs::create_dir_all(&data_dir).expect("Failed to create base data directory");
+
+        // 2. Ensure the parquet subdirectory exists for isolated unit tests
+        std::fs::create_dir_all(data_dir.join("parquet"))
+            .expect("Failed to create parquet subdirectory");
+
         Self { data_dir }
     }
 
     /// Writes a single RecordBatch to a unique Parquet file.
     pub fn flush_to_parquet(&self, batch: RecordBatch, tx_id: u64) -> Result<PathBuf> {
-        // 1. Ensure the exact path and any parent folders are fully created
-        let file_path = self.data_dir.join(format!("tx_{}.parquet", tx_id));
-        if let Some(parent) = file_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        // 2. Now initialize the Parquet Writer safely...
+        // Explicitly route the file destination straight into the pre-made parquet sub-folder
+        let file_path = self
+            .data_dir
+            .join("parquet")
+            .join(format!("part-{:012}.parquet", tx_id));
         let file = File::create(&file_path)?;
 
         let props = WriterProperties::builder()
