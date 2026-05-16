@@ -155,6 +155,13 @@ impl MesoDB {
         let view = { self.world_view.read().unwrap().clone() };
         let ctx = SessionContext::new();
 
+        // FIX: Parse the ruleset if provided so the variable is in scope
+        let ruleset = if let Some(r) = &options.rules {
+            Some(crate::parser::parse_ruleset(r)?)
+        } else {
+            None
+        };
+
         let arrow_schema = view.ram_batches.get(&0).unwrap().schema();
         let pq_options =
             datafusion::prelude::ParquetReadOptions::default().schema(arrow_schema.as_ref());
@@ -247,7 +254,8 @@ impl MesoDB {
             view.schema.as_ref(),
             "resolved_datoms",
             options.format.clone(),
-            options.as_of, // <-- Added
+            options.as_of,
+            ruleset,
         );
         let final_df = planner.plan(&ast).await?;
 
@@ -281,6 +289,7 @@ pub struct QueryOptions {
     pub as_of: Option<i64>,
     /// The serialization format for the output, strictly enforced.
     pub format: OutputFormat,
+    pub rules: Option<String>,
 }
 
 #[cfg(test)]
@@ -484,6 +493,7 @@ mod tests {
         let opts_150 = QueryOptions {
             as_of: Some(150),
             format: OutputFormat::Tabular,
+            rules: None,
         };
         let res_150 = db.query_with_options(query, opts_150).await.unwrap();
         let col_150 = res_150[0]
@@ -629,6 +639,7 @@ mod tests {
         let opts_json = QueryOptions {
             format: OutputFormat::Json,
             as_of: None,
+            rules: None,
         };
         let res_json = db.query_with_options(query, opts_json).await.unwrap();
         let json_str = res_json[0]
@@ -646,6 +657,7 @@ mod tests {
         let opts_edn = QueryOptions {
             format: OutputFormat::Edn,
             as_of: None,
+            rules: None,
         };
         let res_edn = db.query_with_options(query, opts_edn).await.unwrap();
         let edn_str = res_edn[0]
@@ -743,5 +755,83 @@ mod tests {
         let user_1_idx = if user_col.value(0) == 1 { 0 } else { 1 };
         assert_eq!(count_col.value(user_1_idx), 2);
         assert_eq!(sum_col.value(user_1_idx), 150);
+    }
+
+    #[tokio::test]
+    async fn test_recursive_datalog_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":person/parent", crate::schema::ValueType::Ref, false);
+        schema.add_attribute(":person/name", crate::schema::ValueType::String, false);
+
+        let db = MesoDB::open(dir.path().join("rules.db"), schema, Config::default()).unwrap();
+
+        db.transact(vec![
+            // 1 (Alice) is parent of 2 (Bob)
+            Fact {
+                e: 1,
+                ident: ":person/name".into(),
+                v: Value::String("Alice (Grandparent)".into()),
+                op: true,
+            },
+            Fact {
+                e: 2,
+                ident: ":person/parent".into(),
+                v: Value::Ref(1),
+                op: true,
+            },
+            Fact {
+                e: 2,
+                ident: ":person/name".into(),
+                v: Value::String("Bob (Parent)".into()),
+                op: true,
+            },
+            // 2 (Bob) is parent of 3 (Charlie)
+            Fact {
+                e: 3,
+                ident: ":person/parent".into(),
+                v: Value::Ref(2),
+                op: true,
+            },
+            Fact {
+                e: 3,
+                ident: ":person/name".into(),
+                v: Value::String("Charlie (Child)".into()),
+                op: true,
+            },
+        ])
+        .await
+        .unwrap();
+
+        // The Ruleset: Defines both a direct parent and a recursive ancestor
+        let rules = r#"
+        [
+            [(ancestor ?child ?parent)
+             [?child :person/parent ?parent]]
+
+            [(ancestor ?child ?ancestor)
+             [?child :person/parent ?parent]
+             (ancestor ?parent ?ancestor)]
+        ]
+        "#;
+
+        // The Query: "Find the names of ALL ancestors for Charlie (Entity 3)"
+        let query = r#"[:find ?ancestor_name
+                        :where
+                           (ancestor 3 ?a)
+                           [?a :person/name ?ancestor_name]]"#;
+
+        let opts = QueryOptions {
+            rules: Some(rules.into()),
+            ..Default::default()
+        };
+        let results = db.query_with_options(query, opts).await.unwrap();
+
+        // FIX: DataFusion's UNION ALL emits results across multiple RecordBatches!
+        // We must sum the rows across all returned batches to get the true total.
+        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+
+        // It should recursively find BOTH Bob and Alice!
+        assert_eq!(total_rows, 2);
     }
 }
