@@ -53,7 +53,13 @@ binding_scalar = { variable }
 binding        = { binding_rel | binding_tuple | binding_scalar }
 fn_clause      = { "[" ~ fn_expr ~ binding? ~ "]" }
 
-where_elem   = { fn_clause | data_pattern | rule_expr }
+// --- Logic Branching (NEW) ---
+join_vars  = { "[" ~ variable+ ~ "]" }
+or_clause  = { "(" ~ ("or-join" | "or") ~ join_vars? ~ where_elem+ ~ ")" }
+not_clause = { "(" ~ ("not-join" | "not") ~ join_vars? ~ where_elem+ ~ ")" }
+
+// Notice the addition of or_clause and not_clause!
+where_elem   = { fn_clause | data_pattern | rule_expr | or_clause | not_clause }
 where_clause = { ":where" ~ where_elem+ }
 
 // --- Rules ---

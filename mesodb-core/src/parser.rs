@@ -62,62 +62,7 @@ pub fn parse_query(query_str: &str) -> Result<Query, MesoError> {
             }
             Rule::where_clause => {
                 for where_elem in pair.into_inner() {
-                    let inner = where_elem.into_inner().next().unwrap();
-                    match inner.as_rule() {
-                        Rule::data_pattern => {
-                            let mut terms = Vec::new();
-                            let mut options = None;
-
-                            for part in inner.into_inner() {
-                                if part.as_rule() == Rule::options_map {
-                                    options = Some(parse_options_map(part));
-                                } else {
-                                    terms.push(parse_term(part));
-                                }
-                            }
-
-                            if terms.len() >= 2 {
-                                let e = terms[0].clone();
-                                let a = terms[1].clone();
-                                let v = terms.get(2).cloned().unwrap_or(Term::Blank);
-                                let tx = terms.get(3).cloned();
-
-                                query.where_clauses.push(WhereClause::DataPattern {
-                                    e,
-                                    a,
-                                    v,
-                                    tx,
-                                    options,
-                                });
-                            }
-                        }
-                        Rule::rule_expr => {
-                            let mut rule_inner = inner.into_inner();
-                            let rule_name = rule_inner.next().unwrap().as_str().to_string();
-                            let args = rule_inner.map(parse_term).collect();
-                            query
-                                .where_clauses
-                                .push(WhereClause::RuleExpr { rule_name, args });
-                        }
-                        Rule::fn_clause => {
-                            // FIX: Call into_inner() on `inner`, because `where_elem` is already consumed!
-                            let mut fn_inner = inner.into_inner();
-
-                            let fn_expr_pair = fn_inner.next().unwrap();
-                            let mut fn_expr_inner = fn_expr_pair.into_inner();
-
-                            let fn_name = fn_expr_inner.next().unwrap().as_str().to_string();
-                            let args: Vec<Term> = fn_expr_inner.map(parse_term).collect();
-                            let binding = fn_inner.next().map(parse_binding);
-
-                            query.where_clauses.push(WhereClause::Function {
-                                fn_name,
-                                args,
-                                binding,
-                            });
-                        }
-                        _ => {}
-                    }
+                    query.where_clauses.push(parse_where_elem(where_elem));
                 }
             }
             _ => {}
@@ -279,6 +224,85 @@ pub fn parse_ruleset(rules_str: &str) -> Result<RuleSet, MesoError> {
     }
 
     Ok(RuleSet { rules })
+}
+
+fn parse_where_elem(where_elem: pest::iterators::Pair<Rule>) -> WhereClause {
+    let inner = where_elem.into_inner().next().unwrap();
+    match inner.as_rule() {
+        Rule::data_pattern => {
+            let mut terms = Vec::new();
+            let mut options = None;
+
+            for part in inner.into_inner() {
+                if part.as_rule() == Rule::options_map {
+                    options = Some(parse_options_map(part));
+                } else {
+                    terms.push(parse_term(part));
+                }
+            }
+
+            let e = terms.get(0).cloned().unwrap_or(Term::Blank);
+            let a = terms.get(1).cloned().unwrap_or(Term::Blank);
+            let v = terms.get(2).cloned().unwrap_or(Term::Blank);
+            let tx = terms.get(3).cloned();
+
+            WhereClause::DataPattern {
+                e,
+                a,
+                v,
+                tx,
+                options,
+            }
+        }
+        Rule::rule_expr => {
+            let mut rule_inner = inner.into_inner();
+            let rule_name = rule_inner.next().unwrap().as_str().to_string();
+            let args = rule_inner.map(parse_term).collect();
+            WhereClause::RuleExpr { rule_name, args }
+        }
+        Rule::fn_clause => {
+            let mut fn_inner = inner.into_inner();
+            let fn_expr_pair = fn_inner.next().unwrap();
+            let mut fn_expr_inner = fn_expr_pair.into_inner();
+
+            let fn_name = fn_expr_inner.next().unwrap().as_str().to_string();
+            let args: Vec<Term> = fn_expr_inner.map(parse_term).collect();
+
+            let binding = fn_inner.next().map(parse_binding);
+
+            WhereClause::Function {
+                fn_name,
+                args,
+                binding,
+            }
+        }
+        Rule::or_clause | Rule::not_clause => {
+            let is_or = inner.as_rule() == Rule::or_clause;
+            let mut join_vars = None;
+            let mut clauses = Vec::new();
+
+            for part in inner.into_inner() {
+                match part.as_rule() {
+                    Rule::join_vars => {
+                        let vars = part.into_inner().map(|v| v.as_str().to_string()).collect();
+                        join_vars = Some(vars);
+                    }
+                    Rule::where_elem => {
+                        // RECURSION!
+                        clauses.push(parse_where_elem(part));
+                    }
+                    _ => {}
+                }
+            }
+
+            if is_or {
+                WhereClause::Or { join_vars, clauses }
+            } else {
+                WhereClause::Not { join_vars, clauses }
+            }
+        }
+        _ => unreachable!(),
+    }
 }
 
 #[cfg(test)]

@@ -62,6 +62,14 @@ pub enum WhereClause {
         args: Vec<Term>,
         binding: Option<Binding>,
     },
+    Or {
+        join_vars: Option<Vec<String>>,
+        clauses: Vec<WhereClause>,
+    },
+    Not {
+        join_vars: Option<Vec<String>>,
+        clauses: Vec<WhereClause>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

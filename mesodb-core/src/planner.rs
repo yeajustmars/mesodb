@@ -53,7 +53,7 @@ impl<'a> QueryPlanner<'a> {
                     e,
                     a,
                     v,
-                    tx: _,
+                    tx,
                     options,
                 } => {
                     let alias = format!("t{}", alias_counter);
@@ -142,6 +142,23 @@ impl<'a> QueryPlanner<'a> {
                         }
                         _ => {}
                     }
+                    if let Some(tx_term) = tx {
+                        match tx_term {
+                            Term::Variable(var_name) => {
+                                let col_ref = format!("{}.t", alias);
+                                if let Some(existing_col) = var_to_column.get(var_name.as_str()) {
+                                    where_conditions
+                                        .push(format!("{} = {}", existing_col, col_ref));
+                                } else {
+                                    var_to_column.insert(var_name.clone(), col_ref);
+                                }
+                            }
+                            Term::Integer(id) => {
+                                where_conditions.push(format!("{}.t = {}", alias, id))
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 WhereClause::RuleExpr { rule_name, args } => {
                     let alias = format!("t{}", alias_counter);
@@ -225,6 +242,18 @@ impl<'a> QueryPlanner<'a> {
                         // PREDICATE: Push the expression directly into the WHERE conditions
                         where_conditions.push(sql_expr);
                     }
+                }
+                WhereClause::Or {
+                    join_vars: _,
+                    clauses: _,
+                } => {
+                    // TODO: Strike 3
+                }
+                WhereClause::Not {
+                    join_vars: _,
+                    clauses: _,
+                } => {
+                    // TODO: Strike 3
                 }
             }
         }
