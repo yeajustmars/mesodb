@@ -45,12 +45,13 @@ in_clause    = { ":in" ~ in_elem+ }
 data_pattern = { "[" ~ term ~ term ~ term? ~ term? ~ options_map? ~ "]" }
 rule_expr    = { "(" ~ ident ~ term+ ~ ")" }
 
-fn_expr        = { "(" ~ ident ~ term+ ~ ")" }
+operator       = { "<=" | ">=" | "!=" | "<" | ">" | "=" | "+" | "-" | "*" | "/" | ident }
+fn_expr        = { "(" ~ operator ~ term+ ~ ")" }
 binding_rel    = { "[[" ~ variable+ ~ "]]" }
 binding_tuple  = { "[" ~ variable+ ~ "]" }
 binding_scalar = { variable }
 binding        = { binding_rel | binding_tuple | binding_scalar }
-fn_clause      = { "[" ~ fn_expr ~ binding ~ "]" }
+fn_clause      = { "[" ~ fn_expr ~ binding? ~ "]" }
 
 where_elem   = { fn_clause | data_pattern | rule_expr }
 where_clause = { ":where" ~ where_elem+ }

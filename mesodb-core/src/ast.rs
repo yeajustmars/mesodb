@@ -60,7 +60,7 @@ pub enum WhereClause {
     Function {
         fn_name: String,
         args: Vec<Term>,
-        binding: Binding,
+        binding: Option<Binding>,
     },
 }
 

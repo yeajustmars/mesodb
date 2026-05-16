@@ -100,15 +100,15 @@ pub fn parse_query(query_str: &str) -> Result<Query, MesoError> {
                                 .push(WhereClause::RuleExpr { rule_name, args });
                         }
                         Rule::fn_clause => {
+                            // FIX: Call into_inner() on `inner`, because `where_elem` is already consumed!
                             let mut fn_inner = inner.into_inner();
-                            let fn_expr = fn_inner.next().unwrap();
-                            let binding_expr = fn_inner.next().unwrap();
 
-                            let mut fn_args = fn_expr.into_inner();
-                            let fn_name = fn_args.next().unwrap().as_str().to_string();
-                            let args = fn_args.map(parse_term).collect();
+                            let fn_expr_pair = fn_inner.next().unwrap();
+                            let mut fn_expr_inner = fn_expr_pair.into_inner();
 
-                            let binding = parse_binding(binding_expr);
+                            let fn_name = fn_expr_inner.next().unwrap().as_str().to_string();
+                            let args: Vec<Term> = fn_expr_inner.map(parse_term).collect();
+                            let binding = fn_inner.next().map(parse_binding);
 
                             query.where_clauses.push(WhereClause::Function {
                                 fn_name,
