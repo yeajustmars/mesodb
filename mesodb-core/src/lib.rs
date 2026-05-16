@@ -7,6 +7,7 @@ pub mod index;
 pub mod memtable;
 pub mod parser;
 pub mod planner;
+pub mod pull;
 pub mod schema;
 pub mod storage;
 pub mod transactor;

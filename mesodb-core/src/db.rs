@@ -247,6 +247,7 @@ impl MesoDB {
             view.schema.as_ref(),
             "resolved_datoms",
             options.format.clone(),
+            options.as_of, // <-- Added
         );
         let final_df = planner.plan(&ast).await?;
 
@@ -587,5 +588,75 @@ mod tests {
             "New York",
             "Should find the historical city in the same query!"
         );
+    }
+
+    #[tokio::test]
+    async fn test_pull_json_and_edn_formats() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = MesoDB::open(
+            dir.path().join("pull.db"),
+            SchemaMap::new(),
+            Config::default(),
+        )
+        .unwrap();
+
+        db.transact(vec![
+            Fact {
+                e: 1,
+                ident: ":user/name".into(),
+                v: Value::String("Alice".into()),
+                op: true,
+            },
+            Fact {
+                e: 1,
+                ident: ":user/address".into(),
+                v: Value::Ref(2),
+                op: true,
+            },
+            Fact {
+                e: 2,
+                ident: ":address/city".into(),
+                v: Value::String("New York".into()),
+                op: true,
+            },
+        ])
+        .await
+        .unwrap();
+
+        let query = r#"[:find (pull ?e [* {:user/address [:address/city]}]) :where [?e :user/name "Alice"]]"#;
+
+        // 1. Test JSON Format
+        let opts_json = QueryOptions {
+            format: OutputFormat::Json,
+            as_of: None,
+        };
+        let res_json = db.query_with_options(query, opts_json).await.unwrap();
+        let json_str = res_json[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap()
+            .value(0);
+
+        // Keys should be stripped of colons
+        assert!(json_str.contains(r#""user/name":"Alice""#));
+        assert!(json_str.contains(r#""user/address":{"address/city":"New York"}"#));
+
+        // 2. Test EDN Format
+        let opts_edn = QueryOptions {
+            format: OutputFormat::Edn,
+            as_of: None,
+        };
+        let res_edn = db.query_with_options(query, opts_edn).await.unwrap();
+        let edn_str = res_edn[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap()
+            .value(0);
+
+        // Keys should retain standard Datomic keyword syntax
+        assert!(edn_str.contains(r#":user/name "Alice""#));
+        assert!(edn_str.contains(r#":user/address {:address/city "New York"}"#));
     }
 }

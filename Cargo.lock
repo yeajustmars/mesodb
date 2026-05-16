@@ -2321,6 +2321,7 @@ dependencies = [
  "pest_derive",
  "rkyv",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",

@@ -22,6 +22,7 @@ chrono = "0.4.44"
 ordered-float = "5.3.0"
 parquet = "58.2.0"
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
 rkyv = "0.8.16"
 
 # Parsing & Query

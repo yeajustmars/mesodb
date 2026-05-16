@@ -1,6 +1,8 @@
 // mesodb-core/src/planner.rs
+use arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::ast::{FindSpec, Query, Term, WhereClause};
 use crate::db::OutputFormat;
@@ -12,6 +14,7 @@ pub struct QueryPlanner<'a> {
     schema: &'a SchemaMap,
     table_name: &'a str,
     format: OutputFormat,
+    as_of: Option<i64>,
 }
 
 impl<'a> QueryPlanner<'a> {
@@ -20,12 +23,14 @@ impl<'a> QueryPlanner<'a> {
         schema: &'a SchemaMap,
         table_name: &'a str,
         format: OutputFormat,
+        as_of: Option<i64>,
     ) -> Self {
         Self {
             ctx,
             schema,
             table_name,
             format,
+            as_of,
         }
     }
 
@@ -192,13 +197,83 @@ impl<'a> QueryPlanner<'a> {
             .ctx
             .sql(&final_sql)
             .await
-            .map_err(|e| MesoError::DataFusion(e))?;
+            .map_err(MesoError::DataFusion)?;
 
         if has_pull {
-            // Phase 2 - Execute Pull Serialization will go here
-            Ok(df)
+            // PHASE 2: Graph Traversal Interception
+            let batches = df.clone().collect().await.map_err(MesoError::DataFusion)?;
+            if batches.is_empty() {
+                return Ok(df);
+            } // No results, no pull needed
+
+            let mut final_batches = Vec::new();
+
+            for batch in batches {
+                let mut new_columns: Vec<Arc<dyn arrow::array::Array>> = Vec::new();
+                let mut new_fields = Vec::new();
+
+                for (i, find_spec) in query.find.iter().enumerate() {
+                    match find_spec {
+                        FindSpec::Variable(v) => {
+                            let clean_var = v.replace("?", "");
+                            new_columns.push(batch.column(i).clone());
+                            new_fields.push(arrow::datatypes::Field::new(
+                                clean_var,
+                                batch.column(i).data_type().clone(),
+                                true,
+                            ));
+                        }
+                        FindSpec::Pull(v, pattern) => {
+                            let clean_var = v.replace("?", "");
+                            // The underlying column is the Entity ID (e)
+                            let e_col = batch
+                                .column(i)
+                                .as_any()
+                                .downcast_ref::<arrow::array::UInt64Array>()
+                                .unwrap();
+                            let e_ids: Vec<u64> =
+                                (0..e_col.len()).map(|idx| e_col.value(idx)).collect();
+
+                            // Trigger the recursive engine
+                            let pull_engine = crate::pull::PullEngine::new(
+                                self.ctx,
+                                self.schema,
+                                &self.format,
+                                self.as_of,
+                            );
+                            let string_arr = pull_engine.execute_pull(&e_ids, pattern).await?;
+
+                            new_columns.push(Arc::new(string_arr));
+                            new_fields.push(arrow::datatypes::Field::new(
+                                clean_var,
+                                arrow::datatypes::DataType::Utf8,
+                                true,
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+
+                let new_schema = Arc::new(arrow::datatypes::Schema::new(new_fields));
+                let new_batch =
+                    RecordBatch::try_new(new_schema, new_columns).map_err(MesoError::Arrow)?;
+                final_batches.push(new_batch);
+            }
+
+            // Re-wrap the transformed batch in a new DataFrame
+            let mem_table = datafusion::datasource::memory::MemTable::try_new(
+                final_batches[0].schema(),
+                vec![final_batches],
+            )
+            .unwrap();
+            let temp_ctx = SessionContext::new();
+            temp_ctx.register_table("pull_results", Arc::new(mem_table))?;
+            temp_ctx
+                .sql("SELECT * FROM pull_results")
+                .await
+                .map_err(MesoError::DataFusion)
         } else {
-            Ok(df)
+            Ok(df) // Pure tabular data passes straight through!
         }
     }
 }
