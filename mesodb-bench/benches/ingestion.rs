@@ -50,7 +50,7 @@ fn bench_ingestion(c: &mut Criterion) {
     // 1. Strict Mode (Fsync every transaction)
     group.bench_function("WalSyncMode::Strict", |b| {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let _guard = rt.enter(); // FIX: Provide tokio context so the background worker can spawn!
+        let _guard = rt.enter();
 
         let dir = tempfile::tempdir().unwrap();
         let db = setup_db(&dir, WalSyncMode::Strict);
@@ -68,7 +68,7 @@ fn bench_ingestion(c: &mut Criterion) {
     // 2. Background Mode (OS-managed sync)
     group.bench_function("WalSyncMode::Background", |b| {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let _guard = rt.enter(); // FIX: Provide tokio context so the background worker can spawn!
+        let _guard = rt.enter();
 
         let dir = tempfile::tempdir().unwrap();
         let db = setup_db(&dir, WalSyncMode::Background);
@@ -79,6 +79,42 @@ fn bench_ingestion(c: &mut Criterion) {
             tx_counter += 1;
             async {
                 db.transact(facts).await.unwrap();
+            }
+        });
+    });
+
+    // 3. Bitemporal Overwrites (Timeline Mutation / Contention)
+    group.bench_function("Bitemporal Overwrites", |b| {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = setup_db(&dir, WalSyncMode::Background);
+
+        // Seed the database with 1000 static entities first
+        rt.block_on(async {
+            let initial_facts = generate_facts(1000, 0);
+            db.transact(initial_facts).await.unwrap();
+        });
+
+        let mut loop_counter = 0f64;
+        b.to_async(&rt).iter(|| {
+            loop_counter += 1.0;
+            // Continually hammer the exact same 1000 entities with updated readings.
+            // This forces the transactor to execute history lookups, timeline slicing,
+            // and write retractions on every step.
+            let mut update_facts = Vec::with_capacity(1000);
+            for i in 0..1000 {
+                update_facts.push(Fact {
+                    e: i as u64,
+                    ident: ":sensor/reading".into(),
+                    v: Value::Float64(50.0 + loop_counter + (i as f64 * 0.1)),
+                    op: true,
+                });
+            }
+
+            async {
+                db.transact(update_facts).await.unwrap();
             }
         });
     });

@@ -22,8 +22,14 @@ impl BackgroundCompactor {
     }
 
     /// Writes a single RecordBatch to a unique Parquet file.
-    pub fn flush_to_parquet(&self, batch: RecordBatch, batch_id: u64) -> Result<PathBuf> {
-        let file_path = self.data_dir.join(format!("part-{:012}.parquet", batch_id));
+    pub fn flush_to_parquet(&self, batch: RecordBatch, tx_id: u64) -> Result<PathBuf> {
+        // 1. Ensure the exact path and any parent folders are fully created
+        let file_path = self.data_dir.join(format!("tx_{}.parquet", tx_id));
+        if let Some(parent) = file_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        // 2. Now initialize the Parquet Writer safely...
         let file = File::create(&file_path)?;
 
         let props = WriterProperties::builder()
