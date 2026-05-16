@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "mesodb-bench",
     "mesodb-core",
     "mesodb-server",
     "mesodb-cli"

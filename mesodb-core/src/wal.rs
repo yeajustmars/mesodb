@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use crate::config::WalSyncMode;
 use crate::datom::Datom;
 use crate::error::MesoError;
 use crate::types::Result;
@@ -26,7 +27,7 @@ impl Wal {
         Ok(Self { file, path: p })
     }
 
-    pub fn append_batch(&mut self, datoms: &Vec<Datom>) -> Result<()> {
+    pub fn append_batch(&mut self, datoms: &Vec<Datom>, sync_mode: &WalSyncMode) -> Result<()> {
         if datoms.is_empty() {
             return Ok(());
         }
@@ -45,7 +46,10 @@ impl Wal {
 
         self.file.write_all(&len.to_ne_bytes())?;
         self.file.write_all(&bytes)?;
-        self.file.sync_all()?;
+
+        if *sync_mode == WalSyncMode::Strict {
+            self.file.sync_all()?;
+        }
 
         Ok(())
     }
@@ -114,8 +118,8 @@ mod tests {
         let batch1 = vec![Datom::assert(1, 10, Value::Int64(100), 1, 1000)];
         let batch2 = vec![Datom::assert(2, 10, Value::Int64(200), 2, 2000)];
 
-        wal.append_batch(&batch1).unwrap();
-        wal.append_batch(&batch2).unwrap();
+        wal.append_batch(&batch1, &WalSyncMode::Strict).unwrap();
+        wal.append_batch(&batch2, &WalSyncMode::Strict).unwrap();
 
         let mut recovering_wal = Wal::open(temp_file.path()).unwrap();
         let recovered = recovering_wal.recover().unwrap();
@@ -131,7 +135,8 @@ mod tests {
         let mut wal = Wal::open(temp_file.path()).unwrap();
 
         let valid_batch = vec![Datom::assert(1, 10, Value::Int64(100), 1, 1000)];
-        wal.append_batch(&valid_batch).unwrap();
+        wal.append_batch(&valid_batch, &WalSyncMode::Strict)
+            .unwrap();
 
         // Simulate disk corruption by writing garbage
         let mut file = std::fs::OpenOptions::new()

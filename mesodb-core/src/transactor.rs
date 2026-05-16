@@ -154,7 +154,8 @@ impl Transactor {
         }
 
         // --- PHASE 2: WAL Persistence (Crash Safety) ---
-        self.wal.append_batch(&pending_datoms)?;
+        self.wal
+            .append_batch(&pending_datoms, &self.config.storage.wal_sync_mode)?;
 
         // --- PHASE 3: Update RAM Indices & Build Arrow Batch ---
         let mut tx_memtable = MemTable::new(pending_datoms.len());
