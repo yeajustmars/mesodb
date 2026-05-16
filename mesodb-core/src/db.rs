@@ -659,4 +659,89 @@ mod tests {
         assert!(edn_str.contains(r#":user/name "Alice""#));
         assert!(edn_str.contains(r#":user/address {:address/city "New York"}"#));
     }
+
+    #[tokio::test]
+    async fn test_aggregations() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":order/user", ValueType::Ref, false);
+        schema.add_attribute(":order/total", ValueType::Int64, false);
+
+        let db = MesoDB::open(dir.path().join("aggr.db"), schema, Config::default()).unwrap();
+
+        db.transact(vec![
+            // User 1 has two orders totaling 150
+            Fact {
+                e: 101,
+                ident: ":order/user".into(),
+                v: Value::Ref(1),
+                op: true,
+            },
+            Fact {
+                e: 101,
+                ident: ":order/total".into(),
+                v: Value::Int64(50),
+                op: true,
+            },
+            Fact {
+                e: 102,
+                ident: ":order/user".into(),
+                v: Value::Ref(1),
+                op: true,
+            },
+            Fact {
+                e: 102,
+                ident: ":order/total".into(),
+                v: Value::Int64(100),
+                op: true,
+            },
+            // User 2 has one order totaling 75
+            Fact {
+                e: 103,
+                ident: ":order/user".into(),
+                v: Value::Ref(2),
+                op: true,
+            },
+            Fact {
+                e: 103,
+                ident: ":order/total".into(),
+                v: Value::Int64(75),
+                op: true,
+            },
+        ])
+        .await
+        .unwrap();
+
+        // Query: For each user, what is their total order count, and the sum of their totals?
+        let query = r#"[:find ?user (count ?order) (sum ?total)
+                        :where [?order :order/user ?user]
+                               [?order :order/total ?total]]"#;
+
+        let results = db.query(query).await.unwrap();
+        let batch = &results[0];
+
+        // We expect two rows (one for User 1, one for User 2)
+        assert_eq!(batch.num_rows(), 2);
+
+        let user_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .unwrap();
+        let count_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        let sum_col = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+
+        // Find the index for User 1
+        let user_1_idx = if user_col.value(0) == 1 { 0 } else { 1 };
+        assert_eq!(count_col.value(user_1_idx), 2);
+        assert_eq!(sum_col.value(user_1_idx), 150);
+    }
 }
