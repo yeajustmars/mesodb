@@ -170,7 +170,62 @@ impl<'a> QueryPlanner<'a> {
                         }
                     }
                 }
-                _ => {}
+                WhereClause::Function {
+                    fn_name,
+                    args,
+                    binding,
+                } => {
+                    // Convert AST terms into literal SQL arguments
+                    let sql_args: Vec<String> = args
+                        .iter()
+                        .map(|arg| match arg {
+                            Term::Variable(v) => var_to_column
+                                .get(v)
+                                .cloned()
+                                .unwrap_or_else(|| "NULL".into()),
+                            Term::Integer(i) => i.to_string(),
+                            Term::Float(f) => f.to_string(),
+                            Term::String(s) => format!("'{}'", s),
+                            Term::Boolean(b) => b.to_string(),
+                            _ => "NULL".into(),
+                        })
+                        .collect();
+
+                    // Map the Datalog operator to a SQL Expression
+                    let sql_expr = match fn_name.as_str() {
+                        "+" | "-" | "*" | "/" => {
+                            if sql_args.len() == 2 {
+                                format!("({} {} {})", sql_args[0], fn_name, sql_args[1])
+                            } else {
+                                "NULL".into()
+                            }
+                        }
+                        "str" => format!("CONCAT({})", sql_args.join(", ")),
+                        // Comparators
+                        "<" | ">" | "<=" | ">=" | "=" | "!=" => {
+                            if sql_args.len() == 2 {
+                                format!("{} {} {}", sql_args[0], fn_name, sql_args[1])
+                            } else {
+                                "FALSE".into()
+                            }
+                        }
+                        // Fallback to natively invoking DataFusion SQL functions
+                        _ => format!("{}({})", fn_name.to_uppercase(), sql_args.join(", ")),
+                    };
+
+                    if let Some(b) = binding {
+                        // TRANSFORM: Bind the resulting SQL expression to the variable map
+                        match b {
+                            crate::ast::Binding::Scalar(var_name) => {
+                                var_to_column.insert(var_name.clone(), sql_expr);
+                            }
+                            _ => {} // Tuples/relations not supported for simple functions yet
+                        }
+                    } else {
+                        // PREDICATE: Push the expression directly into the WHERE conditions
+                        where_conditions.push(sql_expr);
+                    }
+                }
             }
         }
         Ok((from_tables, where_conditions, var_to_column))

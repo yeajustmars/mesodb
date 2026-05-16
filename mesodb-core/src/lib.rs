@@ -3,6 +3,7 @@ pub mod config;
 pub mod datom;
 pub mod db;
 pub mod error;
+pub mod formatter;
 pub mod index;
 pub mod memtable;
 pub mod parser;

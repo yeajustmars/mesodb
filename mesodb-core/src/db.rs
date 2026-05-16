@@ -261,6 +261,42 @@ impl MesoDB {
 
         Ok(final_df.collect().await.unwrap_or_default())
     }
+
+    /// Executes a query and returns native Rust HashMaps (Best for embedded use).
+    pub async fn query_native(
+        &self,
+        query_str: &str,
+    ) -> Result<Vec<std::collections::HashMap<String, crate::types::Value>>> {
+        let batches = self.query(query_str).await?;
+        crate::formatter::to_native(&batches)
+    }
+
+    /// Executes a query and returns a perfectly formatted JSON string directly from Arrow.
+    pub async fn query_json(&self, query_str: &str) -> Result<String> {
+        // Parse AST to know which columns are 'pull' traversals
+        let ast = crate::parser::parse_query(query_str)?;
+
+        let opts = QueryOptions {
+            format: OutputFormat::Json, // Tell PullEngine to output JSON
+            ..Default::default()
+        };
+
+        let batches = self.query_with_options(query_str, opts).await?;
+        Ok(crate::formatter::to_json_string(&batches, &ast.find))
+    }
+
+    /// Executes a query and returns a perfectly formatted EDN string directly from Arrow.
+    pub async fn query_edn(&self, query_str: &str) -> Result<String> {
+        let ast = crate::parser::parse_query(query_str)?;
+
+        let opts = QueryOptions {
+            format: OutputFormat::Edn, // Tell PullEngine to output EDN
+            ..Default::default()
+        };
+
+        let batches = self.query_with_options(query_str, opts).await?;
+        Ok(crate::formatter::to_edn_string(&batches, &ast.find))
+    }
 }
 
 /// A lightweight, lock-free snapshot of the database at a specific point in time.
@@ -833,5 +869,201 @@ mod tests {
 
         // It should recursively find BOTH Bob and Alice!
         assert_eq!(total_rows, 2);
+    }
+
+    // =====================================================================
+    // SUITE 1: NATIVE RETURN TYPES & ZERO-COPY SERIALIZATION
+    // =====================================================================
+
+    async fn setup_api_db() -> MesoDB {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/name", ValueType::String, false);
+        schema.add_attribute(":user/age", ValueType::Int64, false);
+        schema.add_attribute(":user/active", ValueType::Boolean, false);
+        schema.add_attribute(":user/address", ValueType::Ref, false);
+        schema.add_attribute(":address/city", ValueType::String, false);
+
+        let db = MesoDB::open(dir.path().join("api.db"), schema, Config::default()).unwrap();
+        db.transact(vec![
+            Fact {
+                e: 1,
+                ident: ":user/name".into(),
+                v: Value::String("Alice".into()),
+                op: true,
+            },
+            Fact {
+                e: 1,
+                ident: ":user/age".into(),
+                v: Value::Int64(30),
+                op: true,
+            },
+            Fact {
+                e: 1,
+                ident: ":user/active".into(),
+                v: Value::Boolean(true),
+                op: true,
+            },
+            Fact {
+                e: 1,
+                ident: ":user/address".into(),
+                v: Value::Ref(2),
+                op: true,
+            },
+            Fact {
+                e: 2,
+                ident: ":address/city".into(),
+                v: Value::String("New York".into()),
+                op: true,
+            },
+            Fact {
+                e: 3,
+                ident: ":user/name".into(),
+                v: Value::String("Bob".into()),
+                op: true,
+            },
+            Fact {
+                e: 3,
+                ident: ":user/age".into(),
+                v: Value::Int64(40),
+                op: true,
+            },
+        ])
+        .await
+        .unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn test_api_query_native_types() {
+        let db = setup_api_db().await;
+        let query =
+            r#"[:find ?name ?age :where [?e :user/name ?name] [?e :user/age ?age] [(> ?age 35)]]"#;
+
+        let results = db.query_native(query).await.unwrap();
+        assert_eq!(results.len(), 1);
+
+        // Ensure we get native Rust enum values back
+        assert_eq!(results[0].get("name"), Some(&Value::String("Bob".into())));
+        assert_eq!(results[0].get("age"), Some(&Value::Int64(40)));
+    }
+
+    #[tokio::test]
+    async fn test_api_query_json_flat() {
+        let db = setup_api_db().await;
+        let query =
+            r#"[:find ?name ?active :where [?e :user/name ?name] [?e :user/active ?active]]"#;
+
+        let json = db.query_json(query).await.unwrap();
+        // Should be a perfectly formatted JSON array of objects
+        assert!(json.contains(r#"{"name":"Alice","active":true}"#));
+    }
+
+    #[tokio::test]
+    async fn test_api_query_edn_flat() {
+        let db = setup_api_db().await;
+        let query =
+            r#"[:find ?name ?age :where [?e :user/name ?name] [?e :user/age ?age] [(< ?age 35)]]"#;
+
+        let edn = db.query_edn(query).await.unwrap();
+        // EDN string values are quoted, keys have colons
+        assert!(edn.contains(r#"{:name "Alice" :age 30}"#));
+    }
+
+    #[tokio::test]
+    async fn test_api_query_json_pull_zero_copy() {
+        let db = setup_api_db().await;
+        let query = r#"[:find (pull ?e [* {:user/address [:address/city]}]) :where [?e :user/name "Alice"]]"#;
+
+        let json = db.query_json(query).await.unwrap();
+        // Zero-copy should prevent double escaping! It shouldn't look like "\"user/name\""
+        assert!(json.contains(r#""user/address":{"address/city":"New York"}"#));
+    }
+
+    #[tokio::test]
+    async fn test_api_query_edn_pull_zero_copy() {
+        let db = setup_api_db().await;
+        let query = r#"[:find (pull ?e [* {:user/address [:address/city]}]) :where [?e :user/name "Alice"]]"#;
+
+        let edn = db.query_edn(query).await.unwrap();
+        // EDN pull should preserve the standard Datomic spacing and colons
+        assert!(edn.contains(r#":user/address {:address/city "New York"}"#));
+    }
+
+    #[tokio::test]
+    async fn test_api_json_aggregates() {
+        let db = setup_api_db().await;
+        let query = r#"[:find (count ?e) (sum ?age) :where [?e :user/age ?age]]"#;
+
+        let json = db.query_json(query).await.unwrap();
+        // DataFusion prefixes aggregates with the function name
+        assert!(json.contains(r#""count_e":2"#));
+        assert!(json.contains(r#""sum_age":70"#));
+    }
+
+    // =====================================================================
+    // SUITE 2: DATALOG FUNCTIONS & PREDICATES
+    // =====================================================================
+
+    #[tokio::test]
+    async fn test_datalog_math_operators() {
+        let db = setup_api_db().await;
+        // Test +, -, *, and / in a single binding block
+        let query = r#"[:find ?next_year ?half_age
+                        :where [?e :user/name "Bob"]
+                               [?e :user/age ?age]
+                               [(+ ?age 1) ?next_year]
+                               [(/ ?age 2) ?half_age]]"#;
+
+        let results = db.query_native(query).await.unwrap();
+        assert_eq!(results[0].get("next_year"), Some(&Value::Int64(41)));
+        assert_eq!(results[0].get("half_age"), Some(&Value::Int64(20)));
+    }
+
+    #[tokio::test]
+    async fn test_datalog_comparison_predicates() {
+        let db = setup_api_db().await;
+        // Test != and >=
+        let query = r#"[:find ?name
+                        :where [?e :user/name ?name]
+                               [?e :user/age ?age]
+                               [(!= ?name "Bob")]
+                               [(>= ?age 30)]]"#;
+
+        let results = db.query_native(query).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].get("name"), Some(&Value::String("Alice".into())));
+    }
+
+    #[tokio::test]
+    async fn test_datalog_string_functions() {
+        let db = setup_api_db().await;
+        // Test `str` concatenation
+        let query = r#"[:find ?greeting
+                        :where [?e :user/name "Alice"]
+                               [(str "Hello, " "Alice" "!") ?greeting]]"#;
+
+        let results = db.query_native(query).await.unwrap();
+        assert_eq!(
+            results[0].get("greeting"),
+            Some(&Value::String("Hello, Alice!".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_datalog_native_sql_fallback() {
+        let db = setup_api_db().await;
+        // If a function isn't natively mapped, our planner falls back to raw DataFusion SQL functions.
+        // Let's test calling `UPPER` on a string.
+        let query = r#"[:find ?yelling
+                        :where [?e :user/name "Bob"]
+                               [?e :user/name ?n]
+                               [(upper ?n) ?yelling]]"#;
+
+        let results = db.query_native(query).await.unwrap();
+        assert_eq!(
+            results[0].get("yelling"),
+            Some(&Value::String("BOB".into()))
+        );
     }
 }
