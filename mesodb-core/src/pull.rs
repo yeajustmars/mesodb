@@ -70,7 +70,8 @@ impl<'a> PullEngine<'a> {
         Box<
             dyn std::future::Future<
                     Output = Result<HashMap<u64, Map<String, JsonValue>>, MesoError>,
-                > + 'b,
+                > + Send
+                + 'b,
         >,
     > {
         Box::pin(async move {

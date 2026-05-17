@@ -1,3 +1,5 @@
+# mesodb-server/Cargo.toml
+
 [package]
 name = "mesodb-server"
 version.workspace = true
@@ -6,12 +8,11 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-# Link to our core library using the workspace path
-mesodb-core.workspace = true
-
-# Inherited binary dependencies
-tokio.workspace = true
-axum.workspace = true
-color-eyre.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
+mesodb-core = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+color-eyre = { workspace = true }
