@@ -1,3 +1,4 @@
+use rkyv::{Archive, Deserialize, Serialize};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -5,7 +6,14 @@ use std::path::{Path, PathBuf};
 use crate::config::WalSyncMode;
 use crate::datom::Datom;
 use crate::error::MesoError;
+use crate::schema::SchemaMutation;
 use crate::types::Result;
+
+#[derive(Debug, Archive, Serialize, Deserialize)]
+pub enum WalEntry {
+    DataBatch(Vec<Datom>),
+    SchemaMutation(SchemaMutation),
+}
 
 pub struct Wal {
     file: File,
@@ -27,20 +35,17 @@ impl Wal {
         Ok(Self { file, path: p })
     }
 
-    pub fn append_batch(&mut self, datoms: &Vec<Datom>, sync_mode: &WalSyncMode) -> Result<()> {
-        if datoms.is_empty() {
-            return Ok(());
-        }
-
+    // UPDATED: Now takes a WalEntry enum
+    pub fn append_entry(&mut self, entry: &WalEntry, sync_mode: &WalSyncMode) -> Result<()> {
         self.file.seek(SeekFrom::End(0))?;
 
-        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(datoms)
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(entry)
             .map_err(|e| MesoError::Serialization(e.to_string()))?;
 
         let len = bytes.len() as u64;
         if len == 0 {
             return Err(MesoError::Serialization(
-                "Serialized batch was empty".into(),
+                "Serialized entry was empty".into(),
             ));
         }
 
@@ -54,10 +59,10 @@ impl Wal {
         Ok(())
     }
 
-    pub fn recover(&mut self) -> Result<Vec<Datom>> {
+    // UPDATED: Returns Vec<WalEntry>
+    pub fn recover(&mut self) -> Result<Vec<WalEntry>> {
         self.file.seek(SeekFrom::Start(0))?;
-
-        let mut all_datoms = Vec::new();
+        let mut all_entries = Vec::new();
         let file_len = self.file.metadata()?.len();
 
         while self.file.stream_position()? < file_len {
@@ -81,19 +86,17 @@ impl Wal {
                 break;
             }
 
-            let batch: Vec<Datom> =
-                match rkyv::from_bytes::<Vec<Datom>, rkyv::rancor::Error>(&buffer) {
-                    Ok(b) => b,
-                    Err(_) => {
-                        eprintln!("WAL Recovery: Failed to deserialize batch, stopping.");
-                        break;
-                    }
-                };
-            all_datoms.extend(batch);
+            match rkyv::from_bytes::<WalEntry, rkyv::rancor::Error>(&buffer) {
+                Ok(entry) => all_entries.push(entry),
+                Err(_) => {
+                    eprintln!("WAL Recovery: Failed to deserialize entry, stopping.");
+                    break;
+                }
+            };
         }
 
         self.file.seek(SeekFrom::End(0))?;
-        Ok(all_datoms)
+        Ok(all_entries)
     }
 
     pub fn data_dir(&self) -> PathBuf {
@@ -118,15 +121,31 @@ mod tests {
         let batch1 = vec![Datom::assert(1, 10, Value::Int64(100), 1, 1000)];
         let batch2 = vec![Datom::assert(2, 10, Value::Int64(200), 2, 2000)];
 
-        wal.append_batch(&batch1, &WalSyncMode::Strict).unwrap();
-        wal.append_batch(&batch2, &WalSyncMode::Strict).unwrap();
+        // Wrap the raw datoms in the new WalEntry enum
+        wal.append_entry(&WalEntry::DataBatch(batch1), &WalSyncMode::Strict)
+            .unwrap();
+        wal.append_entry(&WalEntry::DataBatch(batch2), &WalSyncMode::Strict)
+            .unwrap();
 
         let mut recovering_wal = Wal::open(temp_file.path()).unwrap();
         let recovered = recovering_wal.recover().unwrap();
 
+        // We expect two ENVELOPES back
         assert_eq!(recovered.len(), 2);
-        assert_eq!(recovered[0].e, 1);
-        assert_eq!(recovered[1].e, 2);
+
+        // Extract the datoms from Envelope 1
+        if let WalEntry::DataBatch(datoms) = &recovered[0] {
+            assert_eq!(datoms[0].e, 1);
+        } else {
+            panic!("Expected Envelope 1 to be a DataBatch");
+        }
+
+        // Extract the datoms from Envelope 2
+        if let WalEntry::DataBatch(datoms) = &recovered[1] {
+            assert_eq!(datoms[0].e, 2);
+        } else {
+            panic!("Expected Envelope 2 to be a DataBatch");
+        }
     }
 
     #[test]
@@ -135,7 +154,9 @@ mod tests {
         let mut wal = Wal::open(temp_file.path()).unwrap();
 
         let valid_batch = vec![Datom::assert(1, 10, Value::Int64(100), 1, 1000)];
-        wal.append_batch(&valid_batch, &WalSyncMode::Strict)
+
+        // Wrap the raw datoms
+        wal.append_entry(&WalEntry::DataBatch(valid_batch), &WalSyncMode::Strict)
             .unwrap();
 
         // Simulate disk corruption by writing garbage
@@ -149,6 +170,7 @@ mod tests {
         let mut recovering_wal = Wal::open(temp_file.path()).unwrap();
         let recovered = recovering_wal.recover().unwrap();
 
-        assert_eq!(recovered.len(), 1); // Only the valid datom survives
+        // Only the valid envelope survives
+        assert_eq!(recovered.len(), 1);
     }
 }

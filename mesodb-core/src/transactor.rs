@@ -13,6 +13,7 @@ use crate::memtable::MemTable;
 use crate::schema::{SchemaMap, ValueType};
 use crate::types::{EntityId, Result, TxId, Value};
 use crate::wal::Wal;
+use crate::wal::WalEntry;
 
 pub struct Transactor {
     pub config: Config,
@@ -29,16 +30,25 @@ impl Transactor {
         let mut current_tx_id = 1;
 
         // Rebuild memory indices from the WAL
-        let recovered_datoms = wal.recover()?;
-        for datom in recovered_datoms {
-            if datom.t >= current_tx_id {
-                current_tx_id = datom.t + 1;
-            }
-            if let Some(attr) = schema.get_by_id(datom.a) {
-                if datom.op {
-                    indices.insert(datom.e, datom.a, datom.v.clone(), attr.is_unique);
-                } else {
-                    indices.remove(datom.e, datom.a, &datom.v, attr.is_unique);
+        let recovered_entries = wal.recover()?;
+        for entry in recovered_entries {
+            match entry {
+                WalEntry::DataBatch(datoms) => {
+                    for datom in datoms {
+                        if datom.t >= current_tx_id {
+                            current_tx_id = datom.t + 1;
+                        }
+                        if let Some(attr) = schema.get_by_id(datom.a) {
+                            if datom.op {
+                                indices.insert(datom.e, datom.a, datom.v.clone(), attr.is_unique);
+                            } else {
+                                indices.remove(datom.e, datom.a, &datom.v, attr.is_unique);
+                            }
+                        }
+                    }
+                }
+                WalEntry::SchemaMutation(_mutation) => {
+                    // We will wire this up to our SchemaTimeline in the next step!
                 }
             }
         }
@@ -154,8 +164,10 @@ impl Transactor {
         }
 
         // --- PHASE 2: WAL Persistence (Crash Safety) ---
-        self.wal
-            .append_batch(&pending_datoms, &self.config.storage.wal_sync_mode)?;
+        self.wal.append_entry(
+            &crate::wal::WalEntry::DataBatch(pending_datoms.clone()),
+            &self.config.storage.wal_sync_mode,
+        )?;
 
         // --- PHASE 3: Update RAM Indices & Build Arrow Batch ---
         let mut tx_memtable = MemTable::new(pending_datoms.len());

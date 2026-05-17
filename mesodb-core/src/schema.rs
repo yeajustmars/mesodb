@@ -1,10 +1,11 @@
 use ahash::AHashMap;
+use rkyv::{Archive, Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::error::MesoError;
 use crate::types::{AttributeId, Result, Value};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 pub enum ValueType {
     Boolean,
     Int64,
@@ -15,12 +16,17 @@ pub enum ValueType {
     Uuid,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct Attribute {
     pub id: AttributeId,
     pub ident: String,
     pub value_type: ValueType,
     pub is_unique: bool,
+}
+
+#[derive(Debug, Clone, Archive, Serialize, Deserialize)]
+pub enum SchemaMutation {
+    AddAttribute(Attribute),
 }
 
 #[derive(Debug, Default, Clone)]
