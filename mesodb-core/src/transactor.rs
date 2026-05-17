@@ -3,6 +3,7 @@
 use arrow::record_batch::RecordBatch;
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::Config;
@@ -10,26 +11,30 @@ use crate::datom::Datom;
 use crate::error::MesoError;
 use crate::index::IndexManager;
 use crate::memtable::MemTable;
-use crate::schema::{SchemaMap, ValueType};
+use crate::schema::{SchemaMap, SchemaTimeline, ValueType};
 use crate::types::{EntityId, Result, TxId, Value};
-use crate::wal::Wal;
-use crate::wal::WalEntry;
+use crate::wal::{Wal, WalEntry};
 
 pub struct Transactor {
     pub config: Config,
     pub wal: Wal,
     pub schema: SchemaMap,
+    pub timeline: SchemaTimeline,
     pub indices: IndexManager,
     pub current_tx_id: TxId,
 }
 
 impl Transactor {
-    pub fn new<P: AsRef<Path>>(wal_path: P, schema: SchemaMap, config: Config) -> Result<Self> {
+    pub fn new<P: AsRef<Path>>(wal_path: P, mut schema: SchemaMap, config: Config) -> Result<Self> {
         let mut wal = Wal::open(wal_path)?;
         let mut indices = IndexManager::new();
         let mut current_tx_id = 1;
+        let mut timeline = SchemaTimeline::new();
 
-        // Rebuild memory indices from the WAL
+        // Baseline whatever schema was passed in
+        timeline.append_version(0, schema.clone());
+
+        // Rebuild memory indices and timeline from the WAL
         let recovered_entries = wal.recover()?;
         for entry in recovered_entries {
             match entry {
@@ -47,9 +52,19 @@ impl Transactor {
                         }
                     }
                 }
-                WalEntry::SchemaMutation(_mutation) => {
-                    // We will wire this up to our SchemaTimeline in the next step!
-                }
+                WalEntry::SchemaMutation(mutation) => match mutation {
+                    crate::schema::SchemaMutation::AddAttribute {
+                        tx_id,
+                        timestamp: _,
+                        attribute,
+                    } => {
+                        schema.ingest_attribute(attribute);
+                        timeline.append_version(tx_id, schema.clone());
+                        if tx_id >= current_tx_id {
+                            current_tx_id = tx_id + 1;
+                        }
+                    }
+                },
             }
         }
 
@@ -57,9 +72,40 @@ impl Transactor {
             config,
             wal,
             schema,
+            timeline,
             indices,
             current_tx_id,
         })
+    }
+
+    pub fn transact_schema(
+        &mut self,
+        ident: &str,
+        value_type: ValueType,
+        is_unique: bool,
+    ) -> Result<Arc<crate::schema::Attribute>> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
+        let tx_id = self.current_tx_id;
+        self.current_tx_id += 1;
+
+        let attr = self.schema.add_attribute(ident, value_type, is_unique);
+
+        let mutation = crate::schema::SchemaMutation::AddAttribute {
+            tx_id,
+            timestamp: now,
+            attribute: (*attr).clone(),
+        };
+
+        self.wal.append_entry(
+            &WalEntry::SchemaMutation(mutation),
+            &self.config.storage.wal_sync_mode,
+        )?;
+        self.timeline.append_version(tx_id, self.schema.clone());
+
+        Ok(attr)
     }
 
     pub fn transact(&mut self, facts: Vec<Fact>) -> Result<TxReport> {
@@ -103,9 +149,23 @@ impl Transactor {
                     Value::Uuid(_) => ValueType::Uuid,
                     _ => ValueType::String,
                 };
-                self.schema
-                    .add_attribute(&fact.ident, inferred_type, false)
-                    .id
+
+                // JIT Schema Bug Fix: Make JIT schema durable!
+                let new_attr = self.schema.add_attribute(&fact.ident, inferred_type, false);
+
+                let mutation = crate::schema::SchemaMutation::AddAttribute {
+                    tx_id,
+                    timestamp: now,
+                    attribute: (*new_attr).clone(),
+                };
+
+                self.wal.append_entry(
+                    &WalEntry::SchemaMutation(mutation),
+                    &self.config.storage.wal_sync_mode,
+                )?;
+                self.timeline.append_version(tx_id, self.schema.clone());
+
+                new_attr.id
             } else {
                 return Err(MesoError::Serialization(format!(
                     "Unknown attribute: {}",
@@ -165,12 +225,13 @@ impl Transactor {
 
         // --- PHASE 2: WAL Persistence (Crash Safety) ---
         self.wal.append_entry(
-            &crate::wal::WalEntry::DataBatch(pending_datoms.clone()),
+            &WalEntry::DataBatch(pending_datoms.clone()),
             &self.config.storage.wal_sync_mode,
         )?;
 
         // --- PHASE 3: Update RAM Indices & Build Arrow Batch ---
         let mut tx_memtable = MemTable::new(pending_datoms.len());
+
         for datom in &pending_datoms {
             let is_unique = self.schema.get_by_id(datom.a).unwrap().is_unique;
             if datom.op {
@@ -229,7 +290,6 @@ mod tests {
     #[test]
     fn test_tx_bitemporal_interval_closing() {
         let (mut t, _f) = setup_transactor();
-
         // 1. Assert Alice
         let _ = t
             .transact_at(
@@ -264,7 +324,6 @@ mod tests {
     #[test]
     fn test_tx_unique_constraint_enforcement() {
         let (mut t, _f) = setup_transactor();
-
         t.transact(vec![Fact {
             e: 1,
             ident: ":user/email".into(),
@@ -286,7 +345,6 @@ mod tests {
     #[test]
     fn test_engine_raw_bitemporal_arrow_output() {
         use arrow::array::{BooleanArray, StringArray, TimestampMicrosecondArray};
-
         let (mut t, _f) = setup_transactor();
 
         // 1. Assert Alice at T=100

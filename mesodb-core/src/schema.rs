@@ -1,5 +1,6 @@
 use ahash::AHashMap;
 use rkyv::{Archive, Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::error::MesoError;
@@ -26,7 +27,53 @@ pub struct Attribute {
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub enum SchemaMutation {
-    AddAttribute(Attribute),
+    AddAttribute {
+        tx_id: u64,
+        timestamp: i64,
+        attribute: Attribute,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct SchemaTimeline {
+    versions: BTreeMap<u64, Arc<SchemaMap>>,
+    latest_tx: u64,
+}
+
+impl SchemaTimeline {
+    pub fn new() -> Self {
+        let mut versions = BTreeMap::new();
+        versions.insert(0, Arc::new(SchemaMap::new()));
+        Self {
+            versions,
+            latest_tx: 0,
+        }
+    }
+
+    pub fn append_version(&mut self, tx_id: u64, new_schema: SchemaMap) {
+        self.versions.insert(tx_id, Arc::new(new_schema));
+        self.latest_tx = tx_id;
+    }
+
+    pub fn get_schema_at(&self, tx_id: u64) -> Arc<SchemaMap> {
+        let (_, schema) = self.versions.range(..=tx_id).next_back().unwrap();
+        Arc::clone(schema)
+    }
+
+    pub fn get_versions_in_range(&self, start_tx: u64, end_tx: u64) -> Vec<(u64, Arc<SchemaMap>)> {
+        let mut active_versions = Vec::new();
+        let (&base_tx, base_schema) = self.versions.range(..=start_tx).next_back().unwrap();
+        active_versions.push((base_tx, Arc::clone(base_schema)));
+
+        for (&tx, schema) in self.versions.range((start_tx + 1)..=end_tx) {
+            active_versions.push((tx, Arc::clone(schema)));
+        }
+        active_versions
+    }
+
+    pub fn latest_tx(&self) -> u64 {
+        self.latest_tx
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -102,6 +149,17 @@ impl SchemaMap {
                 ident, expected, found
             ))),
         }
+    }
+
+    /// Safely ingests an attribute recovered from the WAL
+    pub fn ingest_attribute(&mut self, attr: Attribute) {
+        if attr.id >= self.next_id {
+            self.next_id = attr.id + 1;
+        }
+        let arc_attr = Arc::new(attr);
+        self.by_ident
+            .insert(arc_attr.ident.clone(), arc_attr.clone());
+        self.by_id.insert(arc_attr.id, arc_attr);
     }
 }
 
