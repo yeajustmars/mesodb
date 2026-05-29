@@ -38,10 +38,12 @@ impl MesoDB {
         let empty_batch = crate::memtable::MemTable::new(0).finish()?;
         let mut initial_ram = BTreeMap::new();
         initial_ram.insert(0, empty_batch);
+
         let world_view = Arc::new(RwLock::new(Arc::new(WorldView {
             ram_batches: Arc::new(initial_ram),
             data_dir: data_dir.clone(),
             schema: Arc::new(schema),
+            timeline: Arc::new(transactor.timeline.clone()), // <-- ADDED
         })));
 
         // Spawn the asynchronous background compactor
@@ -78,9 +80,11 @@ impl MesoDB {
 
                 let new_view = Arc::new(WorldView {
                     ram_batches: Arc::new(new_ram),
-                    data_dir: current_view.data_dir,
-                    schema: current_view.schema,
+                    data_dir: current_view.data_dir.clone(),
+                    schema: Arc::new(tx.schema.clone()),
+                    timeline: Arc::new(tx.timeline.clone()), // <-- ADDED
                 });
+
                 // Atomically update the pointer
                 let mut writer = world_view.write().unwrap();
                 *writer = new_view;
@@ -222,7 +226,7 @@ impl MesoDB {
 
         let planner = crate::planner::QueryPlanner::new(
             &ctx,
-            view.schema.as_ref(),
+            view.timeline.as_ref(),
             "resolved_datoms",
             options.format.clone(),
             options.as_of,
@@ -267,6 +271,7 @@ pub struct WorldView {
     pub ram_batches: Arc<BTreeMap<u64, RecordBatch>>,
     pub data_dir: PathBuf,
     pub schema: Arc<SchemaMap>,
+    pub timeline: Arc<crate::schema::SchemaTimeline>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
