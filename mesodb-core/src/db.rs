@@ -43,7 +43,7 @@ impl MesoDB {
             ram_batches: Arc::new(initial_ram),
             data_dir: data_dir.clone(),
             schema: Arc::new(schema),
-            timeline: Arc::new(transactor.timeline.clone()), // <-- ADDED
+            timeline: Arc::new(transactor.timeline.clone()),
         })));
 
         // Spawn the asynchronous background compactor
@@ -81,8 +81,9 @@ impl MesoDB {
                 let new_view = Arc::new(WorldView {
                     ram_batches: Arc::new(new_ram),
                     data_dir: current_view.data_dir.clone(),
-                    schema: Arc::new(tx.schema.clone()),
-                    timeline: Arc::new(tx.timeline.clone()), // <-- ADDED
+                    // FIX: Clone these safely from the current_view
+                    schema: current_view.schema.clone(),
+                    timeline: current_view.timeline.clone(),
                 });
 
                 // Atomically update the pointer
@@ -121,6 +122,8 @@ impl MesoDB {
                 ram_batches: Arc::new(new_ram),
                 data_dir: current_view.data_dir.clone(),
                 schema: Arc::new(tx.schema.clone()),
+                // FIX: Propagate the updated timeline safely
+                timeline: Arc::new(tx.timeline.clone()),
             });
             {
                 let mut writer = self.world_view.write().unwrap();
@@ -226,7 +229,7 @@ impl MesoDB {
 
         let planner = crate::planner::QueryPlanner::new(
             &ctx,
-            view.timeline.as_ref(),
+            view.timeline.as_ref(), // Updated to use timeline!
             "resolved_datoms",
             options.format.clone(),
             options.as_of,

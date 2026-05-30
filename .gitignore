@@ -11,3 +11,4 @@ assets/.!*
 **assets/\.!*/**
 **.swp
 **.swo
+**mesodb_history.txt

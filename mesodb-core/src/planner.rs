@@ -7,11 +7,11 @@ use std::sync::Arc;
 use crate::ast::{FindSpec, Query, RuleDef, RuleSet, Term, WhereClause};
 use crate::db::OutputFormat;
 use crate::error::MesoError;
-use crate::schema::SchemaMap;
+use crate::schema::{SchemaMap, SchemaTimeline}; // <-- UPDATED IMPORT
 
 pub struct QueryPlanner<'a> {
     ctx: &'a SessionContext,
-    schema: &'a SchemaMap,
+    timeline: &'a SchemaTimeline, // <-- CHANGED
     table_name: &'a str,
     format: OutputFormat,
     as_of: Option<i64>,
@@ -21,7 +21,7 @@ pub struct QueryPlanner<'a> {
 impl<'a> QueryPlanner<'a> {
     pub fn new(
         ctx: &'a SessionContext,
-        schema: &'a SchemaMap,
+        timeline: &'a SchemaTimeline, // <-- CHANGED
         table_name: &'a str,
         format: OutputFormat,
         as_of: Option<i64>,
@@ -29,7 +29,7 @@ impl<'a> QueryPlanner<'a> {
     ) -> Self {
         Self {
             ctx,
-            schema,
+            timeline, // <-- CHANGED
             table_name,
             format,
             as_of,
@@ -42,6 +42,10 @@ impl<'a> QueryPlanner<'a> {
         &self,
         clauses: &[WhereClause],
     ) -> Result<(Vec<String>, Vec<String>, HashMap<String, String>), MesoError> {
+        // FOR NOW: Just grab the absolute latest schema.
+        // We will wire up the time-travel schema switching next!
+        let active_schema = self.timeline.get_schema_at(self.timeline.latest_tx());
+
         let mut from_tables = Vec::new();
         let mut where_conditions = Vec::new();
         let mut var_to_column = HashMap::new();
@@ -91,10 +95,11 @@ impl<'a> QueryPlanner<'a> {
                     let mut current_attr = None;
                     match a {
                         Term::Keyword(kw) => {
-                            let attr_id = self.schema.get_id(kw).ok_or_else(|| {
+                            // CHANGED: Use active_schema instead of self.schema
+                            let attr_id = active_schema.get_id(kw).ok_or_else(|| {
                                 MesoError::PlanError(format!("Unknown attribute: {}", kw))
                             })?;
-                            current_attr = self.schema.get_by_id(attr_id);
+                            current_attr = active_schema.get_by_id(attr_id);
                             where_conditions.push(format!("{}.a = {}", alias, attr_id));
                         }
                         Term::Variable(var_name) => {
@@ -434,9 +439,12 @@ impl<'a> QueryPlanner<'a> {
                             let e_ids: Vec<u64> =
                                 (0..e_col.len()).map(|idx| e_col.value(idx)).collect();
 
+                            // CHANGED: Use active_schema for the PullEngine as well
+                            let active_schema =
+                                self.timeline.get_schema_at(self.timeline.latest_tx());
                             let pull_engine = crate::pull::PullEngine::new(
                                 self.ctx,
-                                self.schema,
+                                &active_schema,
                                 &self.format,
                                 self.as_of,
                             );
