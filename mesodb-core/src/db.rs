@@ -105,6 +105,41 @@ impl MesoDB {
         self.execute(facts, Some(custom_now)).await
     }
 
+    /// Exposes explicit schema definition to the outside world.
+    /// Batches multiple attribute creations into a single locked transaction.
+    pub async fn transact_schema(
+        &self,
+        attributes: Vec<AttributeDefinition>,
+    ) -> Result<Vec<Arc<crate::schema::Attribute>>> {
+        let mut tx = self.transactor.lock().await;
+        let mut added_attrs = Vec::with_capacity(attributes.len());
+
+        for attr in attributes {
+            let added = tx.transact_schema(&attr.ident, attr.value_type, attr.is_unique)?;
+            added_attrs.push(added);
+        }
+
+        // If we actually added anything, we must publish the new schema to RAM
+        // so that read-queries can instantly recognize the new attributes.
+        if !added_attrs.is_empty() {
+            let current_view = self.world_view.read().unwrap().as_ref().clone();
+
+            let new_view = Arc::new(WorldView {
+                ram_batches: current_view.ram_batches.clone(), // Data is unchanged
+                data_dir: current_view.data_dir.clone(),
+                schema: Arc::new(tx.schema.clone()),
+                timeline: Arc::new(tx.timeline.clone()),
+            });
+
+            {
+                let mut writer = self.world_view.write().unwrap();
+                *writer = new_view;
+            }
+        }
+
+        Ok(added_attrs)
+    }
+
     /// DRY helper that handles the lock, the transaction, and the lock-free WorldView pointer swap.
     async fn execute(&self, facts: Vec<Fact>, custom_now: Option<i64>) -> Result<TxReport> {
         let mut tx = self.transactor.lock().await;
@@ -290,6 +325,13 @@ pub struct QueryOptions {
     pub as_of: Option<i64>,
     pub format: OutputFormat,
     pub rules: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AttributeDefinition {
+    pub ident: String,
+    pub value_type: crate::schema::ValueType,
+    pub is_unique: bool,
 }
 
 #[cfg(test)]
