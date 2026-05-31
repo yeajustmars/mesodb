@@ -178,16 +178,31 @@ impl Transactor {
             // --- JIT TYPE COERCION ---
             // JSON numbers parse as Int64 by default. If the schema demands a Ref,
             // we safely cast it here before validation fails.
-            if let Some(attr) = self.schema.get_by_id(attr_id) {
-                if attr.value_type == ValueType::Ref {
-                    if let Value::Int64(i) = fact.v {
-                        fact.v = Value::Ref(i as u64);
-                    }
-                }
+            if let Some(attr) = self.schema.get_by_id(attr_id)
+                && attr.value_type == ValueType::Ref
+                && let Value::Int64(i) = fact.v
+            {
+                fact.v = Value::Ref(i as u64);
             }
 
             self.schema.validate_value(&fact.ident, &fact.v)?;
             let is_unique = self.schema.get_by_id(attr_id).unwrap().is_unique;
+
+            // --- CAS VALIDATION ---
+            if let Some(expected_v) = &fact.cas_old_v {
+                let current_v = self.indices.get_current_value(fact.e, attr_id);
+                let current_matches = match current_v {
+                    Some(v) => v == expected_v,
+                    None => false, // Standard CAS requires the old value to exist
+                };
+
+                if !current_matches {
+                    return Err(MesoError::Serialization(format!(
+                        "CAS conflict for entity {} attribute '{}': expected {:?}, found {:?}",
+                        fact.e, fact.ident, expected_v, current_v
+                    )));
+                }
+            }
 
             if fact.op {
                 // Assertions
@@ -274,6 +289,7 @@ pub struct Fact {
     pub ident: String,
     pub v: Value,
     pub op: bool,
+    pub cas_old_v: Option<Value>, // Compare-And-Swap expectation
 }
 
 #[derive(Debug)]
@@ -311,6 +327,7 @@ mod tests {
                     ident: ":user/name".into(),
                     v: Value::String("Alice".into()),
                     op: true,
+                    cas_old_v: None,
                 }],
                 100,
             )
@@ -324,6 +341,7 @@ mod tests {
                     ident: ":user/name".into(),
                     v: Value::String("Alice-Revised".into()),
                     op: true,
+                    cas_old_v: None,
                 }],
                 200,
             )
@@ -342,6 +360,7 @@ mod tests {
             ident: ":user/email".into(),
             v: Value::String("a@b.com".into()),
             op: true,
+            cas_old_v: None,
         }])
         .unwrap();
 
@@ -350,6 +369,7 @@ mod tests {
             ident: ":user/email".into(),
             v: Value::String("a@b.com".into()),
             op: true,
+            cas_old_v: None,
         }]);
 
         assert!(err.is_err());
@@ -367,6 +387,7 @@ mod tests {
                 ident: ":user/name".into(),
                 v: Value::String("Alice".into()),
                 op: true,
+                cas_old_v: None,
             }],
             100,
         )
@@ -380,6 +401,7 @@ mod tests {
                     ident: ":user/name".into(),
                     v: Value::String("Bob".into()),
                     op: true,
+                    cas_old_v: None,
                 }],
                 200,
             )
@@ -441,6 +463,7 @@ mod tests {
                 ident: ":new/jit_attr".into(), // Does not exist in the initial SchemaMap!
                 v: Value::String("Test".into()),
                 op: true,
+                cas_old_v: None,
             }])
             .unwrap();
 
@@ -458,5 +481,143 @@ mod tests {
             let attr = t_recovered.schema.get_by_ident(":new/jit_attr").unwrap();
             assert_eq!(attr.value_type, ValueType::String);
         }
+    }
+
+    #[test]
+    fn test_atomic_compare_and_swap() {
+        let (mut t, _f) = setup_transactor();
+
+        // 1. Initial State: Alice is 29
+        t.transact(vec![Fact {
+            e: 1,
+            ident: ":user/age".into(), // Will JIT create this attribute
+            v: Value::Int64(29),
+            op: true,
+            cas_old_v: None,
+        }])
+        .unwrap();
+
+        // 2. Failed CAS: Someone tries to update her to 31, but thinks she is 30.
+        let bad_cas = t.transact(vec![Fact {
+            e: 1,
+            ident: ":user/age".into(),
+            v: Value::Int64(31),
+            op: true,
+            cas_old_v: Some(Value::Int64(30)), // Incorrect expectation!
+        }]);
+
+        // Transaction must abort!
+        assert!(bad_cas.is_err());
+        assert!(bad_cas.unwrap_err().to_string().contains("CAS conflict"));
+
+        // 3. Successful CAS: We expect 29, and update to 30.
+        let good_cas = t.transact(vec![Fact {
+            e: 1,
+            ident: ":user/age".into(),
+            v: Value::Int64(30),
+            op: true,
+            cas_old_v: Some(Value::Int64(29)), // Correct expectation!
+        }]);
+
+        assert!(good_cas.is_ok());
+    }
+
+    #[test]
+    fn test_cas_transaction_atomicity() {
+        let (mut t, _f) = setup_transactor();
+
+        // 1. Setup Initial Bank Balances
+        t.transact(vec![
+            Fact {
+                e: 10,
+                ident: ":bank/balance".into(),
+                v: Value::Int64(100),
+                op: true,
+                cas_old_v: None,
+            },
+            Fact {
+                e: 20,
+                ident: ":bank/balance".into(),
+                v: Value::Int64(50),
+                op: true,
+                cas_old_v: None,
+            },
+        ])
+        .unwrap();
+
+        // 2. Attempt a transfer of 50 from Account 10 to Account 20.
+        // We simulate a race condition where Account 20's balance is 50, but our client thought it was 40.
+        let transfer_attempt = t.transact(vec![
+            // Valid CAS (100 -> 50)
+            Fact {
+                e: 10,
+                ident: ":bank/balance".into(),
+                v: Value::Int64(50),
+                op: true,
+                cas_old_v: Some(Value::Int64(100)),
+            },
+            // INVALID CAS (Expected 40, but is actually 50)
+            Fact {
+                e: 20,
+                ident: ":bank/balance".into(),
+                v: Value::Int64(90),
+                op: true,
+                cas_old_v: Some(Value::Int64(40)),
+            },
+        ]);
+
+        assert!(transfer_attempt.is_err());
+
+        // 3. PROVE ATOMICITY: Account 10 MUST STILL BE 100.
+        // The first valid fact should have been entirely rolled back.
+        let attr_id = t.schema.get_id(":bank/balance").unwrap();
+        let bal_10 = t.indices.get_current_value(10, attr_id).unwrap();
+        assert_eq!(
+            bal_10,
+            &Value::Int64(100),
+            "Atomicity failed! Account 10 was partially updated."
+        );
+    }
+
+    #[test]
+    fn test_cas_retractions_and_missing_values() {
+        let (mut t, _f) = setup_transactor();
+
+        t.transact(vec![Fact {
+            e: 1,
+            ident: ":user/status".into(),
+            v: Value::String("active".into()),
+            op: true,
+            cas_old_v: None,
+        }])
+        .unwrap();
+
+        // 1. Failed CAS on Missing Attribute (Entity 2 doesn't exist)
+        let missing_err = t.transact(vec![Fact {
+            e: 2,
+            ident: ":user/status".into(),
+            v: Value::String("active".into()),
+            op: true,
+            cas_old_v: Some(Value::String("inactive".into())),
+        }]);
+        assert!(
+            missing_err.is_err(),
+            "CAS should fail if the expected old value does not exist in the DB"
+        );
+
+        // 2. Successful CAS on Retraction
+        // "Remove the status, but ONLY if it is currently 'active'"
+        let good_retract = t.transact(vec![Fact {
+            e: 1,
+            ident: ":user/status".into(),
+            v: Value::String("active".into()), // The value being retracted
+            op: false,                         // Retract!
+            cas_old_v: Some(Value::String("active".into())),
+        }]);
+        assert!(good_retract.is_ok());
+
+        // Verify it's actually gone
+        let attr_id = t.schema.get_id(":user/status").unwrap();
+        assert!(t.indices.get_current_value(1, attr_id).is_none());
     }
 }

@@ -15,6 +15,8 @@ pub struct WireFact {
     pub ident: String,
     pub v: JsonValue,
     pub op: bool,
+    #[serde(default)] // If missing in JSON, it becomes None
+    pub cas_old_v: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]

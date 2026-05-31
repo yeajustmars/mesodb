@@ -10,7 +10,7 @@ use mesodb_core::schema::ValueType;
 use mesodb_core::transactor::Fact;
 use mesodb_core::types::Value as MesoValue;
 
-use crate::dto::{ErrorResponse, QueryRequest, TransactionRequest};
+use crate::dto::{ErrorResponse, TransactionRequest};
 
 /// POST /transact
 pub async fn handle_transact(
@@ -19,34 +19,43 @@ pub async fn handle_transact(
 ) -> impl IntoResponse {
     let mut core_facts = Vec::with_capacity(payload.facts.len());
 
-    for wire in payload.facts {
-        let core_value = match wire.v {
-            JsonValue::Bool(b) => MesoValue::Boolean(b),
+    // A quick helper to parse standard JSON into our engine's types
+    let parse_json = |val: JsonValue| -> Result<MesoValue, String> {
+        match val {
+            JsonValue::Bool(b) => Ok(MesoValue::Boolean(b)),
             JsonValue::Number(num) => {
                 if let Some(i) = num.as_i64() {
-                    MesoValue::Int64(i)
+                    Ok(MesoValue::Int64(i))
                 } else if let Some(f) = num.as_f64() {
-                    MesoValue::Float64(f)
+                    Ok(MesoValue::Float64(f))
                 } else {
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(ErrorResponse {
-                            error: "Invalid numeric type".into(),
-                        }),
-                    )
-                        .into_response();
+                    Err("Invalid numeric type".into())
                 }
             }
-            JsonValue::String(s) => MesoValue::String(s),
-            _ => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ErrorResponse {
-                        error: "Unsupported value type".into(),
-                    }),
-                )
-                    .into_response();
+            JsonValue::String(s) => Ok(MesoValue::String(s)),
+            _ => Err("Unsupported value type".into()),
+        }
+    };
+
+    for wire in payload.facts {
+        // 1. Parse the main value
+        let core_value = match parse_json(wire.v) {
+            Ok(v) => v,
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })).into_response();
             }
+        };
+
+        // 2. Parse the optional CAS value
+        let core_cas = match wire.cas_old_v {
+            Some(val) => match parse_json(val) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e }))
+                        .into_response();
+                }
+            },
+            None => None,
         };
 
         core_facts.push(Fact {
@@ -54,6 +63,7 @@ pub async fn handle_transact(
             ident: wire.ident,
             v: core_value,
             op: wire.op,
+            cas_old_v: core_cas,
         });
     }
 

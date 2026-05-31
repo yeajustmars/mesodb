@@ -168,15 +168,15 @@ impl MesoDB {
             // --- THE COMPACTION COMPLIANCE THRESHOLD ---
             // Only queue a background disk flush when a memory batch size threshold is reached.
             // This stops high-frequency iterations from overwhelming the OS file system stack.
-            if report.batch.num_rows() >= 50_000 {
-                if self
+            // TODO: allow setting this value in config
+            if report.batch.num_rows() >= 50_000
+                && self
                     .flush_tx
                     .send((report.tx_id, report.batch.clone()))
                     .await
                     .is_err()
-                {
-                    eprintln!("Warning: Background flusher disconnected.");
-                }
+            {
+                eprintln!("Warning: Background flusher disconnected.");
             }
         }
 
@@ -370,12 +370,14 @@ mod tests {
                 ident: ":user/name".into(),
                 v: Value::String("Alice".into()),
                 op: true,
+                cas_old_v: None,
             },
             Fact {
                 e: 1,
                 ident: ":user/age".into(),
                 v: Value::Int64(30),
                 op: true,
+                cas_old_v: None,
             },
         ])
         .await
@@ -417,6 +419,7 @@ mod tests {
                 ident: ":user/name".into(),
                 v: Value::String("Alice".into()),
                 op: true,
+                cas_old_v: None,
             }],
             100,
         )
@@ -430,6 +433,7 @@ mod tests {
                 ident: ":user/name".into(),
                 v: Value::String("Alice-Revised".into()),
                 op: true,
+                cas_old_v: None,
             }],
             200,
         )
@@ -443,6 +447,7 @@ mod tests {
                 ident: ":user/name".into(),
                 v: Value::String("Bob".into()),
                 op: true,
+                cas_old_v: None,
             }],
             300,
         )
@@ -509,6 +514,7 @@ mod tests {
             ident: ":sys/init".into(),
             v: Value::Boolean(true),
             op: true,
+            cas_old_v: None,
         }])
         .await
         .unwrap();
@@ -520,6 +526,7 @@ mod tests {
                 ident: ":user/name".into(),
                 v: Value::String("Alice".into()),
                 op: true,
+                cas_old_v: None,
             }],
             100,
         )
@@ -533,6 +540,7 @@ mod tests {
                 ident: ":user/name".into(),
                 v: Value::String("Alice-Revised".into()),
                 op: true,
+                cas_old_v: None,
             }],
             200,
         )
@@ -592,12 +600,14 @@ mod tests {
                     ident: ":user/name".into(),
                     v: Value::String("Alice".into()),
                     op: true,
+                    cas_old_v: None,
                 },
                 Fact {
                     e: 1,
                     ident: ":user/city".into(),
                     v: Value::String("New York".into()),
                     op: true,
+                    cas_old_v: None,
                 },
             ],
             100,
@@ -612,6 +622,7 @@ mod tests {
                 ident: ":user/city".into(),
                 v: Value::String("London".into()),
                 op: true,
+                cas_old_v: None,
             }],
             200,
         )
@@ -669,18 +680,21 @@ mod tests {
                 ident: ":user/name".into(),
                 v: Value::String("Alice".into()),
                 op: true,
+                cas_old_v: None,
             },
             Fact {
                 e: 1,
                 ident: ":user/address".into(),
                 v: Value::Ref(2),
                 op: true,
+                cas_old_v: None,
             },
             Fact {
                 e: 2,
                 ident: ":address/city".into(),
                 v: Value::String("New York".into()),
                 op: true,
+                cas_old_v: None,
             },
         ])
         .await
@@ -741,24 +755,28 @@ mod tests {
                 ident: ":order/user".into(),
                 v: Value::Ref(1),
                 op: true,
+                cas_old_v: None,
             },
             Fact {
                 e: 101,
                 ident: ":order/total".into(),
                 v: Value::Int64(50),
                 op: true,
+                cas_old_v: None,
             },
             Fact {
                 e: 102,
                 ident: ":order/user".into(),
                 v: Value::Ref(1),
                 op: true,
+                cas_old_v: None,
             },
             Fact {
                 e: 102,
                 ident: ":order/total".into(),
                 v: Value::Int64(100),
                 op: true,
+                cas_old_v: None,
             },
             // User 2 has one order totaling 75
             Fact {
@@ -766,12 +784,14 @@ mod tests {
                 ident: ":order/user".into(),
                 v: Value::Ref(2),
                 op: true,
+                cas_old_v: None,
             },
             Fact {
                 e: 103,
                 ident: ":order/total".into(),
                 v: Value::Int64(75),
                 op: true,
+                cas_old_v: None,
             },
         ])
         .await
@@ -826,18 +846,21 @@ mod tests {
                 ident: ":person/name".into(),
                 v: Value::String("Alice (Grandparent)".into()),
                 op: true,
+                cas_old_v: None,
             },
             Fact {
                 e: 2,
                 ident: ":person/parent".into(),
                 v: Value::Ref(1),
                 op: true,
+                cas_old_v: None,
             },
             Fact {
                 e: 2,
                 ident: ":person/name".into(),
                 v: Value::String("Bob (Parent)".into()),
                 op: true,
+                cas_old_v: None,
             },
             // 2 (Bob) is parent of 3 (Charlie)
             Fact {
@@ -845,12 +868,14 @@ mod tests {
                 ident: ":person/parent".into(),
                 v: Value::Ref(2),
                 op: true,
+                cas_old_v: None,
             },
             Fact {
                 e: 3,
                 ident: ":person/name".into(),
                 v: Value::String("Charlie (Child)".into()),
                 op: true,
+                cas_old_v: None,
             },
         ])
         .await
@@ -908,42 +933,49 @@ mod tests {
                 ident: ":user/name".into(),
                 v: Value::String("Alice".into()),
                 op: true,
+                cas_old_v: None,
             },
             Fact {
                 e: 1,
                 ident: ":user/age".into(),
                 v: Value::Int64(30),
                 op: true,
+                cas_old_v: None,
             },
             Fact {
                 e: 1,
                 ident: ":user/active".into(),
                 v: Value::Boolean(true),
                 op: true,
+                cas_old_v: None,
             },
             Fact {
                 e: 1,
                 ident: ":user/address".into(),
                 v: Value::Ref(2),
                 op: true,
+                cas_old_v: None,
             },
             Fact {
                 e: 2,
                 ident: ":address/city".into(),
                 v: Value::String("New York".into()),
                 op: true,
+                cas_old_v: None,
             },
             Fact {
                 e: 3,
                 ident: ":user/name".into(),
                 v: Value::String("Bob".into()),
                 op: true,
+                cas_old_v: None,
             },
             Fact {
                 e: 3,
                 ident: ":user/age".into(),
                 v: Value::Int64(40),
                 op: true,
+                cas_old_v: None,
             },
         ])
         .await
@@ -1128,12 +1160,14 @@ mod tests {
                 ident: ":product/sku".into(),
                 v: Value::String("XJ-900".into()),
                 op: true,
+                cas_old_v: None,
             },
             Fact {
                 e: 100,
                 ident: ":product/price".into(),
                 v: Value::Float64(99.99),
                 op: true,
+                cas_old_v: None,
             },
         ])
         .await
