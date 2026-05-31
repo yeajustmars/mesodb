@@ -1072,4 +1072,69 @@ mod tests {
             Some(&Value::String("BOB".into()))
         );
     }
+
+    #[tokio::test]
+    async fn test_explicit_schema_transaction_and_query() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = MesoDB::open(
+            dir.path().join("explicit_schema.db"),
+            SchemaMap::new(),
+            Config::default(),
+        )
+        .unwrap();
+
+        // 1. Transact the explicit schema
+        let attrs = vec![
+            AttributeDefinition {
+                ident: ":product/sku".into(),
+                value_type: ValueType::String,
+                is_unique: true,
+            },
+            AttributeDefinition {
+                ident: ":product/price".into(),
+                value_type: ValueType::Float64,
+                is_unique: false,
+            },
+        ];
+
+        let added = db.transact_schema(attrs).await.unwrap();
+        assert_eq!(added.len(), 2);
+        assert_eq!(added[0].ident, ":product/sku");
+        assert_eq!(added[1].ident, ":product/price");
+
+        // 2. Verify the lock-free WorldView pointer updated instantly
+        {
+            let view = db.world_view.read().unwrap().clone();
+            assert!(view.schema.contains_ident(":product/sku"));
+            assert!(view.schema.contains_ident(":product/price"));
+        }
+
+        // 3. Immediately transact data using the new schema!
+        // If the pointer swap or timeline update failed, this or the query will panic.
+        db.transact(vec![
+            Fact {
+                e: 100,
+                ident: ":product/sku".into(),
+                v: Value::String("XJ-900".into()),
+                op: true,
+            },
+            Fact {
+                e: 100,
+                ident: ":product/price".into(),
+                v: Value::Float64(99.99),
+                op: true,
+            },
+        ])
+        .await
+        .unwrap();
+
+        // 4. Query the data to prove the QueryPlanner sees the new timeline
+        let query =
+            r#"[:find ?sku ?price :where [?e :product/sku ?sku] [?e :product/price ?price]]"#;
+        let results = db.query_native(query).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].get("sku"), Some(&Value::String("XJ-900".into())));
+        assert_eq!(results[0].get("price"), Some(&Value::Float64(99.99)));
+    }
 }
