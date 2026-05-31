@@ -293,6 +293,17 @@ impl MesoDB {
         Ok(crate::formatter::to_json_string(&batches, &ast.find))
     }
 
+    pub async fn query_json_with_options(
+        &self,
+        query_str: &str,
+        mut options: QueryOptions,
+    ) -> Result<String> {
+        let ast = crate::parser::parse_query(query_str)?;
+        options.format = OutputFormat::Json; // Enforce JSON for this pipeline
+        let batches = self.query_with_options(query_str, options).await?;
+        Ok(crate::formatter::to_json_string(&batches, &ast.find))
+    }
+
     pub async fn query_edn(&self, query_str: &str) -> Result<String> {
         let ast = crate::parser::parse_query(query_str)?;
         let opts = QueryOptions {

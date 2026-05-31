@@ -86,19 +86,23 @@ pub async fn handle_transact(
 // #[axum::debug_handler]
 pub async fn handle_query(
     State(db): State<Arc<MesoDB>>,
-    Json(payload): Json<QueryRequest>, // Assuming QueryRequest is your DTO
+    Json(payload): Json<crate::dto::QueryRequest>,
 ) -> impl IntoResponse {
-    // We execute the query and format it directly to a JSON string
-    match db.query_json(&payload.query).await {
-        Ok(json_str) => {
-            // json_str is already a formatted array: [{"name":"Alice", "age":30}, ...]
-            (
-                axum::http::StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, "application/json")],
-                json_str,
-            )
-                .into_response()
-        }
+    // Map the incoming DTO to the core engine's QueryOptions
+    let opts = mesodb_core::db::QueryOptions {
+        as_of: payload.as_of,
+        rules: payload.rules.clone(),
+        format: mesodb_core::db::OutputFormat::Json,
+    };
+
+    // Use the new options-aware JSON pipeline!
+    match db.query_json_with_options(&payload.query, opts).await {
+        Ok(json_str) => (
+            axum::http::StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            json_str,
+        )
+            .into_response(),
         Err(e) => (
             axum::http::StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": format!("{:?}", e)})),
