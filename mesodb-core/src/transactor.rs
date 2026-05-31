@@ -415,4 +415,37 @@ mod tests {
         assert_eq!(from_col.value(1), 200);
         assert_eq!(to_col.value(1), i64::MAX); // New assertion is valid until the end of time
     }
+
+    #[test]
+    fn test_jit_schema_durability_and_recovery() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let config = Config::default();
+
+        // 1. Boot fresh transactor and transact a totally unknown attribute
+        {
+            let mut t =
+                Transactor::new(temp_file.path(), SchemaMap::new(), config.clone()).unwrap();
+            t.transact(vec![Fact {
+                e: 1,
+                ident: ":new/jit_attr".into(), // Does not exist in the initial SchemaMap!
+                v: Value::String("Test".into()),
+                op: true,
+            }])
+            .unwrap();
+
+            // Verify the engine inferred it in RAM
+            assert!(t.schema.contains_ident(":new/jit_attr"));
+        } // `t` is dropped here. Server "crashes".
+
+        // 2. Re-open from the exact same WAL file
+        {
+            let t_recovered = Transactor::new(temp_file.path(), SchemaMap::new(), config).unwrap();
+
+            // If the SchemaMutation wasn't durable, this would fail!
+            assert!(t_recovered.schema.contains_ident(":new/jit_attr"));
+
+            let attr = t_recovered.schema.get_by_ident(":new/jit_attr").unwrap();
+            assert_eq!(attr.value_type, ValueType::String);
+        }
+    }
 }

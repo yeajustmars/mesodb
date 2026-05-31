@@ -237,4 +237,30 @@ mod tests {
         assert_eq!(a1.id, 100);
         assert_eq!(a2.id, 101);
     }
+
+    #[test]
+    fn test_schema_timeline_time_travel() {
+        let mut timeline = SchemaTimeline::new(); // Implicitly creates Tx 0 at T 0
+
+        // Schema V1 at T = 1000
+        let mut schema1 = SchemaMap::new();
+        schema1.add_attribute(":v1/attr", ValueType::String, false);
+        timeline.append_version(1, 1000, schema1);
+
+        // Schema V2 at T = 2000
+        let mut schema2 = SchemaMap::new();
+        schema2.add_attribute(":v2/attr", ValueType::Int64, false);
+        timeline.append_version(2, 2000, schema2);
+
+        // 1. Exact matches
+        assert_eq!(timeline.tx_for_timestamp(1000), 1);
+        assert_eq!(timeline.tx_for_timestamp(2000), 2);
+
+        // 2. In-between times (Should floor to the highest Tx <= Timestamp)
+        assert_eq!(timeline.tx_for_timestamp(1500), 1);
+        assert_eq!(timeline.tx_for_timestamp(2999), 2);
+
+        // 3. Before genesis
+        assert_eq!(timeline.tx_for_timestamp(500), 0);
+    }
 }
