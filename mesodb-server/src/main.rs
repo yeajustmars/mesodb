@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use mesodb_core::config::Config;
 use mesodb_core::db::MesoDB;
-use mesodb_core::schema::{SchemaMap, ValueType};
+use mesodb_core::schema::SchemaMap;
 
 mod dto;
 mod handlers;
@@ -23,11 +23,7 @@ async fn main() -> color_eyre::Result<()> {
     tracing::info!("Initializing MesoDB Server Cluster state...");
 
     // Setup base schema
-    let mut schema = SchemaMap::new();
-    schema.add_attribute(":sensor/id", ValueType::Int64, false);
-    schema.add_attribute(":sensor/reading", ValueType::Float64, false);
-    schema.add_attribute(":user/name", ValueType::String, false);
-    schema.add_attribute(":user/email", ValueType::String, true);
+    let schema = SchemaMap::new();
 
     // Initialize DB
     let db_path = PathBuf::from("./data/prod_server.db");
@@ -36,8 +32,9 @@ async fn main() -> color_eyre::Result<()> {
 
     // Build the router with direct State attachment
     let app = Router::new()
-        .route("/transact", post(handlers::handle_transact))
+        .route("/schema", post(handlers::handle_schema))
         .route("/query", post(handlers::handle_query))
+        .route("/transact", post(handlers::handle_transact))
         .with_state(db);
 
     // Bind and serve using standard tokio tools

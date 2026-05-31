@@ -29,3 +29,16 @@ pub struct QueryRequest {
 pub struct ErrorResponse {
     pub error: String,
 }
+
+#[derive(Debug, Deserialize)]
+pub struct SchemaRequest {
+    pub attributes: Vec<SchemaAttributeDto>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SchemaAttributeDto {
+    pub ident: String,
+    pub value_type: String,
+    #[serde(default)]
+    pub is_unique: bool,
+}
