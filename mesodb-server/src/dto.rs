@@ -18,6 +18,7 @@ pub struct WireFact {
 }
 
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)] // TODO: remove this once implemented
 pub struct QueryRequest {
     pub query: String,
     pub as_of: Option<i64>,

@@ -137,7 +137,7 @@ impl Transactor {
         let mut batch_uniques = HashSet::new();
 
         // --- PHASE 1: Validation & Bitemporal Resolution ---
-        for fact in facts {
+        for mut fact in facts {
             let attr_id = if let Some(id) = self.schema.get_id(&fact.ident) {
                 id
             } else if self.config.storage.allow_jit_schema {
@@ -174,6 +174,17 @@ impl Transactor {
                     fact.ident
                 )));
             };
+
+            // --- JIT TYPE COERCION ---
+            // JSON numbers parse as Int64 by default. If the schema demands a Ref,
+            // we safely cast it here before validation fails.
+            if let Some(attr) = self.schema.get_by_id(attr_id) {
+                if attr.value_type == ValueType::Ref {
+                    if let Value::Int64(i) = fact.v {
+                        fact.v = Value::Ref(i as u64);
+                    }
+                }
+            }
 
             self.schema.validate_value(&fact.ident, &fact.v)?;
             let is_unique = self.schema.get_by_id(attr_id).unwrap().is_unique;

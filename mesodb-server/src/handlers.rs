@@ -1,16 +1,11 @@
 // mesodb-server/src/handlers.rs
 
-use axum::{
-    Json,
-    extract::State,
-    http::{StatusCode, header},
-    response::IntoResponse,
-};
+use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
 use crate::dto::SchemaRequest;
-use mesodb_core::db::{AttributeDefinition, MesoDB, OutputFormat, QueryOptions};
+use mesodb_core::db::{AttributeDefinition, MesoDB};
 use mesodb_core::schema::ValueType;
 use mesodb_core::transactor::Fact;
 use mesodb_core::types::Value as MesoValue;
@@ -88,70 +83,27 @@ pub async fn handle_transact(
 }
 
 /// POST /query
+// #[axum::debug_handler]
 pub async fn handle_query(
     State(db): State<Arc<MesoDB>>,
-    Json(payload): Json<QueryRequest>,
+    Json(payload): Json<QueryRequest>, // Assuming QueryRequest is your DTO
 ) -> impl IntoResponse {
-    let output_format = match payload.format.as_deref() {
-        Some("json") => OutputFormat::Json,
-        Some("edn") => OutputFormat::Edn,
-        _ => OutputFormat::Tabular,
-    };
-
-    let opts = QueryOptions {
-        as_of: payload.as_of,
-        format: output_format.clone(),
-        rules: payload.rules,
-    };
-
-    match output_format {
-        OutputFormat::Json => match db.query_json(&payload.query).await {
-            Ok(json_str) => (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/json")],
+    // We execute the query and format it directly to a JSON string
+    match db.query_json(&payload.query).await {
+        Ok(json_str) => {
+            // json_str is already a formatted array: [{"name":"Alice", "age":30}, ...]
+            (
+                axum::http::StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
                 json_str,
             )
-                .into_response(),
-            Err(e) => (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: format!("{:?}", e),
-                }),
-            )
-                .into_response(),
-        },
-        OutputFormat::Edn => match db.query_edn(&payload.query).await {
-            Ok(edn_str) => (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/edn")],
-                edn_str,
-            )
-                .into_response(),
-            Err(e) => (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: format!("{:?}", e),
-                }),
-            )
-                .into_response(),
-        },
-        OutputFormat::Tabular => match db.query_with_options(&payload.query, opts).await {
-            Ok(batches) => {
-                let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-                (
-                    StatusCode::OK,
-                    Json(serde_json::json!({ "tabular_rows_returned": total_rows })),
-                )
-                    .into_response()
-            }
-            Err(e) => (
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: format!("{:?}", e),
-                }),
-            )
-                .into_response(),
-        },
+                .into_response()
+        }
+        Err(e) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("{:?}", e)})),
+        )
+            .into_response(),
     }
 }
 
@@ -312,11 +264,14 @@ mod tests {
             query_json
         );
 
-        // Your API currently returns `{"tabular_rows_returned": 1}` for standard queries.
-        // This proves the QueryPlanner successfully resolved the new schema and found Alice!
-        assert_eq!(
-            query_json["tabular_rows_returned"], 1,
-            "Query did not find the expected number of rows!"
-        );
+        // The endpoint now returns the raw JSON array!
+        let results_array = query_json
+            .as_array()
+            .expect("Expected a JSON array of results");
+
+        // Our test script only inserted Alice, so we expect 1 row.
+        assert_eq!(results_array.len(), 1);
+        assert_eq!(results_array[0]["n"], "Alice");
+        assert_eq!(results_array[0]["a"], 30);
     }
 }
