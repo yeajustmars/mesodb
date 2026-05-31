@@ -37,22 +37,36 @@ pub enum SchemaMutation {
 #[derive(Debug, Clone)]
 pub struct SchemaTimeline {
     versions: BTreeMap<u64, Arc<SchemaMap>>,
+    time_index: BTreeMap<i64, u64>, // NEW: Maps Timestamp -> TxId
     latest_tx: u64,
 }
 
 impl SchemaTimeline {
     pub fn new() -> Self {
         let mut versions = BTreeMap::new();
+        let mut time_index = BTreeMap::new();
         versions.insert(0, Arc::new(SchemaMap::new()));
+        time_index.insert(0, 0); // Genesis time
         Self {
             versions,
+            time_index,
             latest_tx: 0,
         }
     }
 
-    pub fn append_version(&mut self, tx_id: u64, new_schema: SchemaMap) {
+    pub fn append_version(&mut self, tx_id: u64, timestamp: i64, new_schema: SchemaMap) {
         self.versions.insert(tx_id, Arc::new(new_schema));
+        self.time_index.insert(timestamp, tx_id);
         self.latest_tx = tx_id;
+    }
+
+    /// NEW: Converts a wall-clock microsecond timestamp into the active TxId
+    pub fn tx_for_timestamp(&self, timestamp: i64) -> u64 {
+        self.time_index
+            .range(..=timestamp)
+            .next_back()
+            .map(|(_, &tx)| tx)
+            .unwrap_or(0)
     }
 
     pub fn get_schema_at(&self, tx_id: u64) -> Arc<SchemaMap> {

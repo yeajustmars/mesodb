@@ -32,7 +32,7 @@ impl Transactor {
         let mut timeline = SchemaTimeline::new();
 
         // Baseline whatever schema was passed in
-        timeline.append_version(0, schema.clone());
+        timeline.append_version(0, 0, schema.clone());
 
         // Rebuild memory indices and timeline from the WAL
         let recovered_entries = wal.recover()?;
@@ -55,11 +55,11 @@ impl Transactor {
                 WalEntry::SchemaMutation(mutation) => match mutation {
                     crate::schema::SchemaMutation::AddAttribute {
                         tx_id,
-                        timestamp: _,
+                        timestamp,
                         attribute,
                     } => {
                         schema.ingest_attribute(attribute);
-                        timeline.append_version(tx_id, schema.clone());
+                        timeline.append_version(tx_id, timestamp, schema.clone());
                         if tx_id >= current_tx_id {
                             current_tx_id = tx_id + 1;
                         }
@@ -103,7 +103,8 @@ impl Transactor {
             &WalEntry::SchemaMutation(mutation),
             &self.config.storage.wal_sync_mode,
         )?;
-        self.timeline.append_version(tx_id, self.schema.clone());
+        self.timeline
+            .append_version(tx_id, now, self.schema.clone());
 
         Ok(attr)
     }
@@ -163,7 +164,8 @@ impl Transactor {
                     &WalEntry::SchemaMutation(mutation),
                     &self.config.storage.wal_sync_mode,
                 )?;
-                self.timeline.append_version(tx_id, self.schema.clone());
+                self.timeline
+                    .append_version(tx_id, now, self.schema.clone());
 
                 new_attr.id
             } else {

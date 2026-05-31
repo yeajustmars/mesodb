@@ -7,11 +7,11 @@ use std::sync::Arc;
 use crate::ast::{FindSpec, Query, RuleDef, RuleSet, Term, WhereClause};
 use crate::db::OutputFormat;
 use crate::error::MesoError;
-use crate::schema::{SchemaMap, SchemaTimeline}; // <-- UPDATED IMPORT
+use crate::schema::SchemaTimeline;
 
 pub struct QueryPlanner<'a> {
     ctx: &'a SessionContext,
-    timeline: &'a SchemaTimeline, // <-- CHANGED
+    timeline: &'a SchemaTimeline,
     table_name: &'a str,
     format: OutputFormat,
     as_of: Option<i64>,
@@ -21,7 +21,7 @@ pub struct QueryPlanner<'a> {
 impl<'a> QueryPlanner<'a> {
     pub fn new(
         ctx: &'a SessionContext,
-        timeline: &'a SchemaTimeline, // <-- CHANGED
+        timeline: &'a SchemaTimeline,
         table_name: &'a str,
         format: OutputFormat,
         as_of: Option<i64>,
@@ -29,7 +29,7 @@ impl<'a> QueryPlanner<'a> {
     ) -> Self {
         Self {
             ctx,
-            timeline, // <-- CHANGED
+            timeline,
             table_name,
             format,
             as_of,
@@ -42,9 +42,13 @@ impl<'a> QueryPlanner<'a> {
         &self,
         clauses: &[WhereClause],
     ) -> Result<(Vec<String>, Vec<String>, HashMap<String, String>), MesoError> {
-        // FOR NOW: Just grab the absolute latest schema.
-        // We will wire up the time-travel schema switching next!
-        let active_schema = self.timeline.get_schema_at(self.timeline.latest_tx());
+        // The Time-Travel Schema Resolver!
+        let target_tx = if let Some(t) = self.as_of {
+            self.timeline.tx_for_timestamp(t)
+        } else {
+            self.timeline.latest_tx()
+        };
+        let active_schema = self.timeline.get_schema_at(target_tx);
 
         let mut from_tables = Vec::new();
         let mut where_conditions = Vec::new();
@@ -439,9 +443,14 @@ impl<'a> QueryPlanner<'a> {
                             let e_ids: Vec<u64> =
                                 (0..e_col.len()).map(|idx| e_col.value(idx)).collect();
 
-                            // CHANGED: Use active_schema for the PullEngine as well
-                            let active_schema =
-                                self.timeline.get_schema_at(self.timeline.latest_tx());
+                            // The Time-Travel Schema Resolver!
+                            let target_tx = if let Some(t) = self.as_of {
+                                self.timeline.tx_for_timestamp(t)
+                            } else {
+                                self.timeline.latest_tx()
+                            };
+                            let active_schema = self.timeline.get_schema_at(target_tx);
+
                             let pull_engine = crate::pull::PullEngine::new(
                                 self.ctx,
                                 &active_schema,
