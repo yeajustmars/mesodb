@@ -456,8 +456,17 @@ mod tests {
 
         // --- QUERY 1: Travel back to T = 150 ---
         // At this point, "Alice" should be the only valid name
-        let q_150 = r#"[:find ?n :where [1 :user/name ?n {:at 150}]]"#;
-        let res_150 = db.query(q_150).await.unwrap();
+        let q_flat = r#"[:find ?n :where [1 :user/name ?n]]"#;
+        let res_150 = db
+            .query_with_options(
+                q_flat,
+                QueryOptions {
+                    as_of: Some(150),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
 
         let col_150 = res_150[0]
             .column(0)
@@ -469,8 +478,16 @@ mod tests {
 
         // --- QUERY 2: Travel to T = 250 ---
         // At this point, "Alice-Revised" should be valid
-        let q_250 = r#"[:find ?n :where [1 :user/name ?n {:at 250}]]"#;
-        let res_250 = db.query(q_250).await.unwrap();
+        let res_250 = db
+            .query_with_options(
+                q_flat,
+                QueryOptions {
+                    as_of: Some(250),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
 
         let col_250 = res_250[0]
             .column(0)

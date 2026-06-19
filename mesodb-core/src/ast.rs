@@ -1,5 +1,4 @@
 // mesodb-core/src/ast.rs
-use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Term {
