@@ -1,7 +1,6 @@
 // mesodb-core/src/parser.rs
 use pest::Parser;
 use pest_derive::Parser;
-use std::collections::BTreeMap;
 
 use crate::ast::*;
 use crate::error::MesoError;
@@ -77,12 +76,8 @@ fn parse_pull_pattern(pair: pest::iterators::Pair<Rule>) -> PullPattern {
     for pull_attr in pair.into_inner() {
         let inner = pull_attr.into_inner().next().unwrap();
         match inner.as_rule() {
-            Rule::wildcard => {
-                attrs.push(PullAttribute::Wildcard);
-            }
-            Rule::keyword => {
-                attrs.push(PullAttribute::Simple(inner.as_str().to_string()));
-            }
+            Rule::wildcard => attrs.push(PullAttribute::Wildcard),
+            Rule::keyword => attrs.push(PullAttribute::Simple(inner.as_str().to_string())),
             Rule::pull_map => {
                 let mut map_inner = inner.into_inner();
                 let key = map_inner.next().unwrap().as_str().to_string();
@@ -111,29 +106,6 @@ fn parse_term(pair: pest::iterators::Pair<Rule>) -> Term {
         Rule::data_src => Term::DataSource(inner.as_str().to_string()),
         _ => Term::Blank,
     }
-}
-
-fn parse_options_map(pair: pest::iterators::Pair<Rule>) -> BTreeMap<String, Term> {
-    let mut map = BTreeMap::new();
-    for entry in pair.into_inner() {
-        let mut entry_inner = entry.into_inner();
-
-        // FIX: Just call .as_str() directly on the option_key pair to keep the ":" prefix
-        let key = entry_inner.next().unwrap().as_str().to_string();
-
-        let val_pair = entry_inner.next().unwrap().into_inner().next().unwrap();
-        let val = if val_pair.as_rule() == Rule::vector_2 {
-            let mut vec_inner = val_pair.into_inner();
-            let t1 = parse_term(vec_inner.next().unwrap());
-            let t2 = parse_term(vec_inner.next().unwrap());
-            Term::Vector(vec![t1, t2])
-        } else {
-            parse_term(val_pair)
-        };
-
-        map.insert(key, val);
-    }
-    map
 }
 
 fn parse_binding(pair: pest::iterators::Pair<Rule>) -> Binding {
@@ -166,7 +138,6 @@ pub fn parse_ruleset(rules_str: &str) -> Result<RuleSet, MesoError> {
         if rule_def_pair.as_rule() == Rule::rule_def {
             let mut inner = rule_def_pair.into_inner();
 
-            // Parse Head
             let head_pair = inner.next().unwrap();
             let mut head_inner = head_pair.into_inner();
             let rule_name = head_inner.next().unwrap().as_str().to_string();
@@ -176,34 +147,22 @@ pub fn parse_ruleset(rules_str: &str) -> Result<RuleSet, MesoError> {
                 name: rule_name,
                 args,
             };
-
-            // Parse Body (reusing our existing where_clause parser logic)
             let mut body = Vec::new();
+
             for where_elem in inner {
                 let elem_inner = where_elem.into_inner().next().unwrap();
                 match elem_inner.as_rule() {
                     Rule::data_pattern => {
                         let mut terms = Vec::new();
-                        let mut options = None;
                         for part in elem_inner.into_inner() {
-                            if part.as_rule() == Rule::options_map {
-                                options = Some(parse_options_map(part));
-                            } else {
-                                terms.push(parse_term(part));
-                            }
+                            terms.push(parse_term(part));
                         }
                         if terms.len() >= 2 {
                             let e = terms[0].clone();
                             let a = terms[1].clone();
                             let v = terms.get(2).cloned().unwrap_or(Term::Blank);
                             let tx = terms.get(3).cloned();
-                            body.push(WhereClause::DataPattern {
-                                e,
-                                a,
-                                v,
-                                tx,
-                                options,
-                            });
+                            body.push(WhereClause::DataPattern { e, a, v, tx });
                         }
                     }
                     Rule::rule_expr => {
@@ -215,7 +174,6 @@ pub fn parse_ruleset(rules_str: &str) -> Result<RuleSet, MesoError> {
                             args: nested_args,
                         });
                     }
-                    // Ignoring fn_clause in rule bodies for MVP
                     _ => {}
                 }
             }
@@ -231,14 +189,8 @@ fn parse_where_elem(where_elem: pest::iterators::Pair<Rule>) -> WhereClause {
     match inner.as_rule() {
         Rule::data_pattern => {
             let mut terms = Vec::new();
-            let mut options = None;
-
             for part in inner.into_inner() {
-                if part.as_rule() == Rule::options_map {
-                    options = Some(parse_options_map(part));
-                } else {
-                    terms.push(parse_term(part));
-                }
+                terms.push(parse_term(part));
             }
 
             let e = terms.get(0).cloned().unwrap_or(Term::Blank);
@@ -246,13 +198,7 @@ fn parse_where_elem(where_elem: pest::iterators::Pair<Rule>) -> WhereClause {
             let v = terms.get(2).cloned().unwrap_or(Term::Blank);
             let tx = terms.get(3).cloned();
 
-            WhereClause::DataPattern {
-                e,
-                a,
-                v,
-                tx,
-                options,
-            }
+            WhereClause::DataPattern { e, a, v, tx }
         }
         Rule::rule_expr => {
             let mut rule_inner = inner.into_inner();
@@ -267,7 +213,6 @@ fn parse_where_elem(where_elem: pest::iterators::Pair<Rule>) -> WhereClause {
 
             let fn_name = fn_expr_inner.next().unwrap().as_str().to_string();
             let args: Vec<Term> = fn_expr_inner.map(parse_term).collect();
-
             let binding = fn_inner.next().map(parse_binding);
 
             WhereClause::Function {
@@ -288,10 +233,9 @@ fn parse_where_elem(where_elem: pest::iterators::Pair<Rule>) -> WhereClause {
                         join_vars = Some(vars);
                     }
                     Rule::where_elem => {
-                        // RECURSION!
                         clauses.push(parse_where_elem(part));
                     }
-                    _ => {}
+                    _ => unreachable!(),
                 }
             }
 
@@ -359,76 +303,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_jit_temporal_at() {
-        let q = r#"[:find ?n :where [?e :user/name ?n {:at 1600000000}]]"#;
-        let ast = parse_query(q).unwrap();
-        if let WhereClause::DataPattern { options, .. } = &ast.where_clauses[0] {
-            let opts = options.as_ref().expect("Options map should exist");
-            assert_eq!(opts.get(":at"), Some(&Term::Integer(1600000000)));
-        } else {
-            panic!("Expected DataPattern with options");
-        }
-    }
-
-    #[test]
-    fn test_parse_jit_temporal_since_with_tx() {
-        let q = r#"[:find ?e :where [?e :user/age _ 101 {:since "2024-01-01"}]]"#;
-        let ast = parse_query(q).unwrap();
-        if let WhereClause::DataPattern { v, tx, options, .. } = &ast.where_clauses[0] {
-            assert_eq!(v, &Term::Blank);
-            assert_eq!(tx.as_ref().unwrap(), &Term::Integer(101));
-            let opts = options.as_ref().unwrap();
-            assert_eq!(opts.get(":since"), Some(&Term::String("2024-01-01".into())));
-        }
-    }
-
-    #[test]
-    fn test_parse_jit_temporal_between_vector() {
-        let q = r#"[:find ?e :where [?e :user/login _ {:between [1000 2000]}]]"#;
-        let ast = parse_query(q).unwrap();
-        if let WhereClause::DataPattern { options, .. } = &ast.where_clauses[0] {
-            let opts = options.as_ref().unwrap();
-            if let Some(Term::Vector(v)) = opts.get(":between") {
-                assert_eq!(v.len(), 2);
-                assert_eq!(v[0], Term::Integer(1000));
-                assert_eq!(v[1], Term::Integer(2000));
-            } else {
-                panic!("Expected Vector for :between");
-            }
-        }
-    }
-
-    #[test]
-    fn test_parse_xtdb_style_short_pattern() {
-        let q = r#"[:find ?e :where [?e :user/active {:at "2023-05-01"}]]"#;
-        let ast = parse_query(q).unwrap();
-        if let WhereClause::DataPattern { v, options, .. } = &ast.where_clauses[0] {
-            assert_eq!(v, &Term::Blank);
-            let opts = options.as_ref().unwrap();
-            assert_eq!(opts.get(":at"), Some(&Term::String("2023-05-01".into())));
-        }
-    }
-
-    #[test]
-    fn test_parse_multiple_options() {
-        let q = r#"[:find ?e :where [?e :user/name ?n {:at 500 :since 100}]]"#;
-        let ast = parse_query(q).unwrap();
-        if let WhereClause::DataPattern { options, .. } = &ast.where_clauses[0] {
-            let opts = options.as_ref().unwrap();
-            assert_eq!(opts.len(), 2);
-            assert!(opts.contains_key(":at"));
-            assert!(opts.contains_key(":since"));
-        }
-    }
-
-    #[test]
-    fn test_parse_fail_on_nested_map() {
-        let q = r#"[:find ?e :where [?e :a ?v {:outer {:inner 1}}]]"#;
-        let result = parse_query(q);
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_parse_datomic_pull_syntax() {
         let q = r#"
             [:find (pull ?order [:order/id
@@ -436,16 +310,12 @@ mod tests {
                                  {:order/items [:item/qty {:item/product [*]}]}])
              :where [?order :order/id "123"]]
         "#;
-
         let ast = parse_query(q).unwrap();
-
         let find_term = &ast.find[0];
         if let FindSpec::Pull(var, pattern) = find_term {
             assert_eq!(var, "?order");
             assert_eq!(pattern.0.len(), 3);
-
             assert_eq!(pattern.0[0], PullAttribute::Simple(":order/id".into()));
-
             assert_eq!(
                 pattern.0[1],
                 PullAttribute::Map(
@@ -453,7 +323,6 @@ mod tests {
                     PullPattern(vec![PullAttribute::Simple(":customer/name".into())])
                 )
             );
-
             assert_eq!(
                 pattern.0[2],
                 PullAttribute::Map(
@@ -475,20 +344,19 @@ mod tests {
     #[test]
     fn test_parse_ruleset() {
         let rules = r#"
-    [
-        [(ancestor ?child ?parent)
-         [?child :person/parent ?parent]]
+        [
+            [(ancestor ?child ?parent)
+             [?child :person/parent ?parent]]
 
-        [(ancestor ?child ?ancestor)
-         [?child :person/parent ?parent]
-         (ancestor ?parent ?ancestor)]
-    ]
-    "#;
-
+            [(ancestor ?child ?ancestor)
+             [?child :person/parent ?parent]
+             (ancestor ?parent ?ancestor)]
+        ]
+        "#;
         let ruleset = parse_ruleset(rules).unwrap();
         assert_eq!(ruleset.rules.len(), 2);
         assert_eq!(ruleset.rules[0].head.name, "ancestor");
         assert_eq!(ruleset.rules[0].body.len(), 1);
-        assert_eq!(ruleset.rules[1].body.len(), 2); // Pattern + Recursive RuleExpr
+        assert_eq!(ruleset.rules[1].body.len(), 2);
     }
 }

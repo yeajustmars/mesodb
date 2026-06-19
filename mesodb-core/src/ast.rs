@@ -11,7 +11,6 @@ pub enum Term {
     Boolean(bool),
     Blank,
     DataSource(String),
-    Vector(Vec<Term>), // Added for :between [start end]
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -23,7 +22,7 @@ pub enum Binding {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum PullAttribute {
-    Wildcard, // <-- ADDED: Supports [*]
+    Wildcard,
     Simple(String),
     Map(String, PullPattern),
 }
@@ -51,7 +50,6 @@ pub enum WhereClause {
         a: Term,
         v: Term,
         tx: Option<Term>,
-        options: Option<BTreeMap<String, Term>>,
     },
     RuleExpr {
         rule_name: String,
@@ -75,7 +73,7 @@ pub enum WhereClause {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RuleHead {
     pub name: String,
-    pub args: Vec<String>, // The variables, e.g., ["?child", "?ancestor"]
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

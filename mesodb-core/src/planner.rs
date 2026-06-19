@@ -37,12 +37,10 @@ impl<'a> QueryPlanner<'a> {
         }
     }
 
-    /// Reusable engine to compile Datalog predicates into SQL JOINs
     fn build_logical_plan(
         &self,
         clauses: &[WhereClause],
     ) -> Result<(Vec<String>, Vec<String>, HashMap<String, String>), MesoError> {
-        // The Time-Travel Schema Resolver!
         let target_tx = if let Some(t) = self.as_of {
             self.timeline.tx_for_timestamp(t)
         } else {
@@ -57,29 +55,12 @@ impl<'a> QueryPlanner<'a> {
 
         for clause in clauses {
             match clause {
-                WhereClause::DataPattern {
-                    e,
-                    a,
-                    v,
-                    tx,
-                    options,
-                } => {
+                WhereClause::DataPattern { e, a, v, tx } => {
                     let alias = format!("t{}", alias_counter);
                     from_tables.push(format!("{} AS {}", self.table_name, alias));
                     alias_counter += 1;
 
-                    let mut has_inline_time = false;
-                    if let Some(opts) = options {
-                        if let Some(Term::Integer(t)) = opts.get(":at") {
-                            has_inline_time = true;
-                            where_conditions.push(format!("CAST({}.valid_from AS BIGINT) <= {} AND CAST({}.valid_to AS BIGINT) > {}", alias, t, alias, t));
-                        } else if let Some(Term::Integer(t)) = opts.get(":since") {
-                            has_inline_time = true;
-                            where_conditions.push(format!("CAST({}.t AS BIGINT) >= {}", alias, t));
-                        }
-                    }
-
-                    if !has_inline_time && self.format != OutputFormat::Edn {
+                    if self.format != OutputFormat::Edn {
                         where_conditions.push(format!("{}.next_from IS NULL", alias));
                     }
 
@@ -99,7 +80,6 @@ impl<'a> QueryPlanner<'a> {
                     let mut current_attr = None;
                     match a {
                         Term::Keyword(kw) => {
-                            // CHANGED: Use active_schema instead of self.schema
                             let attr_id = active_schema.get_id(kw).ok_or_else(|| {
                                 MesoError::PlanError(format!("Unknown attribute: {}", kw))
                             })?;
@@ -171,7 +151,6 @@ impl<'a> QueryPlanner<'a> {
                 }
                 WhereClause::RuleExpr { rule_name, args } => {
                     let alias = format!("t{}", alias_counter);
-                    // FIX 1: Push recursive tables to the front as the driving left-join table!
                     from_tables.insert(0, format!("{} AS {}", rule_name, alias));
                     alias_counter += 1;
 
@@ -201,7 +180,6 @@ impl<'a> QueryPlanner<'a> {
                     args,
                     binding,
                 } => {
-                    // Convert AST terms into literal SQL arguments
                     let sql_args: Vec<String> = args
                         .iter()
                         .map(|arg| match arg {
@@ -217,7 +195,6 @@ impl<'a> QueryPlanner<'a> {
                         })
                         .collect();
 
-                    // Map the Datalog operator to a SQL Expression
                     let sql_expr = match fn_name.as_str() {
                         "+" | "-" | "*" | "/" => {
                             if sql_args.len() == 2 {
@@ -227,7 +204,6 @@ impl<'a> QueryPlanner<'a> {
                             }
                         }
                         "str" => format!("CONCAT({})", sql_args.join(", ")),
-                        // Comparators
                         "<" | ">" | "<=" | ">=" | "=" | "!=" => {
                             if sql_args.len() == 2 {
                                 format!("{} {} {}", sql_args[0], fn_name, sql_args[1])
@@ -235,35 +211,21 @@ impl<'a> QueryPlanner<'a> {
                                 "FALSE".into()
                             }
                         }
-                        // Fallback to natively invoking DataFusion SQL functions
                         _ => format!("{}({})", fn_name.to_uppercase(), sql_args.join(", ")),
                     };
 
                     if let Some(b) = binding {
-                        // TRANSFORM: Bind the resulting SQL expression to the variable map
                         match b {
                             crate::ast::Binding::Scalar(var_name) => {
                                 var_to_column.insert(var_name.clone(), sql_expr);
                             }
-                            _ => {} // Tuples/relations not supported for simple functions yet
+                            _ => {}
                         }
                     } else {
-                        // PREDICATE: Push the expression directly into the WHERE conditions
                         where_conditions.push(sql_expr);
                     }
                 }
-                WhereClause::Or {
-                    join_vars: _,
-                    clauses: _,
-                } => {
-                    // TODO: Strike 3
-                }
-                WhereClause::Not {
-                    join_vars: _,
-                    clauses: _,
-                } => {
-                    // TODO: Strike 3
-                }
+                _ => {}
             }
         }
         Ok((from_tables, where_conditions, var_to_column))
@@ -291,7 +253,6 @@ impl<'a> QueryPlanner<'a> {
             ));
         }
 
-        // --- CTE GENERATION FOR RULES ---
         let mut cte_blocks = Vec::new();
         if let Some(rs) = &self.ruleset {
             let mut rules_by_name: HashMap<String, Vec<&RuleDef>> = HashMap::new();
@@ -303,7 +264,6 @@ impl<'a> QueryPlanner<'a> {
             }
 
             for (name, mut defs) in rules_by_name {
-                // FIX 2: Sort so base cases (no recursive RuleExpr) ALWAYS come first!
                 defs.sort_by_key(|def| {
                     def.body
                         .iter()
@@ -347,10 +307,8 @@ impl<'a> QueryPlanner<'a> {
             }
         }
 
-        // --- MAIN QUERY GENERATION ---
         let (from_tables, where_conditions, var_to_column) =
             self.build_logical_plan(&query.where_clauses)?;
-
         let mut select_clauses = Vec::new();
         let mut group_by_clauses = Vec::new();
 
@@ -380,7 +338,6 @@ impl<'a> QueryPlanner<'a> {
             }
         }
 
-        // PREPEND THE CTEs!
         let mut final_sql = String::new();
         if !cte_blocks.is_empty() {
             final_sql.push_str("WITH RECURSIVE ");
@@ -404,12 +361,11 @@ impl<'a> QueryPlanner<'a> {
             final_sql.push_str(&group_by_clauses.join(", "));
         }
 
-        // Execute!
         let df = self
             .ctx
             .sql(&final_sql)
             .await
-            .map_err(|e| MesoError::DataFusion(e))?;
+            .map_err(MesoError::DataFusion)?;
 
         if has_pull {
             let batches = df.clone().collect().await.map_err(MesoError::DataFusion)?;
@@ -443,7 +399,6 @@ impl<'a> QueryPlanner<'a> {
                             let e_ids: Vec<u64> =
                                 (0..e_col.len()).map(|idx| e_col.value(idx)).collect();
 
-                            // The Time-Travel Schema Resolver!
                             let target_tx = if let Some(t) = self.as_of {
                                 self.timeline.tx_for_timestamp(t)
                             } else {

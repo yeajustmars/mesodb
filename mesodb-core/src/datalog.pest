@@ -18,16 +18,9 @@ string   = ${ "\"" ~ inner ~ "\"" }
 
 term = { blank | boolean | variable | keyword | string | float | integer | data_src }
 
-// --- MesoDB Flat Options Map ---
-option_key   = { ":" ~ ident }
-vector_2     = { "[" ~ term ~ term ~ "]" }
-option_val   = { term | vector_2 }
-map_entry    = { option_key ~ option_val }
-options_map  = { "{" ~ map_entry+ ~ "}" }
-
 // --- Find Clause ---
-wildcard     = { "*" } // <-- ADDED: Matches literal *
-pull_attr    = { wildcard | pull_map | keyword } // <-- UPDATED to include wildcard
+wildcard     = { "*" }
+pull_attr    = { wildcard | pull_map | keyword }
 pull_map     = { "{" ~ keyword ~ pull_pattern ~ "}" }
 pull_pattern = { "[" ~ pull_attr+ ~ "]" }
 pull_expr    = { "(" ~ "pull" ~ variable ~ pull_pattern ~ ")" }
@@ -41,10 +34,8 @@ in_elem      = { data_src | variable }
 in_clause    = { ":in" ~ in_elem+ }
 
 // --- Where Clause ---
-// Updated to support 2-4 terms followed by an optional flat map
-data_pattern = { "[" ~ term ~ term ~ term? ~ term? ~ options_map? ~ "]" }
-rule_expr    = { "(" ~ ident ~ term+ ~ ")" }
-
+data_pattern   = { "[" ~ term ~ term ~ term? ~ term? ~ "]" }
+rule_expr      = { "(" ~ ident ~ term+ ~ ")" }
 operator       = { "<=" | ">=" | "!=" | "<" | ">" | "=" | "+" | "-" | "*" | "/" | ident }
 fn_expr        = { "(" ~ operator ~ term+ ~ ")" }
 binding_rel    = { "[[" ~ variable+ ~ "]]" }
@@ -53,24 +44,17 @@ binding_scalar = { variable }
 binding        = { binding_rel | binding_tuple | binding_scalar }
 fn_clause      = { "[" ~ fn_expr ~ binding? ~ "]" }
 
-// --- Logic Branching (NEW) ---
-join_vars  = { "[" ~ variable+ ~ "]" }
-or_clause  = { "(" ~ ("or-join" | "or") ~ join_vars? ~ where_elem+ ~ ")" }
-not_clause = { "(" ~ ("not-join" | "not") ~ join_vars? ~ where_elem+ ~ ")" }
-
-// Notice the addition of or_clause and not_clause!
+// --- Logic Branching ---
+join_vars    = { "[" ~ variable+ ~ "]" }
+or_clause    = { "(" ~ ("or-join" | "or") ~ join_vars? ~ where_elem+ ~ ")" }
+not_clause   = { "(" ~ ("not-join" | "not") ~ join_vars? ~ where_elem+ ~ ")" }
 where_elem   = { fn_clause | data_pattern | rule_expr | or_clause | not_clause }
 where_clause = { ":where" ~ where_elem+ }
 
 // --- Rules ---
-// e.g., (ancestor ?child ?parent)
-rule_head = { "(" ~ ident ~ variable+ ~ ")" }
-
-// e.g., [(ancestor ?c ?p) [?c :person/parent ?p] (some-other-rule ?p)]
-rule_def  = { "[" ~ rule_head ~ where_elem+ ~ "]" }
-
-// A collection of rule definitions passed into the query via %
-ruleset   = { SOI ~ "[" ~ rule_def+ ~ "]" ~ EOI }
+rule_head    = { "(" ~ ident ~ variable+ ~ ")" }
+rule_def     = { "[" ~ rule_head ~ where_elem+ ~ "]" }
+ruleset      = { SOI ~ "[" ~ rule_def+ ~ "]" ~ EOI }
 
 // --- Root ---
-query = { SOI ~ "[" ~ find_clause ~ in_clause? ~ where_clause ~ "]" ~ EOI }
+query        = { SOI ~ "[" ~ find_clause ~ in_clause? ~ where_clause ~ "]" ~ EOI }
