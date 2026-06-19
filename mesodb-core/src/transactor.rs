@@ -138,6 +138,12 @@ impl Transactor {
 
         // --- PHASE 1: Validation & Bitemporal Resolution ---
         for mut fact in facts {
+            // --- REIFIED TRANSACTIONS ---
+            // Entity ID 0 is a reserved pointer to the current transaction.
+            if fact.e == 0 {
+                fact.e = tx_id;
+            }
+
             let attr_id = if let Some(id) = self.schema.get_id(&fact.ident) {
                 id
             } else if self.config.storage.allow_jit_schema {

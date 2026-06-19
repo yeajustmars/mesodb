@@ -261,31 +261,60 @@ impl<'a> QueryPlanner<'a> {
                     join_vars: _,
                     clauses: or_clauses,
                 } => {
+                    if or_clauses.is_empty() {
+                        continue;
+                    }
+
+                    let alias = format!("or_{}_{}", prefix, alias_counter);
+                    alias_counter += 1;
+
                     let mut union_branches = Vec::new();
-                    for clause in or_clauses {
+                    let mut projected_vars: Vec<String> = Vec::new();
+
+                    for (idx, clause) in or_clauses.iter().enumerate() {
                         let (sub_froms, sub_wheres, sub_vars) =
                             self.build_logical_plan(&[clause.clone()])?;
 
-                        let mut correlation_links = Vec::new();
-                        for (var, outer_col) in &var_to_column {
-                            if let Some(inner_col) = sub_vars.get(var) {
-                                correlation_links.push(format!("{} = {}", outer_col, inner_col));
+                        if idx == 0 {
+                            for k in sub_vars.keys() {
+                                if !k.starts_with("__lit") {
+                                    projected_vars.push(k.clone());
+                                }
                             }
                         }
 
-                        let mut sub_sql = format!("SELECT 1 FROM {}", sub_froms.join(", "));
-                        let mut all_sub_wheres = sub_wheres;
-                        all_sub_wheres.extend(correlation_links);
+                        let mut selects = Vec::new();
+                        for var in &projected_vars {
+                            if let Some(col) = sub_vars.get(var) {
+                                selects.push(format!("{} AS \"{}\"", col, var));
+                            } else {
+                                selects.push(format!("NULL AS \"{}\"", var));
+                            }
+                        }
 
-                        if !all_sub_wheres.is_empty() {
+                        let mut sub_sql = format!(
+                            "SELECT {} FROM {}",
+                            selects.join(", "),
+                            sub_froms.join(", ")
+                        );
+                        if !sub_wheres.is_empty() {
                             sub_sql.push_str(" WHERE ");
-                            sub_sql.push_str(&all_sub_wheres.join(" AND "));
+                            sub_sql.push_str(&sub_wheres.join(" AND "));
                         }
                         union_branches.push(sub_sql);
                     }
-                    if !union_branches.is_empty() {
-                        where_conditions
-                            .push(format!("EXISTS ({})", union_branches.join(" UNION ALL ")));
+
+                    // Use standard UNION (Distinct) to prevent exponential graph explosions
+                    // from multi-matching entities across branches.
+                    from_tables.push(format!("({}) AS {}", union_branches.join(" UNION "), alias));
+
+                    for var in projected_vars {
+                        let outer_col_ref = format!("{}.\"{}\"", alias, var);
+                        if let Some(existing_col) = var_to_column.get(&var) {
+                            where_conditions.push(format!("{} = {}", existing_col, outer_col_ref));
+                        } else {
+                            var_to_column.insert(var.clone(), outer_col_ref);
+                        }
                     }
                 }
                 WhereClause::Not {

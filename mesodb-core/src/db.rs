@@ -292,6 +292,15 @@ impl MesoDB {
         crate::formatter::to_native(&batches)
     }
 
+    pub async fn query_native_with_options(
+        &self,
+        query_str: &str,
+        options: QueryOptions,
+    ) -> Result<Vec<std::collections::HashMap<String, crate::types::Value>>> {
+        let batches = self.query_with_options(query_str, options).await?;
+        crate::formatter::to_native(&batches)
+    }
+
     pub async fn query_json(&self, query_str: &str) -> Result<String> {
         let ast = crate::parser::parse_query(query_str)?;
         let opts = QueryOptions {
@@ -1256,17 +1265,17 @@ mod tests {
         // Row 0: Assert "active" at Tx 1
         assert_eq!(val_col.value(0), "active");
         assert_eq!(tx_col.value(0), 1);
-        assert_eq!(op_col.value(0), true);
+        assert!(op_col.value(0));
 
         // Row 1: Retract "active" at Tx 2
         assert_eq!(val_col.value(1), "active");
         assert_eq!(tx_col.value(1), 2);
-        assert_eq!(op_col.value(1), false);
+        assert!(!op_col.value(1));
 
         // Row 2: Assert "inactive" at Tx 2
         assert_eq!(val_col.value(2), "inactive");
         assert_eq!(tx_col.value(2), 2);
-        assert_eq!(op_col.value(2), true);
+        assert!(op_col.value(2));
     }
 
     // =====================================================================
@@ -1799,12 +1808,11 @@ mod tests {
         "#;
 
         let results = db.query(query).await.unwrap();
-        let batch = &results[0];
 
-        // Should match accounts 1, 2, and 3. Account 4 is dropped.
+        // Sum the rows across all parallel Arrow partitions
+        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
         assert_eq!(
-            batch.num_rows(),
-            3,
+            total_rows, 3,
             "OR clause should return the union of the matching branches"
         );
     }
@@ -1862,20 +1870,102 @@ mod tests {
         "#;
 
         let results = db.query(query).await.unwrap();
-        let batch = &results[0];
 
-        // Should match EXACTLY account 2
+        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
         assert_eq!(
-            batch.num_rows(),
-            1,
+            total_rows, 1,
             "NOT clause should filter out the active admin"
         );
 
-        let e_col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::UInt64Array>()
+        // Find the actual row regardless of which partition it landed in
+        let mut found_e = 0;
+        for batch in results {
+            if batch.num_rows() > 0 {
+                let e_col = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::UInt64Array>()
+                    .unwrap();
+                found_e = e_col.value(0);
+                break;
+            }
+        }
+        assert_eq!(found_e, 2);
+    }
+
+    // =====================================================================
+    // SUITE 7: REIFIED TRANSACTIONS
+    // =====================================================================
+
+    #[tokio::test]
+    async fn test_reified_transactions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":tx/author", crate::schema::ValueType::String, false);
+        schema.add_attribute(":user/name", crate::schema::ValueType::String, false);
+
+        let db = MesoDB::open(dir.path().join("reified.db"), schema, Config::default()).unwrap();
+
+        // Transact a user, AND attach metadata to the transaction itself using `e: 0`
+        let report = db
+            .transact(vec![
+                Fact {
+                    e: 100,
+                    ident: ":user/name".into(),
+                    v: Value::String("Alice".into()),
+                    op: true,
+                    cas_old_v: None,
+                },
+                Fact {
+                    e: 0,
+                    ident: ":tx/author".into(),
+                    v: Value::String("SystemAdmin".into()),
+                    op: true,
+                    cas_old_v: None,
+                },
+            ])
+            .await
             .unwrap();
-        assert_eq!(e_col.value(0), 2);
+
+        let actual_tx = report.tx_id;
+
+        // QUERY 1: Did the transaction entity get written?
+        let query_tx = format!("[:find ?author :where [{} :tx/author ?author]]", actual_tx);
+        let results_tx = db.query_native(&query_tx).await.unwrap();
+
+        assert_eq!(results_tx.len(), 1, "Transaction entity should exist");
+        assert_eq!(
+            results_tx[0].get("author"),
+            Some(&Value::String("SystemAdmin".into()))
+        );
+
+        // QUERY 2: The History Audit Join!
+        // "Find the user's name, and the author of the transaction that wrote it."
+        let query_audit = r#"
+            [:find ?name ?author
+             :where
+                [100 :user/name ?name ?tx true]
+                [?tx :tx/author ?author]]
+        "#;
+
+        let opts = QueryOptions {
+            history: true,
+            format: OutputFormat::Tabular,
+            ..Default::default()
+        };
+        let results_audit = db
+            .query_native_with_options(query_audit, opts)
+            .await
+            .unwrap();
+
+        assert_eq!(results_audit.len(), 1);
+        assert_eq!(
+            results_audit[0].get("name"),
+            Some(&Value::String("Alice".into()))
+        );
+        assert_eq!(
+            results_audit[0].get("author"),
+            Some(&Value::String("SystemAdmin".into()))
+        );
     }
 }
