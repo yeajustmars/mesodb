@@ -162,7 +162,8 @@ pub fn parse_ruleset(rules_str: &str) -> Result<RuleSet, MesoError> {
                             let a = terms[1].clone();
                             let v = terms.get(2).cloned().unwrap_or(Term::Blank);
                             let tx = terms.get(3).cloned();
-                            body.push(WhereClause::DataPattern { e, a, v, tx });
+                            let op = terms.get(4).cloned();
+                            body.push(WhereClause::DataPattern { e, a, v, tx, op });
                         }
                     }
                     Rule::rule_expr => {
@@ -197,8 +198,9 @@ fn parse_where_elem(where_elem: pest::iterators::Pair<Rule>) -> WhereClause {
             let a = terms.get(1).cloned().unwrap_or(Term::Blank);
             let v = terms.get(2).cloned().unwrap_or(Term::Blank);
             let tx = terms.get(3).cloned();
+            let op = terms.get(4).cloned();
 
-            WhereClause::DataPattern { e, a, v, tx }
+            WhereClause::DataPattern { e, a, v, tx, op }
         }
         Rule::rule_expr => {
             let mut rule_inner = inner.into_inner();

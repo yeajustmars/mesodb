@@ -55,7 +55,7 @@ impl<'a> QueryPlanner<'a> {
 
         for clause in clauses {
             match clause {
-                WhereClause::DataPattern { e, a, v, tx } => {
+                WhereClause::DataPattern { e, a, v, tx, op } => {
                     let alias = format!("t{}", alias_counter);
                     from_tables.push(format!("{} AS {}", self.table_name, alias));
                     alias_counter += 1;
@@ -144,6 +144,23 @@ impl<'a> QueryPlanner<'a> {
                             }
                             Term::Integer(id) => {
                                 where_conditions.push(format!("{}.t = {}", alias, id))
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(op_term) = op {
+                        match op_term {
+                            Term::Variable(var_name) => {
+                                let col_ref = format!("{}.op", alias);
+                                if let Some(existing_col) = var_to_column.get(var_name.as_str()) {
+                                    where_conditions
+                                        .push(format!("{} = {}", existing_col, col_ref));
+                                } else {
+                                    var_to_column.insert(var_name.clone(), col_ref);
+                                }
+                            }
+                            Term::Boolean(b) => {
+                                where_conditions.push(format!("{}.op = {}", alias, b));
                             }
                             _ => {}
                         }

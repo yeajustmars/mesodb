@@ -49,6 +49,7 @@ pub enum WhereClause {
         a: Term,
         v: Term,
         tx: Option<Term>,
+        op: Option<Term>,
     },
     RuleExpr {
         rule_name: String,

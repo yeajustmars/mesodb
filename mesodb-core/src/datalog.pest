@@ -34,7 +34,7 @@ in_elem      = { data_src | variable }
 in_clause    = { ":in" ~ in_elem+ }
 
 // --- Where Clause ---
-data_pattern   = { "[" ~ term ~ term ~ term? ~ term? ~ "]" }
+data_pattern   = { "[" ~ term ~ term ~ term? ~ term? ~ term? ~ "]" }
 rule_expr      = { "(" ~ ident ~ term+ ~ ")" }
 operator       = { "<=" | ">=" | "!=" | "<" | ">" | "=" | "+" | "-" | "*" | "/" | ident }
 fn_expr        = { "(" ~ operator ~ term+ ~ ")" }
