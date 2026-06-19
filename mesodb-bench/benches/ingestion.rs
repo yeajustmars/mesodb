@@ -122,6 +122,48 @@ fn bench_ingestion(c: &mut Criterion) {
         });
     });
 
+    // 4. Thread Contention (10 Parallel Readers vs 1 High-Speed Writer)
+    group.bench_function("Lock-Free Read/Write Contention", |b| {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = std::sync::Arc::new(setup_db(&dir, WalSyncMode::Background));
+
+        // Spawn 10 background threads that constantly hammer the database with queries
+        let keep_running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut reader_handles = Vec::new();
+
+        for _ in 0..10 {
+            let db_clone = db.clone();
+            let running_clone = keep_running.clone();
+            reader_handles.push(rt.spawn(async move {
+                let query = r#"[:find (count ?e) :where [?e :sensor/id ?id]]"#;
+                while running_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = db_clone.query(query).await;
+                }
+            }));
+        }
+
+        let mut tx_counter = 0;
+        b.to_async(&rt).iter(|| {
+            let facts = generate_facts(100, tx_counter * 100);
+            tx_counter += 1;
+            let db_ref = db.clone();
+            async move {
+                db_ref.transact(facts).await.unwrap();
+            }
+        });
+
+        // Cleanup background readers
+        keep_running.store(false, std::sync::atomic::Ordering::Relaxed);
+        rt.block_on(async {
+            for handle in reader_handles {
+                let _ = handle.await;
+            }
+        });
+    });
+
     group.finish();
 }
 
