@@ -183,6 +183,10 @@ impl MesoDB {
         Ok(report)
     }
 
+    // =====================================================================
+    // STANDARD QUERY API PIPELINE
+    // =====================================================================
+
     pub async fn query(&self, query_str: &str) -> Result<Vec<RecordBatch>> {
         self.query_with_options(query_str, QueryOptions::default())
             .await
@@ -260,27 +264,7 @@ impl MesoDB {
                 time_filter, resolved_time_filter
             )
         };
-        /*
-                let time_filter = match options.as_of {
-                    Some(t) => format!("WHERE CAST(valid_from AS BIGINT) <= {}", t),
-                    None => "".to_string(),
-                };
-                let resolved_time_filter = match options.as_of {
-                    Some(t) => format!(
-                        "AND CAST(valid_from AS BIGINT) <= {t} AND CAST(COALESCE(next_from, valid_to) AS BIGINT) > {t}"
-                    ),
-                    None => "".to_string(),
-                };
-                let resolved_sql = format!(
-                    r#"
-            WITH raw_filtered AS (SELECT * FROM raw_datoms {}),
-            bounds AS (SELECT *, LEAD(valid_from) OVER (PARTITION BY e, a ORDER BY valid_from ASC, t ASC) as next_from FROM raw_filtered)
-            SELECT e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid, t, op, valid_from, next_from, COALESCE(next_from, valid_to) as valid_to
-            FROM bounds WHERE op = true {}
-            "#,
-                    time_filter, resolved_time_filter
-                );
-        */
+
         let resolved_df = ctx
             .sql(&resolved_sql)
             .await
@@ -333,6 +317,51 @@ impl MesoDB {
         let ast = crate::parser::parse_query(query_str)?;
         let opts = QueryOptions {
             format: OutputFormat::Edn,
+            ..Default::default()
+        };
+        let batches = self.query_with_options(query_str, opts).await?;
+        Ok(crate::formatter::to_edn_string(&batches, &ast.find))
+    }
+
+    // =====================================================================
+    // HISTORY API PIPELINE
+    // =====================================================================
+
+    pub async fn history(&self, query_str: &str) -> Result<Vec<RecordBatch>> {
+        self.query_with_options(
+            query_str,
+            QueryOptions {
+                history: true,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    pub async fn history_native(
+        &self,
+        query_str: &str,
+    ) -> Result<Vec<std::collections::HashMap<String, crate::types::Value>>> {
+        let batches = self.history(query_str).await?;
+        crate::formatter::to_native(&batches)
+    }
+
+    pub async fn history_json(&self, query_str: &str) -> Result<String> {
+        let ast = crate::parser::parse_query(query_str)?;
+        let opts = QueryOptions {
+            format: OutputFormat::Json,
+            history: true,
+            ..Default::default()
+        };
+        let batches = self.query_with_options(query_str, opts).await?;
+        Ok(crate::formatter::to_json_string(&batches, &ast.find))
+    }
+
+    pub async fn history_edn(&self, query_str: &str) -> Result<String> {
+        let ast = crate::parser::parse_query(query_str)?;
+        let opts = QueryOptions {
+            format: OutputFormat::Edn,
+            history: true,
             ..Default::default()
         };
         let batches = self.query_with_options(query_str, opts).await?;
@@ -1515,5 +1544,171 @@ mod tests {
 
         assert_eq!(past_col.value(0), "offline");
         assert_eq!(new_col.value(0), "online");
+    }
+
+    // =====================================================================
+    // SUITE 5: HISTORY API WRAPPERS
+    // =====================================================================
+
+    async fn setup_history_db(name: &str) -> MesoDB {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":doc/title", crate::schema::ValueType::String, false);
+
+        let db = MesoDB::open(dir.path().join(name), schema, Config::default()).unwrap();
+
+        // Tx 1: Assert "Draft"
+        db.transact(vec![Fact {
+            e: 100,
+            ident: ":doc/title".into(),
+            v: Value::String("Draft".into()),
+            op: true,
+            cas_old_v: None,
+        }])
+        .await
+        .unwrap();
+        // Tx 2: Overwrite with "Final" (Creates Retract "Draft" + Assert "Final")
+        db.transact(vec![Fact {
+            e: 100,
+            ident: ":doc/title".into(),
+            v: Value::String("Final".into()),
+            op: true,
+            cas_old_v: None,
+        }])
+        .await
+        .unwrap();
+
+        db
+    }
+
+    // --- 1. db.history() Tests ---
+
+    #[tokio::test]
+    async fn test_history_wrapper_returns_all_batches() {
+        let db = setup_history_db("hist_wrapper_1.db").await;
+        let query = r#"[:find ?v ?op :where [100 :doc/title ?v _ ?op]]"#;
+
+        let batches = db.history(query).await.unwrap();
+        assert!(!batches.is_empty());
+
+        let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 3, "Should return exactly 3 historical records");
+    }
+
+    #[tokio::test]
+    async fn test_history_wrapper_arrow_downcasting() {
+        let db = setup_history_db("hist_wrapper_2.db").await;
+        let query = r#"[:find ?op :where [100 :doc/title "Draft" _ ?op]]"#;
+
+        let batches = db.history(query).await.unwrap();
+        let op_col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .unwrap();
+
+        // "Draft" should have two entries: the initial assertion (true), and the subsequent retraction (false)
+        assert_eq!(op_col.len(), 2);
+        // We aren't guaranteeing sort order in this simple query, so we just check it contains both
+        let ops: Vec<bool> = (0..op_col.len()).map(|i| op_col.value(i)).collect();
+        assert!(ops.contains(&true));
+        assert!(ops.contains(&false));
+    }
+
+    // --- 2. db.history_native() Tests ---
+
+    #[tokio::test]
+    async fn test_history_native_maps_correct_keys() {
+        let db = setup_history_db("hist_native_1.db").await;
+        let query = r#"[:find ?v ?op :where [100 :doc/title ?v _ ?op]]"#;
+
+        let results = db.history_native(query).await.unwrap();
+        assert_eq!(results.len(), 3);
+
+        for row in results {
+            assert!(
+                row.contains_key("v"),
+                "Native map should contain the 'v' key"
+            );
+            assert!(
+                row.contains_key("op"),
+                "Native map should contain the 'op' key"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_history_native_preserves_value_types() {
+        let db = setup_history_db("hist_native_2.db").await;
+        // Specifically look for the active "Final" state
+        let query = r#"[:find ?v ?op :where [100 :doc/title ?v _ ?op] [(= ?v "Final")]]"#;
+
+        let results = db.history_native(query).await.unwrap();
+        assert_eq!(results.len(), 1);
+
+        let row = &results[0];
+        assert_eq!(row.get("v"), Some(&Value::String("Final".into())));
+        assert_eq!(row.get("op"), Some(&Value::Boolean(true)));
+    }
+
+    // --- 3. db.history_json() Tests ---
+
+    #[tokio::test]
+    async fn test_history_json_array_format() {
+        let db = setup_history_db("hist_json_1.db").await;
+        let query = r#"[:find ?v :where [100 :doc/title ?v _ _]]"#;
+
+        let json_str = db.history_json(query).await.unwrap();
+
+        // Should be a valid JSON array of objects
+        assert!(json_str.starts_with('['));
+        assert!(json_str.ends_with(']'));
+
+        // Both string states should exist in the raw JSON output
+        assert!(json_str.contains(r#"{"v":"Draft"}"#));
+        assert!(json_str.contains(r#"{"v":"Final"}"#));
+    }
+
+    #[tokio::test]
+    async fn test_history_json_handles_booleans() {
+        let db = setup_history_db("hist_json_2.db").await;
+        let query = r#"[:find ?op :where [100 :doc/title "Draft" _ ?op]]"#;
+
+        let json_str = db.history_json(query).await.unwrap();
+
+        // "op" maps to native JSON booleans, not strings
+        assert!(json_str.contains(r#"{"op":true}"#));
+        assert!(json_str.contains(r#"{"op":false}"#));
+    }
+
+    // --- 4. db.history_edn() Tests ---
+
+    #[tokio::test]
+    async fn test_history_edn_keyword_formatting() {
+        let db = setup_history_db("hist_edn_1.db").await;
+        let query = r#"[:find ?v :where [100 :doc/title ?v _ _]]"#;
+
+        let edn_str = db.history_edn(query).await.unwrap();
+
+        // EDN format prepends keys with colons
+        assert!(edn_str.contains(r#"{:v "Draft"}"#));
+        assert!(edn_str.contains(r#"{:v "Final"}"#));
+    }
+
+    #[tokio::test]
+    async fn test_history_edn_multiple_records() {
+        let db = setup_history_db("hist_edn_2.db").await;
+        let query = r#"[:find ?v ?op :where [100 :doc/title ?v _ ?op]]"#;
+
+        let edn_str = db.history_edn(query).await.unwrap();
+
+        // The output should be an EDN array [...] containing multiple maps
+        assert!(edn_str.starts_with('['));
+        assert!(edn_str.ends_with(']'));
+
+        // Check for specific exact EDN state representations
+        assert!(edn_str.contains(r#":v "Draft""#));
+        assert!(edn_str.contains(r#":op false"#)); // The retraction
+        assert!(edn_str.contains(r#":op true"#)); // The assertions
     }
 }
