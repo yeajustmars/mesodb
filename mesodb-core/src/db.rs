@@ -237,25 +237,50 @@ impl MesoDB {
             ctx.register_table("raw_datoms", df.into_view())?;
         }
 
-        let time_filter = match options.as_of {
-            Some(t) => format!("WHERE CAST(valid_from AS BIGINT) <= {}", t),
-            None => "".to_string(),
+        let resolved_sql = if options.history {
+            r#"SELECT e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid, t, op, valid_from, CAST(NULL AS BIGINT) as next_from, valid_to FROM raw_datoms"#.to_string()
+        } else {
+            let time_filter = match options.as_of {
+                Some(t) => format!("WHERE CAST(valid_from AS BIGINT) <= {}", t),
+                None => "".to_string(),
+            };
+            let resolved_time_filter = match options.as_of {
+                Some(t) => format!(
+                    "AND CAST(valid_from AS BIGINT) <= {t} AND CAST(COALESCE(next_from, valid_to) AS BIGINT) > {t}"
+                ),
+                None => "".to_string(),
+            };
+            format!(
+                r#"
+                WITH raw_filtered AS (SELECT * FROM raw_datoms {}),
+                bounds AS (SELECT *, LEAD(valid_from) OVER (PARTITION BY e, a ORDER BY valid_from ASC, t ASC) as next_from FROM raw_filtered)
+                SELECT e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid, t, op, valid_from, next_from, COALESCE(next_from, valid_to) as valid_to
+                FROM bounds WHERE op = true {}
+                "#,
+                time_filter, resolved_time_filter
+            )
         };
-        let resolved_time_filter = match options.as_of {
-            Some(t) => format!(
-                "AND CAST(valid_from AS BIGINT) <= {t} AND CAST(COALESCE(next_from, valid_to) AS BIGINT) > {t}"
-            ),
-            None => "".to_string(),
-        };
-        let resolved_sql = format!(
-            r#"
+        /*
+                let time_filter = match options.as_of {
+                    Some(t) => format!("WHERE CAST(valid_from AS BIGINT) <= {}", t),
+                    None => "".to_string(),
+                };
+                let resolved_time_filter = match options.as_of {
+                    Some(t) => format!(
+                        "AND CAST(valid_from AS BIGINT) <= {t} AND CAST(COALESCE(next_from, valid_to) AS BIGINT) > {t}"
+                    ),
+                    None => "".to_string(),
+                };
+                let resolved_sql = format!(
+                    r#"
             WITH raw_filtered AS (SELECT * FROM raw_datoms {}),
             bounds AS (SELECT *, LEAD(valid_from) OVER (PARTITION BY e, a ORDER BY valid_from ASC, t ASC) as next_from FROM raw_filtered)
             SELECT e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid, t, op, valid_from, next_from, COALESCE(next_from, valid_to) as valid_to
             FROM bounds WHERE op = true {}
             "#,
-            time_filter, resolved_time_filter
-        );
+                    time_filter, resolved_time_filter
+                );
+        */
         let resolved_df = ctx
             .sql(&resolved_sql)
             .await
@@ -336,6 +361,7 @@ pub struct QueryOptions {
     pub as_of: Option<i64>,
     pub format: OutputFormat,
     pub rules: Option<String>,
+    pub history: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -572,6 +598,7 @@ mod tests {
             as_of: Some(150),
             format: OutputFormat::Tabular,
             rules: None,
+            history: false,
         };
         let res_150 = db.query_with_options(query, opts_150).await.unwrap();
         let col_150 = res_150[0]
@@ -642,6 +669,7 @@ mod tests {
             format: OutputFormat::Json,
             as_of: None,
             rules: None,
+            history: false,
         };
         let res_json = db.query_with_options(query, opts_json).await.unwrap();
         let json_str = res_json[0]
@@ -660,6 +688,7 @@ mod tests {
             format: OutputFormat::Edn,
             as_of: None,
             rules: None,
+            history: false,
         };
         let res_edn = db.query_with_options(query, opts_edn).await.unwrap();
         let edn_str = res_edn[0]
@@ -1116,5 +1145,98 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].get("sku"), Some(&Value::String("XJ-900".into())));
         assert_eq!(results[0].get("price"), Some(&Value::Float64(99.99)));
+    }
+
+    #[tokio::test]
+    async fn test_history_api_5_tuple_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/status", crate::schema::ValueType::String, false);
+
+        let db = MesoDB::open(dir.path().join("history.db"), schema, Config::default()).unwrap();
+
+        // T = 100: User becomes "active"
+        db.transact_at(
+            vec![Fact {
+                e: 1,
+                ident: ":user/status".into(),
+                v: crate::types::Value::String("active".into()),
+                op: true,
+                cas_old_v: None,
+            }],
+            100,
+        )
+        .await
+        .unwrap();
+
+        // T = 200: User changes to "inactive"
+        // Under the hood, this bitemporally closes "active" (retraction) and asserts "inactive".
+        db.transact_at(
+            vec![Fact {
+                e: 1,
+                ident: ":user/status".into(),
+                v: crate::types::Value::String("inactive".into()),
+                op: true,
+                cas_old_v: None,
+            }],
+            200,
+        )
+        .await
+        .unwrap();
+
+        // THE QUERY: Give me the raw audit trail of all values, transactions, and ops for Entity 1's status.
+        let query = r#"[:find ?v ?tx ?op :where [1 :user/status ?v ?tx ?op]]"#;
+
+        // Execute with the new history API enabled
+        let opts = QueryOptions {
+            history: true,
+            format: OutputFormat::Tabular,
+            ..Default::default()
+        };
+
+        let results = db.query_with_options(query, opts).await.unwrap();
+
+        let batch = &results[0];
+
+        // We expect EXACTLY 3 rows:
+        // 1. The original "active" assertion (T=1)
+        // 2. The "active" retraction (T=2)
+        // 3. The new "inactive" assertion (T=2)
+        assert_eq!(
+            batch.num_rows(),
+            3,
+            "History view must return uncollapsed assertions and retractions."
+        );
+
+        let val_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        let tx_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .unwrap();
+        let op_col = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .unwrap();
+
+        // Row 0: Assert "active" at Tx 1
+        assert_eq!(val_col.value(0), "active");
+        assert_eq!(tx_col.value(0), 1);
+        assert_eq!(op_col.value(0), true);
+
+        // Row 1: Retract "active" at Tx 2
+        assert_eq!(val_col.value(1), "active");
+        assert_eq!(tx_col.value(1), 2);
+        assert_eq!(op_col.value(1), false);
+
+        // Row 2: Assert "inactive" at Tx 2
+        assert_eq!(val_col.value(2), "inactive");
+        assert_eq!(tx_col.value(2), 2);
+        assert_eq!(op_col.value(2), true);
     }
 }
