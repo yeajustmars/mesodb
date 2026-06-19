@@ -1239,4 +1239,283 @@ mod tests {
         assert_eq!(tx_col.value(2), 2);
         assert_eq!(op_col.value(2), true);
     }
+
+    // =====================================================================
+    // SUITE 3: POINT-IN-TIME (SNAPSHOT) QUERIES
+    // =====================================================================
+
+    #[tokio::test]
+    async fn test_point_in_time_snapshot_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":item/price", crate::schema::ValueType::Int64, false);
+        let db = MesoDB::open(dir.path().join("pit1.db"), schema, Config::default()).unwrap();
+
+        // T=100: Assert Initial Price
+        db.transact_at(
+            vec![Fact {
+                e: 1,
+                ident: ":item/price".into(),
+                v: Value::Int64(50),
+                op: true,
+                cas_old_v: None,
+            }],
+            100,
+        )
+        .await
+        .unwrap();
+
+        // T=200: Overwrite Price
+        db.transact_at(
+            vec![Fact {
+                e: 1,
+                ident: ":item/price".into(),
+                v: Value::Int64(75),
+                op: true,
+                cas_old_v: None,
+            }],
+            200,
+        )
+        .await
+        .unwrap();
+
+        let query = r#"[:find ?price :where [1 :item/price ?price]]"#;
+
+        // Snapshot at T=150 (Should see 50)
+        let res_150 = db
+            .query_with_options(
+                query,
+                QueryOptions {
+                    as_of: Some(150),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let val_150 = res_150[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(val_150, 50, "At T=150, the price should be 50");
+
+        // Snapshot at T=250 (Should see 75)
+        let res_250 = db
+            .query_with_options(
+                query,
+                QueryOptions {
+                    as_of: Some(250),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let val_250 = res_250[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(val_250, 75, "At T=250, the price should be 75");
+    }
+
+    #[tokio::test]
+    async fn test_point_in_time_retraction_visibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/tag", crate::schema::ValueType::String, false);
+        let db = MesoDB::open(dir.path().join("pit2.db"), schema, Config::default()).unwrap();
+
+        // T=10: Assert Tag
+        db.transact_at(
+            vec![Fact {
+                e: 2,
+                ident: ":user/tag".into(),
+                v: Value::String("beta".into()),
+                op: true,
+                cas_old_v: None,
+            }],
+            10,
+        )
+        .await
+        .unwrap();
+
+        // T=20: Retract Tag
+        db.transact_at(
+            vec![Fact {
+                e: 2,
+                ident: ":user/tag".into(),
+                v: Value::String("beta".into()),
+                op: false,
+                cas_old_v: Some(Value::String("beta".into())),
+            }],
+            20,
+        )
+        .await
+        .unwrap();
+
+        let query = r#"[:find ?tag :where [2 :user/tag ?tag]]"#;
+
+        // At T=15, the tag is active
+        let res_15 = db
+            .query_with_options(
+                query,
+                QueryOptions {
+                    as_of: Some(15),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res_15[0].num_rows(),
+            1,
+            "Tag should exist before retraction"
+        );
+
+        // At T=25, the tag is gone
+        let res_25 = db
+            .query_with_options(
+                query,
+                QueryOptions {
+                    as_of: Some(25),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            res_25.is_empty() || res_25[0].num_rows() == 0,
+            "Tag should be completely invisible after retraction"
+        );
+    }
+
+    // =====================================================================
+    // SUITE 4: ACROSS-TIME (HISTORY) QUERIES
+    // =====================================================================
+
+    #[tokio::test]
+    async fn test_across_time_entity_audit_trail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":order/status", crate::schema::ValueType::String, false);
+        let db = MesoDB::open(dir.path().join("at1.db"), schema, Config::default()).unwrap();
+
+        db.transact_at(
+            vec![Fact {
+                e: 99,
+                ident: ":order/status".into(),
+                v: Value::String("pending".into()),
+                op: true,
+                cas_old_v: None,
+            }],
+            100,
+        )
+        .await
+        .unwrap();
+        db.transact_at(
+            vec![Fact {
+                e: 99,
+                ident: ":order/status".into(),
+                v: Value::String("shipped".into()),
+                op: true,
+                cas_old_v: None,
+            }],
+            200,
+        )
+        .await
+        .unwrap();
+
+        // Query: Show me EVERY assertion made to this order's status over time
+        let query =
+            r#"[:find ?status ?tx :where [99 :order/status ?status ?tx ?op] [(= ?op true)]]"#;
+        let opts = QueryOptions {
+            history: true,
+            format: OutputFormat::Tabular,
+            ..Default::default()
+        };
+        let res = db.query_with_options(query, opts).await.unwrap();
+
+        let total_rows: usize = res.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(
+            total_rows, 2,
+            "History view should yield both the historical 'pending' and current 'shipped' assertions"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_across_time_temporal_self_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":device/state", crate::schema::ValueType::String, false);
+        let db = MesoDB::open(dir.path().join("at2.db"), schema, Config::default()).unwrap();
+
+        db.transact_at(
+            vec![Fact {
+                e: 42,
+                ident: ":device/state".into(),
+                v: Value::String("offline".into()),
+                op: true,
+                cas_old_v: None,
+            }],
+            10,
+        )
+        .await
+        .unwrap();
+        db.transact_at(
+            vec![Fact {
+                e: 42,
+                ident: ":device/state".into(),
+                v: Value::String("online".into()),
+                op: true,
+                cas_old_v: None,
+            }],
+            20,
+        )
+        .await
+        .unwrap();
+
+        // Query: Self-join the history stream to find the exact state transition pair
+        // We use ?e to enforce a safe HashJoin in DataFusion, then filter it to 42.
+        let query = r#"
+            [:find ?past_state ?new_state
+             :where
+                [?e :device/state ?past_state ?tx1 ?op1]
+                [?e :device/state ?new_state ?tx2 ?op2]
+                [(= ?e 42)]
+                [(= ?op1 true)]
+                [(= ?op2 true)]
+                [(< ?tx1 ?tx2)]
+            ]
+        "#;
+
+        let opts = QueryOptions {
+            history: true,
+            format: OutputFormat::Tabular,
+            ..Default::default()
+        };
+        let res = db.query_with_options(query, opts).await.unwrap();
+
+        let batch = &res[0];
+        assert_eq!(
+            batch.num_rows(),
+            1,
+            "Should identify exactly one state transition"
+        );
+
+        let past_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        let new_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+
+        assert_eq!(past_col.value(0), "offline");
+        assert_eq!(new_col.value(0), "online");
+    }
 }
