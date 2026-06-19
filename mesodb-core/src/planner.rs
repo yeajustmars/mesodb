@@ -3,6 +3,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use crate::ast::{FindSpec, Query, RuleDef, RuleSet, Term, WhereClause};
 use crate::db::OutputFormat;
@@ -52,11 +53,15 @@ impl<'a> QueryPlanner<'a> {
         let mut where_conditions = Vec::new();
         let mut var_to_column = HashMap::new();
         let mut alias_counter = 0;
+        let prefix = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
 
         for clause in clauses {
             match clause {
                 WhereClause::DataPattern { e, a, v, tx, op } => {
-                    let alias = format!("t{}", alias_counter);
+                    let alias = format!("t{}_{}", prefix, alias_counter);
                     from_tables.push(format!("{} AS {}", self.table_name, alias));
                     alias_counter += 1;
 
@@ -177,7 +182,7 @@ impl<'a> QueryPlanner<'a> {
                     }
                 }
                 WhereClause::RuleExpr { rule_name, args } => {
-                    let alias = format!("t{}", alias_counter);
+                    let alias = format!("t{}_{}", prefix, alias_counter);
                     from_tables.insert(0, format!("{} AS {}", rule_name, alias));
                     alias_counter += 1;
 
@@ -252,7 +257,60 @@ impl<'a> QueryPlanner<'a> {
                         where_conditions.push(sql_expr);
                     }
                 }
-                _ => {}
+                WhereClause::Or {
+                    join_vars: _,
+                    clauses: or_clauses,
+                } => {
+                    let mut union_branches = Vec::new();
+                    for clause in or_clauses {
+                        let (sub_froms, sub_wheres, sub_vars) =
+                            self.build_logical_plan(&[clause.clone()])?;
+
+                        let mut correlation_links = Vec::new();
+                        for (var, outer_col) in &var_to_column {
+                            if let Some(inner_col) = sub_vars.get(var) {
+                                correlation_links.push(format!("{} = {}", outer_col, inner_col));
+                            }
+                        }
+
+                        let mut sub_sql = format!("SELECT 1 FROM {}", sub_froms.join(", "));
+                        let mut all_sub_wheres = sub_wheres;
+                        all_sub_wheres.extend(correlation_links);
+
+                        if !all_sub_wheres.is_empty() {
+                            sub_sql.push_str(" WHERE ");
+                            sub_sql.push_str(&all_sub_wheres.join(" AND "));
+                        }
+                        union_branches.push(sub_sql);
+                    }
+                    if !union_branches.is_empty() {
+                        where_conditions
+                            .push(format!("EXISTS ({})", union_branches.join(" UNION ALL ")));
+                    }
+                }
+                WhereClause::Not {
+                    join_vars: _,
+                    clauses: not_clauses,
+                } => {
+                    let (sub_froms, sub_wheres, sub_vars) = self.build_logical_plan(not_clauses)?;
+
+                    let mut correlation_links = Vec::new();
+                    for (var, outer_col) in &var_to_column {
+                        if let Some(inner_col) = sub_vars.get(var) {
+                            correlation_links.push(format!("{} = {}", outer_col, inner_col));
+                        }
+                    }
+
+                    let mut sub_sql = format!("SELECT 1 FROM {}", sub_froms.join(", "));
+                    let mut all_sub_wheres = sub_wheres;
+                    all_sub_wheres.extend(correlation_links);
+
+                    if !all_sub_wheres.is_empty() {
+                        sub_sql.push_str(" WHERE ");
+                        sub_sql.push_str(&all_sub_wheres.join(" AND "));
+                    }
+                    where_conditions.push(format!("NOT EXISTS ({})", sub_sql));
+                }
             }
         }
         Ok((from_tables, where_conditions, var_to_column))

@@ -1711,4 +1711,171 @@ mod tests {
         assert!(edn_str.contains(r#":op false"#)); // The retraction
         assert!(edn_str.contains(r#":op true"#)); // The assertions
     }
+
+    // =====================================================================
+    // SUITE 6: LOGICAL OPERATORS (OR / NOT)
+    // =====================================================================
+
+    #[tokio::test]
+    async fn test_datalog_or_clause() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":account/status", crate::schema::ValueType::String, false);
+        schema.add_attribute(":account/type", crate::schema::ValueType::String, false);
+
+        let db = MesoDB::open(dir.path().join("or_logic.db"), schema, Config::default()).unwrap();
+
+        db.transact(vec![
+            // Account 1: Active Admin (Matches both)
+            Fact {
+                e: 1,
+                ident: ":account/status".into(),
+                v: Value::String("active".into()),
+                op: true,
+                cas_old_v: None,
+            },
+            Fact {
+                e: 1,
+                ident: ":account/type".into(),
+                v: Value::String("admin".into()),
+                op: true,
+                cas_old_v: None,
+            },
+            // Account 2: Inactive Admin (Matches type)
+            Fact {
+                e: 2,
+                ident: ":account/status".into(),
+                v: Value::String("inactive".into()),
+                op: true,
+                cas_old_v: None,
+            },
+            Fact {
+                e: 2,
+                ident: ":account/type".into(),
+                v: Value::String("admin".into()),
+                op: true,
+                cas_old_v: None,
+            },
+            // Account 3: Active User (Matches status)
+            Fact {
+                e: 3,
+                ident: ":account/status".into(),
+                v: Value::String("active".into()),
+                op: true,
+                cas_old_v: None,
+            },
+            Fact {
+                e: 3,
+                ident: ":account/type".into(),
+                v: Value::String("user".into()),
+                op: true,
+                cas_old_v: None,
+            },
+            // Account 4: Inactive User (Matches NEITHER)
+            Fact {
+                e: 4,
+                ident: ":account/status".into(),
+                v: Value::String("inactive".into()),
+                op: true,
+                cas_old_v: None,
+            },
+            Fact {
+                e: 4,
+                ident: ":account/type".into(),
+                v: Value::String("user".into()),
+                op: true,
+                cas_old_v: None,
+            },
+        ])
+        .await
+        .unwrap();
+
+        // THE QUERY: Find any account that is EITHER 'active' OR an 'admin'
+        let query = r#"
+            [:find ?e
+             :where
+                (or [?e :account/status "active"]
+                    [?e :account/type "admin"])]
+        "#;
+
+        let results = db.query(query).await.unwrap();
+        let batch = &results[0];
+
+        // Should match accounts 1, 2, and 3. Account 4 is dropped.
+        assert_eq!(
+            batch.num_rows(),
+            3,
+            "OR clause should return the union of the matching branches"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_datalog_not_clause() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":account/status", crate::schema::ValueType::String, false);
+        schema.add_attribute(":account/type", crate::schema::ValueType::String, false);
+
+        let db = MesoDB::open(dir.path().join("not_logic.db"), schema, Config::default()).unwrap();
+
+        db.transact(vec![
+            // Account 1: Active Admin
+            Fact {
+                e: 1,
+                ident: ":account/status".into(),
+                v: Value::String("active".into()),
+                op: true,
+                cas_old_v: None,
+            },
+            Fact {
+                e: 1,
+                ident: ":account/type".into(),
+                v: Value::String("admin".into()),
+                op: true,
+                cas_old_v: None,
+            },
+            // Account 2: Inactive Admin
+            Fact {
+                e: 2,
+                ident: ":account/status".into(),
+                v: Value::String("inactive".into()),
+                op: true,
+                cas_old_v: None,
+            },
+            Fact {
+                e: 2,
+                ident: ":account/type".into(),
+                v: Value::String("admin".into()),
+                op: true,
+                cas_old_v: None,
+            },
+        ])
+        .await
+        .unwrap();
+
+        // THE QUERY: Find 'admins' who are NOT 'active'
+        let query = r#"
+            [:find ?e
+             :where
+                [?e :account/type "admin"]
+                (not [?e :account/status "active"])]
+        "#;
+
+        let results = db.query(query).await.unwrap();
+        let batch = &results[0];
+
+        // Should match EXACTLY account 2
+        assert_eq!(
+            batch.num_rows(),
+            1,
+            "NOT clause should filter out the active admin"
+        );
+
+        let e_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .unwrap();
+        assert_eq!(e_col.value(0), 2);
+    }
 }
