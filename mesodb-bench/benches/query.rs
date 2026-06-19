@@ -33,12 +33,14 @@ fn setup_populated_db(dir: &TempDir) -> MesoDB {
             ident: ":user/name".into(),
             v: Value::String(format!("User_{}", i)),
             op: true,
+            cas_old_v: None,
         });
         facts.push(Fact {
             e: e_user,
             ident: ":user/age".into(),
             v: Value::Int64(20 + (i % 50) as i64),
             op: true,
+            cas_old_v: None,
         });
 
         facts.push(Fact {
@@ -46,12 +48,14 @@ fn setup_populated_db(dir: &TempDir) -> MesoDB {
             ident: ":order/user".into(),
             v: Value::Ref(e_user),
             op: true,
+            cas_old_v: None,
         });
         facts.push(Fact {
             e: e_order,
             ident: ":order/amount".into(),
             v: Value::Float64(10.0 + (i as f64 % 100.0)),
             op: true,
+            cas_old_v: None,
         });
     }
 
@@ -101,6 +105,21 @@ fn bench_queries(c: &mut Criterion) {
                         :where [?u :user/age 30]]"#;
         let opts = QueryOptions {
             format: OutputFormat::Json,
+            ..Default::default()
+        };
+        b.to_async(&rt).iter(|| async {
+            db.query_with_options(query, opts.clone()).await.unwrap();
+        });
+    });
+
+    // 4. Across-Time History Audit
+    group.bench_function("Across-Time History Audit", |b| {
+        // Pseudo-boxing the literal `25001` to force HashJoin
+        let query = r#"[:find ?amount ?tx ?op
+                        :where [?e :order/amount ?amount ?tx ?op]
+                               [(= ?e 25001)]]"#;
+        let opts = QueryOptions {
+            history: true,
             ..Default::default()
         };
         b.to_async(&rt).iter(|| async {
