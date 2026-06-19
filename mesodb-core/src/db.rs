@@ -1477,13 +1477,11 @@ mod tests {
         .unwrap();
 
         // Query: Self-join the history stream to find the exact state transition pair
-        // We use ?e to enforce a safe HashJoin in DataFusion, then filter it to 42.
         let query = r#"
             [:find ?past_state ?new_state
              :where
-                [?e :device/state ?past_state ?tx1 ?op1]
-                [?e :device/state ?new_state ?tx2 ?op2]
-                [(= ?e 42)]
+                [42 :device/state ?past_state ?tx1 ?op1]
+                [42 :device/state ?new_state ?tx2 ?op2]
                 [(= ?op1 true)]
                 [(= ?op2 true)]
                 [(< ?tx1 ?tx2)]

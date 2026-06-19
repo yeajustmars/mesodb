@@ -73,7 +73,17 @@ impl<'a> QueryPlanner<'a> {
                                 var_to_column.insert(var_name.clone(), col_ref);
                             }
                         }
-                        Term::Integer(id) => where_conditions.push(format!("{}.e = {}", alias, id)),
+                        Term::Integer(id) => {
+                            // Treat literals as pseudo-variables to enforce DataFusion HashJoins
+                            let col_ref = format!("{}.e", alias);
+                            let lit_key = format!("__lit_e_{}", id);
+                            if let Some(existing_col) = var_to_column.get(&lit_key) {
+                                where_conditions.push(format!("{} = {}", existing_col, col_ref));
+                            } else {
+                                var_to_column.insert(lit_key, col_ref.clone());
+                            }
+                            where_conditions.push(format!("{} = {}", col_ref, id));
+                        }
                         _ => {}
                     }
 

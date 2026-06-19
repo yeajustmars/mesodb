@@ -5,12 +5,11 @@ use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
 use crate::dto::SchemaRequest;
+use crate::dto::{ErrorResponse, TransactionRequest};
 use mesodb_core::db::{AttributeDefinition, MesoDB};
 use mesodb_core::schema::ValueType;
 use mesodb_core::transactor::Fact;
 use mesodb_core::types::Value as MesoValue;
-
-use crate::dto::{ErrorResponse, TransactionRequest};
 
 /// POST /transact
 pub async fn handle_transact(
