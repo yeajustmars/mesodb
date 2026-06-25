@@ -435,6 +435,7 @@ mod tests {
                 v: Value::String("Alice".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             Fact {
                 e: 1,
@@ -442,6 +443,7 @@ mod tests {
                 v: Value::Int64(30),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
         ])
         .await
@@ -484,6 +486,7 @@ mod tests {
                 v: Value::String("Alice".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             }],
             100,
         )
@@ -498,6 +501,7 @@ mod tests {
                 v: Value::String("Alice-Revised".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             }],
             200,
         )
@@ -512,6 +516,7 @@ mod tests {
                 v: Value::String("Bob".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             }],
             300,
         )
@@ -596,6 +601,7 @@ mod tests {
             v: Value::Boolean(true),
             op: true,
             cas_old_v: None,
+            valid_time: None,
         }])
         .await
         .unwrap();
@@ -608,6 +614,7 @@ mod tests {
                 v: Value::String("Alice".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             }],
             100,
         )
@@ -622,6 +629,7 @@ mod tests {
                 v: Value::String("Alice-Revised".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             }],
             200,
         )
@@ -681,6 +689,7 @@ mod tests {
                 v: Value::String("Alice".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             Fact {
                 e: 1,
@@ -688,6 +697,7 @@ mod tests {
                 v: Value::Ref(2),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             Fact {
                 e: 2,
@@ -695,6 +705,7 @@ mod tests {
                 v: Value::String("New York".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
         ])
         .await
@@ -758,6 +769,7 @@ mod tests {
                 v: Value::Ref(1),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             Fact {
                 e: 101,
@@ -765,6 +777,7 @@ mod tests {
                 v: Value::Int64(50),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             Fact {
                 e: 102,
@@ -772,6 +785,7 @@ mod tests {
                 v: Value::Ref(1),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             Fact {
                 e: 102,
@@ -779,6 +793,7 @@ mod tests {
                 v: Value::Int64(100),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             // User 2 has one order totaling 75
             Fact {
@@ -787,6 +802,7 @@ mod tests {
                 v: Value::Ref(2),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             Fact {
                 e: 103,
@@ -794,6 +810,7 @@ mod tests {
                 v: Value::Int64(75),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
         ])
         .await
@@ -849,6 +866,7 @@ mod tests {
                 v: Value::String("Alice (Grandparent)".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             Fact {
                 e: 2,
@@ -856,6 +874,7 @@ mod tests {
                 v: Value::Ref(1),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             Fact {
                 e: 2,
@@ -863,6 +882,7 @@ mod tests {
                 v: Value::String("Bob (Parent)".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             // 2 (Bob) is parent of 3 (Charlie)
             Fact {
@@ -871,6 +891,7 @@ mod tests {
                 v: Value::Ref(2),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             Fact {
                 e: 3,
@@ -878,6 +899,7 @@ mod tests {
                 v: Value::String("Charlie (Child)".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
         ])
         .await
@@ -936,6 +958,7 @@ mod tests {
                 v: Value::String("Alice".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             Fact {
                 e: 1,
@@ -943,6 +966,7 @@ mod tests {
                 v: Value::Int64(30),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             Fact {
                 e: 1,
@@ -950,6 +974,7 @@ mod tests {
                 v: Value::Boolean(true),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             Fact {
                 e: 1,
@@ -957,6 +982,7 @@ mod tests {
                 v: Value::Ref(2),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             Fact {
                 e: 2,
@@ -964,6 +990,7 @@ mod tests {
                 v: Value::String("New York".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             Fact {
                 e: 3,
@@ -971,6 +998,7 @@ mod tests {
                 v: Value::String("Bob".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             Fact {
                 e: 3,
@@ -978,6 +1006,7 @@ mod tests {
                 v: Value::Int64(40),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
         ])
         .await
@@ -1163,6 +1192,7 @@ mod tests {
                 v: Value::String("XJ-900".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             Fact {
                 e: 100,
@@ -1170,6 +1200,7 @@ mod tests {
                 v: Value::Float64(99.99),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
         ])
         .await
@@ -1201,6 +1232,7 @@ mod tests {
                 v: crate::types::Value::String("active".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             }],
             100,
         )
@@ -1216,6 +1248,7 @@ mod tests {
                 v: crate::types::Value::String("inactive".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             }],
             200,
         )
@@ -1297,6 +1330,7 @@ mod tests {
                 v: Value::Int64(50),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             }],
             100,
         )
@@ -1311,6 +1345,7 @@ mod tests {
                 v: Value::Int64(75),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             }],
             200,
         )
@@ -1373,6 +1408,7 @@ mod tests {
                 v: Value::String("beta".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             }],
             10,
         )
@@ -1387,6 +1423,7 @@ mod tests {
                 v: Value::String("beta".into()),
                 op: false,
                 cas_old_v: Some(Value::String("beta".into())),
+                valid_time: None,
             }],
             20,
         )
@@ -1447,6 +1484,7 @@ mod tests {
                 v: Value::String("pending".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             }],
             100,
         )
@@ -1459,6 +1497,7 @@ mod tests {
                 v: Value::String("shipped".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             }],
             200,
         )
@@ -1496,6 +1535,7 @@ mod tests {
                 v: Value::String("offline".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             }],
             10,
         )
@@ -1508,6 +1548,7 @@ mod tests {
                 v: Value::String("online".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             }],
             20,
         )
@@ -1573,6 +1614,7 @@ mod tests {
             v: Value::String("Draft".into()),
             op: true,
             cas_old_v: None,
+            valid_time: None,
         }])
         .await
         .unwrap();
@@ -1583,6 +1625,7 @@ mod tests {
             v: Value::String("Final".into()),
             op: true,
             cas_old_v: None,
+            valid_time: None,
         }])
         .await
         .unwrap();
@@ -1742,6 +1785,7 @@ mod tests {
                 v: Value::String("active".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             Fact {
                 e: 1,
@@ -1749,6 +1793,7 @@ mod tests {
                 v: Value::String("admin".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             // Account 2: Inactive Admin (Matches type)
             Fact {
@@ -1757,6 +1802,7 @@ mod tests {
                 v: Value::String("inactive".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             Fact {
                 e: 2,
@@ -1764,6 +1810,7 @@ mod tests {
                 v: Value::String("admin".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             // Account 3: Active User (Matches status)
             Fact {
@@ -1772,6 +1819,7 @@ mod tests {
                 v: Value::String("active".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             Fact {
                 e: 3,
@@ -1779,6 +1827,7 @@ mod tests {
                 v: Value::String("user".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             // Account 4: Inactive User (Matches NEITHER)
             Fact {
@@ -1787,6 +1836,7 @@ mod tests {
                 v: Value::String("inactive".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             Fact {
                 e: 4,
@@ -1794,6 +1844,7 @@ mod tests {
                 v: Value::String("user".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
         ])
         .await
@@ -1834,6 +1885,7 @@ mod tests {
                 v: Value::String("active".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             Fact {
                 e: 1,
@@ -1841,6 +1893,7 @@ mod tests {
                 v: Value::String("admin".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             // Account 2: Inactive Admin
             Fact {
@@ -1849,6 +1902,7 @@ mod tests {
                 v: Value::String("inactive".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             Fact {
                 e: 2,
@@ -1856,6 +1910,7 @@ mod tests {
                 v: Value::String("admin".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
         ])
         .await
@@ -1915,6 +1970,7 @@ mod tests {
                     v: Value::String("Alice".into()),
                     op: true,
                     cas_old_v: None,
+                    valid_time: None,
                 },
                 Fact {
                     e: 0,
@@ -1922,6 +1978,7 @@ mod tests {
                     v: Value::String("SystemAdmin".into()),
                     op: true,
                     cas_old_v: None,
+                    valid_time: None,
                 },
             ])
             .await

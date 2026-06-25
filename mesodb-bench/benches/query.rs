@@ -34,6 +34,7 @@ fn setup_populated_db(dir: &TempDir) -> MesoDB {
             v: Value::String(format!("User_{}", i)),
             op: true,
             cas_old_v: None,
+            valid_time: None,
         });
         facts.push(Fact {
             e: e_user,
@@ -41,6 +42,7 @@ fn setup_populated_db(dir: &TempDir) -> MesoDB {
             v: Value::Int64(20 + (i % 50) as i64),
             op: true,
             cas_old_v: None,
+            valid_time: None,
         });
 
         facts.push(Fact {
@@ -49,6 +51,7 @@ fn setup_populated_db(dir: &TempDir) -> MesoDB {
             v: Value::Ref(e_user),
             op: true,
             cas_old_v: None,
+            valid_time: None,
         });
         facts.push(Fact {
             e: e_order,
@@ -56,6 +59,7 @@ fn setup_populated_db(dir: &TempDir) -> MesoDB {
             v: Value::Float64(10.0 + (i as f64 % 100.0)),
             op: true,
             cas_old_v: None,
+            valid_time: None,
         });
     }
 

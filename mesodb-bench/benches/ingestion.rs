@@ -34,6 +34,7 @@ fn generate_facts(batch_size: usize, start_id: i64) -> Vec<Fact> {
             v: Value::Int64(e as i64),
             op: true,
             cas_old_v: None,
+            valid_time: None,
         });
         facts.push(Fact {
             e,
@@ -41,6 +42,7 @@ fn generate_facts(batch_size: usize, start_id: i64) -> Vec<Fact> {
             v: Value::Float64(42.5 + (i as f64 * 0.1)),
             op: true,
             cas_old_v: None,
+            valid_time: None,
         });
     }
     facts
@@ -113,6 +115,7 @@ fn bench_ingestion(c: &mut Criterion) {
                     v: Value::Float64(50.0 + loop_counter + (i as f64 * 0.1)),
                     op: true,
                     cas_old_v: None,
+                    valid_time: None,
                 });
             }
 

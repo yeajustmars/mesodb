@@ -138,6 +138,8 @@ impl Transactor {
 
         // --- PHASE 1: Validation & Bitemporal Resolution ---
         for mut fact in facts {
+            let resolved_valid_time = fact.valid_time.unwrap_or(now);
+
             // --- REIFIED TRANSACTIONS ---
             // Entity ID 0 is a reserved pointer to the current transaction.
             if fact.e == 0 {
@@ -239,20 +241,32 @@ impl Transactor {
                             attr_id,
                             existing_v.clone(),
                             tx_id,
-                            now,
+                            resolved_valid_time,
                         ));
                     } else {
                         continue; // No-op: value is already exactly this
                     }
                 }
 
-                pending_datoms.push(Datom::assert(fact.e, attr_id, fact.v, tx_id, now));
+                pending_datoms.push(Datom::assert(
+                    fact.e,
+                    attr_id,
+                    fact.v,
+                    tx_id,
+                    resolved_valid_time,
+                ));
             } else {
                 // Retractions
                 if let Some(existing_v) = self.indices.get_current_value(fact.e, attr_id)
                     && existing_v == &fact.v
                 {
-                    pending_datoms.push(Datom::retract(fact.e, attr_id, fact.v, tx_id, now));
+                    pending_datoms.push(Datom::retract(
+                        fact.e,
+                        attr_id,
+                        fact.v,
+                        tx_id,
+                        resolved_valid_time,
+                    ));
                 }
             }
         }
@@ -296,6 +310,7 @@ pub struct Fact {
     pub v: Value,
     pub op: bool,
     pub cas_old_v: Option<Value>, // Compare-And-Swap expectation
+    pub valid_time: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -334,6 +349,7 @@ mod tests {
                     v: Value::String("Alice".into()),
                     op: true,
                     cas_old_v: None,
+                    valid_time: None,
                 }],
                 100,
             )
@@ -348,6 +364,7 @@ mod tests {
                     v: Value::String("Alice-Revised".into()),
                     op: true,
                     cas_old_v: None,
+                    valid_time: None,
                 }],
                 200,
             )
@@ -367,6 +384,7 @@ mod tests {
             v: Value::String("a@b.com".into()),
             op: true,
             cas_old_v: None,
+            valid_time: None,
         }])
         .unwrap();
 
@@ -376,6 +394,7 @@ mod tests {
             v: Value::String("a@b.com".into()),
             op: true,
             cas_old_v: None,
+            valid_time: None,
         }]);
 
         assert!(err.is_err());
@@ -394,6 +413,7 @@ mod tests {
                 v: Value::String("Alice".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             }],
             100,
         )
@@ -408,6 +428,7 @@ mod tests {
                     v: Value::String("Bob".into()),
                     op: true,
                     cas_old_v: None,
+                    valid_time: None,
                 }],
                 200,
             )
@@ -470,6 +491,7 @@ mod tests {
                 v: Value::String("Test".into()),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             }])
             .unwrap();
 
@@ -500,6 +522,7 @@ mod tests {
             v: Value::Int64(29),
             op: true,
             cas_old_v: None,
+            valid_time: None,
         }])
         .unwrap();
 
@@ -510,6 +533,7 @@ mod tests {
             v: Value::Int64(31),
             op: true,
             cas_old_v: Some(Value::Int64(30)), // Incorrect expectation!
+            valid_time: None,
         }]);
 
         // Transaction must abort!
@@ -523,6 +547,7 @@ mod tests {
             v: Value::Int64(30),
             op: true,
             cas_old_v: Some(Value::Int64(29)), // Correct expectation!
+            valid_time: None,
         }]);
 
         assert!(good_cas.is_ok());
@@ -540,6 +565,7 @@ mod tests {
                 v: Value::Int64(100),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
             Fact {
                 e: 20,
@@ -547,6 +573,7 @@ mod tests {
                 v: Value::Int64(50),
                 op: true,
                 cas_old_v: None,
+                valid_time: None,
             },
         ])
         .unwrap();
@@ -561,6 +588,7 @@ mod tests {
                 v: Value::Int64(50),
                 op: true,
                 cas_old_v: Some(Value::Int64(100)),
+                valid_time: None,
             },
             // INVALID CAS (Expected 40, but is actually 50)
             Fact {
@@ -569,6 +597,7 @@ mod tests {
                 v: Value::Int64(90),
                 op: true,
                 cas_old_v: Some(Value::Int64(40)),
+                valid_time: None,
             },
         ]);
 
@@ -595,6 +624,7 @@ mod tests {
             v: Value::String("active".into()),
             op: true,
             cas_old_v: None,
+            valid_time: None,
         }])
         .unwrap();
 
@@ -605,6 +635,7 @@ mod tests {
             v: Value::String("active".into()),
             op: true,
             cas_old_v: Some(Value::String("inactive".into())),
+            valid_time: None,
         }]);
         assert!(
             missing_err.is_err(),
@@ -619,11 +650,188 @@ mod tests {
             v: Value::String("active".into()), // The value being retracted
             op: false,                         // Retract!
             cas_old_v: Some(Value::String("active".into())),
+            valid_time: None,
         }]);
         assert!(good_retract.is_ok());
 
         // Verify it's actually gone
         let attr_id = t.schema.get_id(":user/status").unwrap();
         assert!(t.indices.get_current_value(1, attr_id).is_none());
+    }
+
+    #[test]
+    fn test_explicit_valid_time_ingestion() {
+        use arrow::array::TimestampMicrosecondArray;
+        let (mut t, _f) = setup_transactor();
+
+        let historical_time = 5000; // Deep in the past
+
+        // Assert a fact with a specific valid_time
+        let report = t
+            .transact(vec![Fact {
+                e: 1,
+                ident: ":user/name".into(),
+                v: Value::String("TimeTraveler".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: Some(historical_time),
+            }])
+            .unwrap();
+
+        let batch = report.batch;
+        let from_col = batch
+            .column(11) // valid_from
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+
+        // Verify the engine respected the user's valid_time instead of using the transaction's `now`
+        assert_eq!(from_col.value(0), historical_time);
+    }
+
+    #[test]
+    fn test_bitemporal_past_valid_time() {
+        use arrow::array::TimestampMicrosecondArray;
+        let (mut t, _f) = setup_transactor();
+
+        let past_time = 1500000000000; // Explicit past timestamp
+
+        let report = t
+            .transact(vec![Fact {
+                e: 1,
+                ident: ":user/name".into(),
+                v: Value::String("Past User".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: Some(past_time),
+            }])
+            .unwrap();
+
+        let from_col = report
+            .batch
+            .column(11) // valid_from column index
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+
+        assert_eq!(
+            from_col.value(0),
+            past_time,
+            "Transactor must respect explicit past time"
+        );
+    }
+
+    #[test]
+    fn test_bitemporal_future_valid_time() {
+        use arrow::array::TimestampMicrosecondArray;
+        let (mut t, _f) = setup_transactor();
+
+        let future_time = 2500000000000; // Explicit future timestamp
+
+        let report = t
+            .transact(vec![Fact {
+                e: 2,
+                ident: ":user/name".into(),
+                v: Value::String("Future User".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: Some(future_time),
+            }])
+            .unwrap();
+
+        let from_col = report
+            .batch
+            .column(11) // valid_from column index
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+
+        assert_eq!(
+            from_col.value(0),
+            future_time,
+            "Transactor must respect explicit future time"
+        );
+    }
+
+    #[test]
+    fn test_bitemporal_mixed_valid_times_batch() {
+        use arrow::array::TimestampMicrosecondArray;
+        let (mut t, _f) = setup_transactor();
+
+        let past_1 = 1000;
+        let future_1 = 8_000_000_000_000_000; // Far future (Year ~2223)
+        let past_2 = 2000;
+        let future_2 = 9_000_000_000_000_000; // Farther future (Year ~2255)
+
+        // Mix past, future, and implicit 'now' (None) in a single transaction batch
+        let report = t
+            .transact(vec![
+                Fact {
+                    e: 10,
+                    ident: ":user/name".into(),
+                    v: Value::String("A".into()),
+                    op: true,
+                    cas_old_v: None,
+                    valid_time: Some(past_1),
+                },
+                Fact {
+                    e: 11,
+                    ident: ":user/name".into(),
+                    v: Value::String("B".into()),
+                    op: true,
+                    cas_old_v: None,
+                    valid_time: Some(future_1),
+                },
+                Fact {
+                    e: 12,
+                    ident: ":user/name".into(),
+                    v: Value::String("C".into()),
+                    op: true,
+                    cas_old_v: None,
+                    valid_time: None,
+                }, // Falls back to internal SystemTime::now()
+                Fact {
+                    e: 13,
+                    ident: ":user/name".into(),
+                    v: Value::String("D".into()),
+                    op: true,
+                    cas_old_v: None,
+                    valid_time: Some(past_2),
+                },
+                Fact {
+                    e: 14,
+                    ident: ":user/name".into(),
+                    v: Value::String("E".into()),
+                    op: true,
+                    cas_old_v: None,
+                    valid_time: Some(future_2),
+                },
+            ])
+            .unwrap();
+
+        let from_col = report
+            .batch
+            .column(11) // valid_from column index
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+
+        assert_eq!(report.batch.num_rows(), 5);
+
+        // Assert explicit times were bound correctly
+        assert_eq!(from_col.value(0), past_1);
+        assert_eq!(from_col.value(1), future_1);
+        assert_eq!(from_col.value(3), past_2);
+        assert_eq!(from_col.value(4), future_2);
+
+        // Assert the implicit 'None' fallback correctly generated a real transaction timestamp
+        let implicit_now = from_col.value(2);
+        assert!(
+            implicit_now > past_2 && implicit_now < future_2,
+            "Implicit fallback ({}) should reflect current system time and sit between {} and {}",
+            implicit_now,
+            past_2,
+            future_2
+        );
     }
 }
