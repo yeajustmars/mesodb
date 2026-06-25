@@ -81,7 +81,6 @@ impl MesoDB {
                 let new_view = Arc::new(WorldView {
                     ram_batches: Arc::new(new_ram),
                     data_dir: current_view.data_dir.clone(),
-                    // FIX: Clone these safely from the current_view
                     schema: current_view.schema.clone(),
                     timeline: current_view.timeline.clone(),
                 });
@@ -157,7 +156,6 @@ impl MesoDB {
                 ram_batches: Arc::new(new_ram),
                 data_dir: current_view.data_dir.clone(),
                 schema: Arc::new(tx.schema.clone()),
-                // FIX: Propagate the updated timeline safely
                 timeline: Arc::new(tx.timeline.clone()),
             });
             {
@@ -166,9 +164,6 @@ impl MesoDB {
             }
 
             // --- THE COMPACTION COMPLIANCE THRESHOLD ---
-            // Only queue a background disk flush when a memory batch size threshold is reached.
-            // This stops high-frequency iterations from overwhelming the OS file system stack.
-            // TODO: allow setting this value in config
             if report.batch.num_rows() >= 50_000
                 && self
                     .flush_tx
@@ -205,14 +200,58 @@ impl MesoDB {
         } else {
             None
         };
+
         let arrow_schema = view.ram_batches.get(&0).unwrap().schema();
         let pq_options =
             datafusion::prelude::ParquetReadOptions::default().schema(arrow_schema.as_ref());
-        let table_path = view.data_dir.to_string_lossy().to_string();
 
-        let _ = ctx
-            .register_parquet("parquet_datoms", &table_path, pq_options)
-            .await;
+        // 1. Separate Physical Isolated Streams to Preserve Predicate Pushdown
+        let mut compacted_paths = vec![];
+        let mut volatile_paths = vec![];
+        let pq_dir = view.data_dir.join("parquet");
+
+        if let Ok(entries) = std::fs::read_dir(&pq_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let path = entry.path().to_string_lossy().to_string();
+                if name.starts_with("compacted-") && name.ends_with(".parquet") {
+                    compacted_paths.push(path);
+                } else if name.starts_with("part-") && name.ends_with(".parquet") {
+                    volatile_paths.push(path);
+                }
+            }
+        }
+
+        if !compacted_paths.is_empty() {
+            let df = ctx
+                .read_parquet(compacted_paths, pq_options.clone())
+                .await?;
+            ctx.register_table("compacted_datoms", df.into_view())?;
+        } else {
+            let provider = datafusion::datasource::memory::MemTable::try_new(
+                arrow_schema.clone(),
+                vec![vec![arrow::record_batch::RecordBatch::new_empty(
+                    arrow_schema.clone(),
+                )]],
+            )
+            .unwrap();
+            ctx.register_table("compacted_datoms", Arc::new(provider))?;
+        }
+
+        if !volatile_paths.is_empty() {
+            let df = ctx.read_parquet(volatile_paths, pq_options.clone()).await?;
+            ctx.register_table("volatile_parquet", df.into_view())?;
+        } else {
+            let provider = datafusion::datasource::memory::MemTable::try_new(
+                arrow_schema.clone(),
+                vec![vec![arrow::record_batch::RecordBatch::new_empty(
+                    arrow_schema.clone(),
+                )]],
+            )
+            .unwrap();
+            ctx.register_table("volatile_parquet", Arc::new(provider))?;
+        }
+
         let mut ram_vec: Vec<RecordBatch> = view
             .ram_batches
             .values()
@@ -224,44 +263,79 @@ impl MesoDB {
                 arrow_schema.clone(),
             ));
         }
-
         let ram_provider =
             datafusion::datasource::memory::MemTable::try_new(arrow_schema.clone(), vec![ram_vec])
                 .unwrap();
         ctx.register_table("ram_datoms", Arc::new(ram_provider))?;
 
-        let table_exists = ctx.table_exist("parquet_datoms").unwrap_or(false);
-        if table_exists {
-            let df = ctx
-                .sql("SELECT * FROM parquet_datoms UNION ALL SELECT * FROM ram_datoms")
-                .await?;
-            ctx.register_table("raw_datoms", df.into_view())?;
-        } else {
-            let df = ctx.sql("SELECT * FROM ram_datoms").await?;
-            ctx.register_table("raw_datoms", df.into_view())?;
-        }
+        let df_vol = ctx
+            .sql("SELECT * FROM volatile_parquet UNION ALL SELECT * FROM ram_datoms")
+            .await?;
+        ctx.register_table("volatile_datoms", df_vol.into_view())?;
 
+        // 2. The Vectorized Option A SQL Router
         let resolved_sql = if options.history {
-            r#"SELECT e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid, t, op, valid_from, CAST(NULL AS BIGINT) as next_from, valid_to FROM raw_datoms"#.to_string()
+            // History queries bypass window groupings entirely to stream the raw, unadulterated audit trail.
+            r#"
+            WITH raw_combined AS (
+                SELECT * FROM compacted_datoms UNION ALL SELECT * FROM volatile_datoms
+            ),
+            reconstructed_retractions AS (
+                SELECT e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid, t, false as op, valid_to as valid_from, (CASE WHEN false THEN valid_to ELSE NULL END) as next_from, valid_to
+                FROM compacted_datoms WHERE op = true AND CAST(valid_to AS BIGINT) < 9223372036854775807
+            )
+            SELECT e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid, t, op, valid_from, (CASE WHEN false THEN valid_from ELSE NULL END) as next_from, valid_to FROM raw_combined
+            UNION ALL
+            SELECT * FROM reconstructed_retractions
+            "#.to_string()
         } else {
-            let time_filter = match options.as_of {
-                Some(t) => format!("WHERE CAST(valid_from AS BIGINT) <= {}", t),
-                None => "".to_string(),
-            };
-            let resolved_time_filter = match options.as_of {
-                Some(t) => format!(
-                    "AND CAST(valid_from AS BIGINT) <= {t} AND CAST(COALESCE(next_from, valid_to) AS BIGINT) > {t}"
+            // Dynamically construct time filters to safely evaluate 'current state' vs 'past state'
+            let t = options.as_of.unwrap_or(i64::MAX);
+            let (vol_filter, active_vol_filter, comp_filter) = match options.as_of {
+                Some(_) => (
+                    format!("WHERE CAST(valid_from AS BIGINT) <= {t}"),
+                    format!(
+                        "AND CAST(valid_from AS BIGINT) <= {t} AND CAST(COALESCE(next_from, valid_to) AS BIGINT) >= {t}"
+                    ),
+                    format!(
+                        "AND CAST(c.valid_from AS BIGINT) <= {t} AND CAST(c.valid_to AS BIGINT) >= {t}"
+                    ),
                 ),
-                None => "".to_string(),
+                None => (
+                    "".to_string(),
+                    "AND next_from IS NULL".to_string(),
+                    "AND CAST(c.valid_to AS BIGINT) = 9223372036854775807".to_string(),
+                ),
             };
+
             format!(
                 r#"
-                WITH raw_filtered AS (SELECT * FROM raw_datoms {}),
-                bounds AS (SELECT *, LEAD(valid_from) OVER (PARTITION BY e, a ORDER BY valid_from ASC, t ASC) as next_from FROM raw_filtered)
-                SELECT e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid, t, op, valid_from, next_from, COALESCE(next_from, valid_to) as valid_to
-                FROM bounds WHERE op = true {}
-                "#,
-                time_filter, resolved_time_filter
+                WITH
+                volatile_filtered AS (
+                    SELECT * FROM volatile_datoms {vol_filter}
+                ),
+                volatile_bounds AS (
+                    SELECT *, LEAD(valid_from) OVER (PARTITION BY e, a ORDER BY valid_from ASC, t ASC, op ASC) as next_from
+                    FROM volatile_filtered
+                ),
+                active_volatile AS (
+                    SELECT e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid, t, op, valid_from, next_from, COALESCE(next_from, valid_to) as valid_to
+                    FROM volatile_bounds
+                    WHERE op = true {active_vol_filter}
+                ),
+                volatile_mask AS (
+                    SELECT DISTINCT e, a FROM volatile_filtered
+                ),
+                surviving_compacted AS (
+                    SELECT c.e, c.a, c.v_bool, c.v_int, c.v_float, c.v_str, c.v_ref, c.v_time, c.v_uuid, c.t, c.op, c.valid_from, (CASE WHEN false THEN c.valid_from ELSE NULL END) as next_from, c.valid_to
+                    FROM compacted_datoms c
+                    WHERE c.op = true {comp_filter}
+                      AND NOT EXISTS (SELECT 1 FROM volatile_mask m WHERE m.e = c.e AND m.a = c.a)
+                )
+                SELECT * FROM surviving_compacted
+                UNION ALL
+                SELECT * FROM active_volatile
+                "#
             )
         };
 
@@ -273,15 +347,21 @@ impl MesoDB {
 
         let planner = crate::planner::QueryPlanner::new(
             &ctx,
-            view.timeline.as_ref(), // Updated to use timeline!
+            view.timeline.as_ref(),
             "resolved_datoms",
             options.format.clone(),
             options.as_of,
             ruleset,
         );
+
         let final_df = planner.plan(&ast).await?;
 
-        Ok(final_df.collect().await.unwrap_or_default())
+        // Explicit error propagation to prevent silent failures
+        let batches = final_df
+            .collect()
+            .await
+            .map_err(crate::error::MesoError::DataFusion)?;
+        Ok(batches)
     }
 
     pub async fn query_native(
@@ -409,6 +489,7 @@ pub struct AttributeDefinition {
     pub is_unique: bool,
 }
 
+// --- TESTS ---
 #[cfg(test)]
 mod tests {
     use super::*;
