@@ -5,14 +5,12 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Default, Clone)]
 pub struct IndexManager {
-    /// EAVT Index: Entity -> Attribute -> Value
-    /// Used by the Transactor to find the "current" value of an attribute
-    /// so it can close its bitemporal interval when a new value is asserted.
-    eavt: BTreeMap<EntityId, BTreeMap<AttributeId, Value>>,
+    /// 4D EAVT Index: Entity -> Attribute -> ValidTime -> Option<Value>
+    /// A `None` value represents a retraction (closing the bitemporal interval).
+    eavt: BTreeMap<EntityId, BTreeMap<AttributeId, BTreeMap<i64, Option<Value>>>>,
 
-    /// Tracks unique constraints: (AttributeId, Value) -> EntityId
-    /// Used by the Transactor for O(1) collision detection.
-    unique_index: BTreeMap<(AttributeId, Value), EntityId>,
+    /// 4D Unique Index: (AttributeId, Value) -> ValidTime -> Option<EntityId>
+    unique_index: BTreeMap<(AttributeId, Value), BTreeMap<i64, Option<EntityId>>>,
 }
 
 impl IndexManager {
@@ -20,40 +18,101 @@ impl IndexManager {
         Self::default()
     }
 
-    /// Records a new active datom in the writer's memory state.
-    pub fn insert(&mut self, e: EntityId, a: AttributeId, v: Value, is_unique: bool) {
-        self.eavt.entry(e).or_default().insert(a, v.clone());
+    pub fn insert(
+        &mut self,
+        e: EntityId,
+        a: AttributeId,
+        v: Value,
+        is_unique: bool,
+        valid_time: i64,
+    ) {
+        self.eavt
+            .entry(e)
+            .or_default()
+            .entry(a)
+            .or_default()
+            .insert(valid_time, Some(v.clone()));
         if is_unique {
-            self.unique_index.insert((a, v), e);
+            self.unique_index
+                .entry((a, v))
+                .or_default()
+                .insert(valid_time, Some(e));
         }
     }
 
-    /// Removes a datom from the writer's memory state (e.g., during a retraction).
-    pub fn remove(&mut self, e: EntityId, a: AttributeId, v: &Value, is_unique: bool) {
-        if let Some(attrs) = self.eavt.get_mut(&e) {
-            if let Some(existing_v) = attrs.get(&a)
-                && existing_v == v
-            {
-                attrs.remove(&a);
-            }
-            // Cleanup empty maps to prevent memory leaks
-            if attrs.is_empty() {
-                self.eavt.remove(&e);
-            }
-        }
+    pub fn remove(
+        &mut self,
+        e: EntityId,
+        a: AttributeId,
+        v: &Value,
+        is_unique: bool,
+        valid_time: i64,
+    ) {
+        // We append `None` to the timeline to officially close the interval at `valid_time`.
+        self.eavt
+            .entry(e)
+            .or_default()
+            .entry(a)
+            .or_default()
+            .insert(valid_time, None);
         if is_unique {
-            self.unique_index.remove(&(a, v.clone()));
+            self.unique_index
+                .entry((a, v.clone()))
+                .or_default()
+                .insert(valid_time, None);
         }
     }
 
-    /// Fast lookup to see what value an entity currently holds for an attribute.
+    pub fn get_value_at(&self, e: EntityId, a: AttributeId, valid_time: i64) -> Option<&Value> {
+        self.eavt
+            .get(&e)
+            .and_then(|attrs| attrs.get(&a))
+            .and_then(|timeline| timeline.range(..=valid_time).next_back())
+            .and_then(|(_, opt_v)| opt_v.as_ref())
+    }
+
+    pub fn get_owner_of_unique_at(
+        &self,
+        a: AttributeId,
+        v: &Value,
+        valid_time: i64,
+    ) -> Option<EntityId> {
+        self.unique_index
+            .get(&(a, v.clone()))
+            .and_then(|timeline| timeline.range(..=valid_time).next_back())
+            .and_then(|(_, opt_e)| opt_e.as_ref())
+            .copied()
+    }
+
+    /// Convenience method: gets the latest known value by querying at the end of time.
     pub fn get_current_value(&self, e: EntityId, a: AttributeId) -> Option<&Value> {
-        self.eavt.get(&e).and_then(|attrs| attrs.get(&a))
+        self.get_value_at(e, a, i64::MAX)
     }
 
-    /// Fast lookup to see who owns a unique value.
+    /// Convenience method: gets the latest known owner by querying at the end of time.
     pub fn get_owner_of_unique(&self, a: AttributeId, v: &Value) -> Option<EntityId> {
-        self.unique_index.get(&(a, v.clone())).copied()
+        self.get_owner_of_unique_at(a, v, i64::MAX)
+    }
+
+    /// SQL:2011 WITHOUT OVERLAPS validation.
+    /// Checks if asserting a unique value at `valid_time` would overlap with someone else's future claim.
+    pub fn get_future_unique_conflict(
+        &self,
+        a: AttributeId,
+        v: &Value,
+        requester: EntityId,
+        valid_time: i64,
+    ) -> Option<EntityId> {
+        if let Some(timeline) = self.unique_index.get(&(a, v.clone())) {
+            for (_, opt_owner) in timeline.range(valid_time..) {
+                if let Some(owner) = opt_owner
+                    && *owner != requester
+                {
+                    return Some(*owner);
+                }
+            }
+        }
+        None
     }
 }
 
@@ -64,8 +123,8 @@ mod tests {
     #[test]
     fn test_index_insert_and_get_current() {
         let mut idx = IndexManager::new();
-        idx.insert(1, 10, Value::String("Alice".into()), false);
-        idx.insert(1, 11, Value::Int64(30), false);
+        idx.insert(1, 10, Value::String("Alice".into()), false, 100);
+        idx.insert(1, 11, Value::Int64(30), false, 100);
 
         assert_eq!(
             idx.get_current_value(1, 10),
@@ -82,7 +141,7 @@ mod tests {
         let email_val = Value::String("alice@example.com".into());
 
         // Insert unique value
-        idx.insert(1, email_attr, email_val.clone(), true);
+        idx.insert(1, email_attr, email_val.clone(), true, 100);
 
         // Check owner
         assert_eq!(idx.get_owner_of_unique(email_attr, &email_val), Some(1));
@@ -95,22 +154,29 @@ mod tests {
     }
 
     #[test]
-    fn test_index_removal_and_cleanup() {
+    fn test_index_removal_and_bitemporal_tombstones() {
         let mut idx = IndexManager::new();
-        idx.insert(2, 20, Value::Int64(100), true);
+        // Insert at T=100
+        idx.insert(2, 20, Value::Int64(100), true, 100);
 
-        // Ensure it's there
+        // Ensure it's there presently
         assert_eq!(idx.get_current_value(2, 20), Some(&Value::Int64(100)));
         assert_eq!(idx.get_owner_of_unique(20, &Value::Int64(100)), Some(2));
 
-        // Remove it
-        idx.remove(2, 20, &Value::Int64(100), true);
+        // Retract at T=200
+        idx.remove(2, 20, &Value::Int64(100), true, 200);
 
-        // Ensure it's gone from both EAVT and Unique Index
+        // Ensure it's gone from the PRESENT
         assert_eq!(idx.get_current_value(2, 20), None);
         assert_eq!(idx.get_owner_of_unique(20, &Value::Int64(100)), None);
 
-        // Ensure the empty EAVT map for Entity 2 was cleaned up to save memory
-        assert!(!idx.eavt.contains_key(&2));
+        // Prove bitemporality: The entity map MUST still exist to preserve history
+        assert!(
+            idx.eavt.contains_key(&2),
+            "Entity map must survive to preserve history"
+        );
+
+        // Prove time travel: The value was still active at T=150!
+        assert_eq!(idx.get_value_at(2, 20, 150), Some(&Value::Int64(100)));
     }
 }

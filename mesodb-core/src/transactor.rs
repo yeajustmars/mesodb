@@ -45,9 +45,21 @@ impl Transactor {
                         }
                         if let Some(attr) = schema.get_by_id(datom.a) {
                             if datom.op {
-                                indices.insert(datom.e, datom.a, datom.v.clone(), attr.is_unique);
+                                indices.insert(
+                                    datom.e,
+                                    datom.a,
+                                    datom.v.clone(),
+                                    attr.is_unique,
+                                    datom.valid_from,
+                                );
                             } else {
-                                indices.remove(datom.e, datom.a, &datom.v, attr.is_unique);
+                                indices.remove(
+                                    datom.e,
+                                    datom.a,
+                                    &datom.v,
+                                    attr.is_unique,
+                                    datom.valid_from,
+                                );
                             }
                         }
                     }
@@ -198,7 +210,9 @@ impl Transactor {
 
             // --- CAS VALIDATION ---
             if let Some(expected_v) = &fact.cas_old_v {
-                let current_v = self.indices.get_current_value(fact.e, attr_id);
+                let current_v = self
+                    .indices
+                    .get_value_at(fact.e, attr_id, resolved_valid_time);
                 let current_matches = match current_v {
                     Some(v) => v == expected_v,
                     None => false, // Standard CAS requires the old value to exist
@@ -216,7 +230,10 @@ impl Transactor {
                 // Assertions
                 if is_unique {
                     let key = (attr_id, fact.v.clone());
-                    if let Some(owner) = self.indices.get_owner_of_unique(attr_id, &fact.v)
+
+                    if let Some(owner) =
+                        self.indices
+                            .get_owner_of_unique_at(attr_id, &fact.v, resolved_valid_time)
                         && owner != fact.e
                     {
                         return Err(MesoError::UniqueConstraintViolation {
@@ -225,6 +242,19 @@ impl Transactor {
                             owner,
                         });
                     }
+                    if let Some(future_owner) = self.indices.get_future_unique_conflict(
+                        attr_id,
+                        &fact.v,
+                        fact.e,
+                        resolved_valid_time,
+                    ) {
+                        return Err(MesoError::UniqueConstraintViolation {
+                            attr: fact.ident,
+                            value: fact.v.to_string(),
+                            owner: future_owner,
+                        });
+                    }
+
                     if !batch_uniques.insert(key) {
                         return Err(MesoError::Serialization(format!(
                             "Duplicate unique in batch: {}",
@@ -234,7 +264,10 @@ impl Transactor {
                 }
 
                 // THE BITEMPORAL FIX: Retract existing value if it differs
-                if let Some(existing_v) = self.indices.get_current_value(fact.e, attr_id) {
+                if let Some(existing_v) =
+                    self.indices
+                        .get_value_at(fact.e, attr_id, resolved_valid_time)
+                {
                     if existing_v != &fact.v {
                         pending_datoms.push(Datom::retract(
                             fact.e,
@@ -257,7 +290,9 @@ impl Transactor {
                 ));
             } else {
                 // Retractions
-                if let Some(existing_v) = self.indices.get_current_value(fact.e, attr_id)
+                if let Some(existing_v) =
+                    self.indices
+                        .get_value_at(fact.e, attr_id, resolved_valid_time)
                     && existing_v == &fact.v
                 {
                     pending_datoms.push(Datom::retract(
@@ -283,10 +318,16 @@ impl Transactor {
         for datom in &pending_datoms {
             let is_unique = self.schema.get_by_id(datom.a).unwrap().is_unique;
             if datom.op {
-                self.indices
-                    .insert(datom.e, datom.a, datom.v.clone(), is_unique);
+                self.indices.insert(
+                    datom.e,
+                    datom.a,
+                    datom.v.clone(),
+                    is_unique,
+                    datom.valid_from,
+                );
             } else {
-                self.indices.remove(datom.e, datom.a, &datom.v, is_unique);
+                self.indices
+                    .remove(datom.e, datom.a, &datom.v, is_unique, datom.valid_from);
             }
             tx_memtable.append(datom.clone());
         }
@@ -832,6 +873,61 @@ mod tests {
             implicit_now,
             past_2,
             future_2
+        );
+    }
+
+    #[test]
+    fn test_bitemporal_contextual_uniqueness() {
+        let (mut t, _f) = setup_transactor();
+
+        // 1. Alice claims an email starting at T=100
+        t.transact(vec![Fact {
+            e: 1,
+            ident: ":user/email".into(),
+            v: Value::String("context@test.com".into()),
+            op: true,
+            cas_old_v: None,
+            valid_time: Some(100),
+        }])
+        .unwrap();
+
+        // 2. Alice retracts the email at T=200
+        t.transact(vec![Fact {
+            e: 1,
+            ident: ":user/email".into(),
+            v: Value::String("context@test.com".into()),
+            op: false,
+            cas_old_v: None,
+            valid_time: Some(200),
+        }])
+        .unwrap();
+
+        // 3. Bob attempts to claim the email retroactively at T=150 (OVERLAP! Alice owns it 100-200)
+        let bad_overlap = t.transact(vec![Fact {
+            e: 2,
+            ident: ":user/email".into(),
+            v: Value::String("context@test.com".into()),
+            op: true,
+            cas_old_v: None,
+            valid_time: Some(150),
+        }]);
+        assert!(
+            bad_overlap.is_err(),
+            "Must prevent overlapping claims inside an active interval"
+        );
+
+        // 4. Bob claims the email at T=250 (NO OVERLAP! Alice freed it at 200)
+        let valid_claim = t.transact(vec![Fact {
+            e: 2,
+            ident: ":user/email".into(),
+            v: Value::String("context@test.com".into()),
+            op: true,
+            cas_old_v: None,
+            valid_time: Some(250),
+        }]);
+        assert!(
+            valid_claim.is_ok(),
+            "Must allow claiming a unique value after it was freed in the timeline"
         );
     }
 }
