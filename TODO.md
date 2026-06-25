@@ -44,3 +44,25 @@ Push to v0.2: Transaction Functions. Your atomic CAS implementation is highly ca
 
 Do it NOW: Reified Transactions. Because your tx_id is a u64 and your EntityId is a u64, the math aligns perfectly. Being able to tag transactions with a :tx/author or :tx/message makes your new History API infinitely more useful for auditing.
 ```
+
+# Potential Traps & General 'Watch out for'
+
+```
+The Honest Architectural Audit: What to Watch out For
+Since we are keeping our hands off the keyboard tonight, let's look at the hidden corners of the codebase where technical debt or scaling traps might be lurking:
+
+1. The Compactor Memory Horizon (The OOM Trap)
+Right now, our BackgroundCompactor::compact loads all targeted Parquet files into memory to run the LEAD() window function. While this is incredibly fast for our current benchmarks, if the background thread tries to compact 50GB of raw historical fragments at once, DataFusion will pull all of it into RAM to perform the sort.
+
+The Verdict: We don't need to change this yet, but as the database scales, we will eventually need to introduce Entity Sharding/Partitioning so the compactor only processes chunks of entities at a time.
+
+2. The i64::MAX Magic Number Drift
+In our new SQL query router, we hardcoded 9223372036854775807 directly into the SQL string to represent the "End of Time."
+
+The Verdict: This is safe for now, but magic numbers have a habit of drifting. When we regroup, we should clean this up by defining a global constant (e.g., const END_OF_TIME: i64 = i64::MAX;) and interpolating it cleanly into the SQL.
+
+3. Retroactive Writes vs. Future Schema Rules
+Because the Transactor now supports true 4D time-travel, it’s possible to write a fact at ValidTime = 2020. But what happens if you introduced a schema uniqueness constraint in 2024?
+
+The Verdict: Our current unique timeline validation handles this beautifully via the IndexManager, but we need to ensure our integration tests rigorously cover these temporal schema paradoxes.
+```
