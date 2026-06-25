@@ -1,5 +1,3 @@
-// mesodb-core/src/storage.rs
-
 use arrow::record_batch::RecordBatch;
 use datafusion::dataframe::DataFrameWriteOptions;
 use datafusion::prelude::*;
@@ -17,19 +15,14 @@ pub struct BackgroundCompactor {
 
 impl BackgroundCompactor {
     pub fn new(data_dir: PathBuf) -> Self {
-        // 1. Ensure the base data directory exists
         std::fs::create_dir_all(&data_dir).expect("Failed to create base data directory");
-
-        // 2. Ensure the parquet subdirectory exists for isolated unit tests
         std::fs::create_dir_all(data_dir.join("parquet"))
             .expect("Failed to create parquet subdirectory");
 
         Self { data_dir }
     }
 
-    /// Writes a single RecordBatch to a unique Parquet file.
     pub fn flush_to_parquet(&self, batch: RecordBatch, tx_id: u64) -> Result<PathBuf> {
-        // Explicitly route the file destination straight into the pre-made parquet sub-folder
         let file_path = self
             .data_dir
             .join("parquet")
@@ -40,7 +33,6 @@ impl BackgroundCompactor {
             .set_compression(parquet::basic::Compression::SNAPPY)
             .build();
 
-        // Map parquet errors to our Serialization error if you haven't added a Parquet variant yet
         let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))
             .map_err(|e| MesoError::Serialization(format!("Parquet error: {}", e)))?;
 
@@ -55,7 +47,9 @@ impl BackgroundCompactor {
         Ok(file_path)
     }
 
-    /// Merges multiple parquet files into a single optimized file using DataFusion.
+    /// OPTION A BITEMPORAL COMPACTION
+    /// Merges multiple parquet files, mathematically resolves the bitemporal valid_to bounds,
+    /// and strips the op=false rows to maximize Point-in-Time read throughput.
     pub async fn compact(&self, file_paths: &[PathBuf], output_id: u64) -> Result<PathBuf> {
         let ctx = SessionContext::new();
         let output_path = self
@@ -67,14 +61,34 @@ impl BackgroundCompactor {
             .map(|p| p.to_string_lossy().to_string())
             .collect::<Vec<String>>();
 
+        // 1. Read all the fragmented files into a single DataFrame
         let df = ctx.read_parquet(paths, Default::default()).await?;
+        ctx.register_table("raw_fragments", df.into_view())?;
 
-        // Write out to a single file to prevent folder fragmentation
+        // 2. The Iceberg Resolution (Option A)
+        let sql = r#"
+            WITH bounds AS (
+                SELECT *,
+                       LEAD(valid_from) OVER (PARTITION BY e, a ORDER BY valid_from ASC, t ASC, op ASC) as next_from
+                FROM raw_fragments
+            )
+            SELECT
+                e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid, t, op, valid_from,
+                COALESCE(next_from, valid_to) as valid_to
+            FROM bounds
+            WHERE op = true
+        "#;
+
+        // Execute the transformation
+        let compacted_df = ctx.sql(sql).await.map_err(|e| MesoError::DataFusion(e))?;
+
+        // 3. Write the mathematically pure result out to a single file
         let write_options = DataFrameWriteOptions::default().with_single_file_output(true);
-        df.write_parquet(output_path.to_str().unwrap(), write_options, None)
+        compacted_df
+            .write_parquet(output_path.to_str().unwrap(), write_options, None)
             .await?;
 
-        // Cleanup the old, fragmented files
+        // 4. Cleanup the old, fragmented files
         for path in file_paths {
             let _ = std::fs::remove_file(path);
         }
@@ -106,7 +120,7 @@ mod tests {
         let batch2 = mt2.finish().unwrap();
 
         // 2. Flush them to disk independently
-        let path1 = compactor.flush_to_parquet(batch1, 1).unwrap();
+        let path1 = compactor.flush_to_parquet(batch1.clone(), 1).unwrap();
         let path2 = compactor.flush_to_parquet(batch2, 2).unwrap();
 
         assert!(path1.exists());
@@ -122,7 +136,53 @@ mod tests {
         assert!(!path1.exists(), "Original file 1 should be deleted");
         assert!(!path2.exists(), "Original file 2 should be deleted");
 
-        // 4. Verify the compacted file has both rows
+        // 4. Verify the Compaction Results
+        let ctx = SessionContext::new();
+
+        // Explicitly load the schema from the MemTable batch to prevent Arrow downcast panics
+        let schema = batch1.schema();
+        let pq_options = datafusion::prelude::ParquetReadOptions::default().schema(schema.as_ref());
+
+        ctx.register_parquet("compacted", compacted_path.to_str().unwrap(), pq_options)
+            .await
+            .unwrap();
+
+        let df = ctx.sql("SELECT * FROM compacted").await.unwrap();
+        let results = df.collect().await.unwrap();
+
+        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows, 2);
+    }
+
+    #[tokio::test]
+    async fn test_option_a_bitemporal_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let compactor = BackgroundCompactor::new(dir.path().to_path_buf());
+
+        // 1. T=100: Assert Alice
+        let mut mt1 = MemTable::new(10);
+        mt1.append(Datom::assert(1, 10, Value::String("Alice".into()), 1, 100));
+        let batch1 = mt1.finish().unwrap();
+
+        // 2. T=200: Overwrite with Alice-Revised (Emits a Retract + Assert)
+        let mut mt2 = MemTable::new(10);
+        mt2.append(Datom::retract(1, 10, Value::String("Alice".into()), 2, 200));
+        mt2.append(Datom::assert(
+            1,
+            10,
+            Value::String("Alice-Revised".into()),
+            2,
+            200,
+        ));
+        let batch2 = mt2.finish().unwrap();
+
+        let path1 = compactor.flush_to_parquet(batch1, 1).unwrap();
+        let path2 = compactor.flush_to_parquet(batch2, 2).unwrap();
+
+        // 3. Execute the Option A Compaction
+        let compacted_path = compactor.compact(&[path1, path2], 3).await.unwrap();
+
+        // 4. Verify the Compaction Results
         let ctx = SessionContext::new();
         ctx.register_parquet(
             "compacted",
@@ -132,10 +192,46 @@ mod tests {
         .await
         .unwrap();
 
-        let df = ctx.sql("SELECT * FROM compacted").await.unwrap();
+        let df = ctx
+            .sql("SELECT valid_from, valid_to, v_str FROM compacted ORDER BY valid_from ASC")
+            .await
+            .unwrap();
         let results = df.collect().await.unwrap();
 
-        let total_rows: usize = results.iter().map(|b| b.num_rows()).sum();
-        assert_eq!(total_rows, 2);
+        let batch = &results[0];
+
+        // Use arrow compute casts to force DataFusion's optimized physical types back to our expected Rust types
+        let from_cast =
+            arrow::compute::cast(batch.column(0), &arrow::datatypes::DataType::Int64).unwrap();
+        let to_cast =
+            arrow::compute::cast(batch.column(1), &arrow::datatypes::DataType::Int64).unwrap();
+        let val_cast =
+            arrow::compute::cast(batch.column(2), &arrow::datatypes::DataType::Utf8).unwrap();
+
+        let from_col = from_cast
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        let to_col = to_cast
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        let val_col = val_cast
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+
+        // Under Option A, the Retraction row MUST be stripped, leaving exactly 2 perfect intervals
+        assert_eq!(batch.num_rows(), 2);
+
+        // Interval 1: Alice (Active from 100 -> 200)
+        assert_eq!(val_col.value(0), "Alice");
+        assert_eq!(from_col.value(0), 100);
+        assert_eq!(to_col.value(0), 200);
+
+        // Interval 2: Alice-Revised (Active from 200 -> End of Time)
+        assert_eq!(val_col.value(1), "Alice-Revised");
+        assert_eq!(from_col.value(1), 200);
+        assert_eq!(to_col.value(1), i64::MAX);
     }
 }

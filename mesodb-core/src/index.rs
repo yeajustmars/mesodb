@@ -1,16 +1,17 @@
 // mesodb-core/src/index.rs
 
 use crate::types::{AttributeId, EntityId, Value};
+use ahash::AHashMap;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Default, Clone)]
 pub struct IndexManager {
-    /// 4D EAVT Index: Entity -> Attribute -> ValidTime -> Option<Value>
+    /// Flattened 4D EAVT Index: (EntityId, AttributeId) -> ValidTime -> Option<Value>
     /// A `None` value represents a retraction (closing the bitemporal interval).
-    eavt: BTreeMap<EntityId, BTreeMap<AttributeId, BTreeMap<i64, Option<Value>>>>,
+    pub eavt: AHashMap<(EntityId, AttributeId), BTreeMap<i64, Option<Value>>>,
 
-    /// 4D Unique Index: (AttributeId, Value) -> ValidTime -> Option<EntityId>
-    unique_index: BTreeMap<(AttributeId, Value), BTreeMap<i64, Option<EntityId>>>,
+    /// Flattened 4D Unique Index: (AttributeId, Value) -> ValidTime -> Option<EntityId>
+    pub unique_index: AHashMap<(AttributeId, Value), BTreeMap<i64, Option<EntityId>>>,
 }
 
 impl IndexManager {
@@ -27,9 +28,7 @@ impl IndexManager {
         valid_time: i64,
     ) {
         self.eavt
-            .entry(e)
-            .or_default()
-            .entry(a)
+            .entry((e, a))
             .or_default()
             .insert(valid_time, Some(v.clone()));
         if is_unique {
@@ -50,9 +49,7 @@ impl IndexManager {
     ) {
         // We append `None` to the timeline to officially close the interval at `valid_time`.
         self.eavt
-            .entry(e)
-            .or_default()
-            .entry(a)
+            .entry((e, a))
             .or_default()
             .insert(valid_time, None);
         if is_unique {
@@ -65,8 +62,7 @@ impl IndexManager {
 
     pub fn get_value_at(&self, e: EntityId, a: AttributeId, valid_time: i64) -> Option<&Value> {
         self.eavt
-            .get(&e)
-            .and_then(|attrs| attrs.get(&a))
+            .get(&(e, a))
             .and_then(|timeline| timeline.range(..=valid_time).next_back())
             .and_then(|(_, opt_v)| opt_v.as_ref())
     }
@@ -84,18 +80,7 @@ impl IndexManager {
             .copied()
     }
 
-    /// Convenience method: gets the latest known value by querying at the end of time.
-    pub fn get_current_value(&self, e: EntityId, a: AttributeId) -> Option<&Value> {
-        self.get_value_at(e, a, i64::MAX)
-    }
-
-    /// Convenience method: gets the latest known owner by querying at the end of time.
-    pub fn get_owner_of_unique(&self, a: AttributeId, v: &Value) -> Option<EntityId> {
-        self.get_owner_of_unique_at(a, v, i64::MAX)
-    }
-
     /// SQL:2011 WITHOUT OVERLAPS validation.
-    /// Checks if asserting a unique value at `valid_time` would overlap with someone else's future claim.
     pub fn get_future_unique_conflict(
         &self,
         a: AttributeId,
@@ -113,6 +98,16 @@ impl IndexManager {
             }
         }
         None
+    }
+
+    /// Convenience method: gets the latest known value by querying at the end of time.
+    pub fn get_current_value(&self, e: EntityId, a: AttributeId) -> Option<&Value> {
+        self.get_value_at(e, a, i64::MAX)
+    }
+
+    /// Convenience method: gets the latest known owner by querying at the end of time.
+    pub fn get_owner_of_unique(&self, a: AttributeId, v: &Value) -> Option<EntityId> {
+        self.get_owner_of_unique_at(a, v, i64::MAX)
     }
 }
 
@@ -172,8 +167,8 @@ mod tests {
 
         // Prove bitemporality: The entity map MUST still exist to preserve history
         assert!(
-            idx.eavt.contains_key(&2),
-            "Entity map must survive to preserve history"
+            idx.eavt.contains_key(&(2, 20)),
+            "Timeline map must survive to preserve history"
         );
 
         // Prove time travel: The value was still active at T=150!
