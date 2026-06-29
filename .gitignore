@@ -12,8 +12,5 @@ assets/.!*
 **.swp
 **.swo
 **mesodb_history.txt
-<<<<<<< HEAD
 **ipynb_checkpoints**
-=======
 data/
->>>>>>> cd09600dad9e5314525da714e78d9363af59f302
