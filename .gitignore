@@ -12,3 +12,4 @@ assets/.!*
 **.swp
 **.swo
 **mesodb_history.txt
+**ipynb_checkpoints**
