@@ -164,7 +164,7 @@ impl MesoDB {
             }
 
             // --- THE COMPACTION COMPLIANCE THRESHOLD ---
-            if report.batch.num_rows() >= 50_000
+            if report.batch.num_rows() >= tx.config.storage.memtable_max_rows
                 && self
                     .flush_tx
                     .send((report.tx_id, report.batch.clone()))
