@@ -84,7 +84,7 @@ async fn test_deep_retroactive_retrofitting() {
     let mut schema = SchemaMap::new();
     schema.add_attribute(":sys/status", ValueType::String, false);
 
-    let mut t = Transactor::new(dir.path().join("wal.db"), schema, Config::default()).unwrap();
+    let (mut t, _) = Transactor::new(dir.path().join("wal.db"), schema, Config::default()).unwrap();
 
     // 1. Assert Current State (T = 5000)
     t.transact_at(
