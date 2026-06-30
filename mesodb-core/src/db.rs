@@ -27,17 +27,23 @@ impl MesoDB {
     pub fn open<P: AsRef<Path>>(path: P, schema: SchemaMap, config: Config) -> Result<Self> {
         let data_dir = path.as_ref().parent().unwrap().to_path_buf();
         create_dir_all(&data_dir)?;
-
-        // Create the parquet sub-directory synchronously right here at startup
         create_dir_all(data_dir.join("parquet"))?;
 
-        let transactor = Transactor::new(path, schema.clone(), config.clone())?;
+        // Destructure the tuple to grab the recovered RAM batch
+        let (transactor, recovered_batch) = Transactor::new(path, schema.clone(), config.clone())?;
 
-        // We always keep a "TxId 0" empty batch in RAM so DataFusion always knows the schema,
-        // even if no data has been inserted or everything has been flushed to disk.
-        let empty_batch = crate::memtable::MemTable::new(0).finish()?;
         let mut initial_ram = BTreeMap::new();
+        let empty_batch = crate::memtable::MemTable::new(0).finish()?;
         initial_ram.insert(0, empty_batch);
+
+        // If we recovered uncompacted data, mount it. Otherwise, mount an empty schema batch.
+        if recovered_batch.num_rows() > 0 {
+            // Use the current_tx_id as the key so the background flusher can eventually process it
+            initial_ram.insert(transactor.current_tx_id, recovered_batch);
+        } else {
+            let empty_batch = crate::memtable::MemTable::new(0).finish()?;
+            initial_ram.insert(0, empty_batch);
+        }
 
         let world_view = Arc::new(RwLock::new(Arc::new(WorldView {
             ram_batches: Arc::new(initial_ram),
@@ -46,7 +52,6 @@ impl MesoDB {
             timeline: Arc::new(transactor.timeline.clone()),
         })));
 
-        // Spawn the asynchronous background compactor
         let (flush_tx, flush_rx) = mpsc::channel(config.compactor.backpressure_threshold);
         Self::spawn_background_worker(data_dir, flush_rx, world_view.clone());
 

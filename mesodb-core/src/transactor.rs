@@ -25,16 +25,21 @@ pub struct Transactor {
 }
 
 impl Transactor {
-    pub fn new<P: AsRef<Path>>(wal_path: P, mut schema: SchemaMap, config: Config) -> Result<Self> {
+    pub fn new<P: AsRef<Path>>(
+        wal_path: P,
+        mut schema: SchemaMap,
+        config: Config,
+    ) -> Result<(Self, RecordBatch)> {
         let mut wal = Wal::open(wal_path)?;
         let mut indices = IndexManager::new();
         let mut current_tx_id = 1;
         let mut timeline = SchemaTimeline::new();
 
-        // Baseline whatever schema was passed in
         timeline.append_version(0, 0, schema.clone());
 
-        // Rebuild memory indices and timeline from the WAL
+        // NEW: Initialize a MemTable to rebuild uncompacted RAM state
+        let mut recovery_memtable = MemTable::new(10_000);
+
         let recovered_entries = wal.recover()?;
         for entry in recovered_entries {
             match entry {
@@ -62,6 +67,8 @@ impl Transactor {
                                 );
                             }
                         }
+                        // NEW: Push the recovered datom into RAM
+                        recovery_memtable.append(datom);
                     }
                 }
                 WalEntry::SchemaMutation(mutation) => match mutation {
@@ -80,16 +87,21 @@ impl Transactor {
             }
         }
 
-        Ok(Self {
-            config,
-            wal,
-            schema,
-            timeline,
-            indices,
-            current_tx_id,
-        })
-    }
+        // NEW: Seal the recovered batch
+        let recovered_batch = recovery_memtable.finish()?;
 
+        Ok((
+            Self {
+                config,
+                wal,
+                schema,
+                timeline,
+                indices,
+                current_tx_id,
+            },
+            recovered_batch,
+        ))
+    }
     pub fn transact_schema(
         &mut self,
         ident: &str,
@@ -374,7 +386,10 @@ mod tests {
         schema.add_attribute(":user/name", ValueType::String, false);
         schema.add_attribute(":user/email", ValueType::String, true);
         let config = Config::default();
-        let transactor = Transactor::new(temp_file.path(), schema, config).unwrap();
+
+        // SURGICAL FIX: Add `(transactor, _)`
+        let (transactor, _) = Transactor::new(temp_file.path(), schema, config).unwrap();
+
         (transactor, temp_file)
     }
 
@@ -524,7 +539,7 @@ mod tests {
 
         // 1. Boot fresh transactor and transact a totally unknown attribute
         {
-            let mut t =
+            let (mut t, _) =
                 Transactor::new(temp_file.path(), SchemaMap::new(), config.clone()).unwrap();
             t.transact(vec![Fact {
                 e: 1,
@@ -542,7 +557,8 @@ mod tests {
 
         // 2. Re-open from the exact same WAL file
         {
-            let t_recovered = Transactor::new(temp_file.path(), SchemaMap::new(), config).unwrap();
+            let (t_recovered, _) =
+                Transactor::new(temp_file.path(), SchemaMap::new(), config).unwrap();
 
             // If the SchemaMutation wasn't durable, this would fail!
             assert!(t_recovered.schema.contains_ident(":new/jit_attr"));
