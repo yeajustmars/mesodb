@@ -63,6 +63,7 @@ pub async fn handle_transact(
             v: core_value,
             op: wire.op,
             cas_old_v: core_cas,
+            valid_time: None,
         });
     }
 
@@ -102,6 +103,7 @@ pub async fn handle_query(
         as_of: payload.as_of,
         rules: payload.rules.clone(),
         format: mesodb_core::db::OutputFormat::Json,
+        history: false,
     };
 
     // Use the new options-aware JSON pipeline!
