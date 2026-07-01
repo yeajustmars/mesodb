@@ -38,10 +38,13 @@ async fn main() -> color_eyre::Result<()> {
         .with_state(db);
 
     // Bind and serve using standard tokio tools
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8080));
+    let addr = SocketAddr::from(([127, 0, 0, 1], 8000));
     tracing::info!("MesoDB Server online and running at http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
+
+    println!("MesoDB Server is running at http://{}", addr);
+
     axum::serve(listener, app).await?;
 
     Ok(())
