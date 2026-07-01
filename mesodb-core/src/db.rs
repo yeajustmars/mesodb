@@ -908,7 +908,10 @@ mod tests {
                                [?order :order/total ?total]]"#;
 
         let results = db.query(query).await.unwrap();
-        let batch = &results[0];
+        // Unify all partitions into a single RecordBatch before downcasting.
+        let schema = results[0].schema();
+        let batch =
+            arrow::compute::concat_batches(&schema, &results).expect("Failed to concat batches");
 
         // We expect two rows (one for User 1, one for User 2)
         assert_eq!(batch.num_rows(), 2);
