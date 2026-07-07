@@ -60,7 +60,7 @@ impl SchemaTimeline {
         self.latest_tx = tx_id;
     }
 
-    /// NEW: Converts a wall-clock microsecond timestamp into the active TxId
+    /// Converts a wall-clock microsecond timestamp into the active TxId
     pub fn tx_for_timestamp(&self, timestamp: i64) -> u64 {
         self.time_index
             .range(..=timestamp)

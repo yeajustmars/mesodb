@@ -6,11 +6,11 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Default, Clone)]
 pub struct IndexManager {
-    /// Flattened 4D EAVT Index: (EntityId, AttributeId) -> ValidTime -> Option<Value>
+    /// Flattened EAVT Index: (EntityId, AttributeId) -> `ValidTime` -> `Option<Value>`
     /// A `None` value represents a retraction (closing the bitemporal interval).
     pub eavt: AHashMap<(EntityId, AttributeId), BTreeMap<i64, Option<Value>>>,
 
-    /// Flattened 4D Unique Index: (AttributeId, Value) -> ValidTime -> Option<EntityId>
+    /// Flattened Unique Index: (AttributeId, Value) -> `ValidTime` -> `Option<EntityId>`
     pub unique_index: AHashMap<(AttributeId, Value), BTreeMap<i64, Option<EntityId>>>,
 }
 
