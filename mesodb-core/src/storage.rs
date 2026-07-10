@@ -80,7 +80,7 @@ impl BackgroundCompactor {
         "#;
 
         // Execute the transformation
-        let compacted_df = ctx.sql(sql).await.map_err(|e| MesoError::DataFusion(e))?;
+        let compacted_df = ctx.sql(sql).await.map_err(MesoError::DataFusion)?;
 
         // 3. Write the mathematically pure result out to a single file
         let write_options = DataFrameWriteOptions::default().with_single_file_output(true);

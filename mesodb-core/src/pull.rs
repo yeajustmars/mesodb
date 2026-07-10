@@ -4,7 +4,11 @@ use arrow::array::Array;
 use arrow::array::StringArray;
 use datafusion::prelude::*;
 use serde_json::{Map, Value as JsonValue};
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    pin::Pin,
+};
 
 use crate::ast::{PullAttribute, PullPattern};
 use crate::db::OutputFormat;
@@ -17,6 +21,12 @@ pub struct PullEngine<'a> {
     format: &'a OutputFormat,
     as_of: Option<i64>,
 }
+
+type EntityMap = HashMap<u64, Map<String, JsonValue>>;
+
+// 2. Define the alias for the Pin<Box<dyn Future>>
+type PullEntitiesFuture<'b> =
+    Pin<Box<dyn Future<Output = Result<EntityMap, MesoError>> + Send + 'b>>;
 
 impl<'a> PullEngine<'a> {
     pub fn new(
@@ -66,14 +76,7 @@ impl<'a> PullEngine<'a> {
         &'b self,
         e_ids: &'b [u64],
         pattern: &'b PullPattern,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<HashMap<u64, Map<String, JsonValue>>, MesoError>,
-                > + Send
-                + 'b,
-        >,
-    > {
+    ) -> PullEntitiesFuture<'b> {
         Box::pin(async move {
             if e_ids.is_empty() {
                 return Ok(HashMap::new());
@@ -232,13 +235,13 @@ impl<'a> PullEngine<'a> {
 
                 // Patch the parent documents with the retrieved JSON objects
                 for doc in docs.values_mut() {
-                    if let Some(val) = doc.get_mut(&ident) {
-                        if let Some(target_e_num) = val.as_u64() {
-                            if let Some(sub_doc) = sub_results.get(&target_e_num) {
-                                *val = JsonValue::Object(sub_doc.clone());
-                            } else {
-                                *val = JsonValue::Object(Map::new()); // Empty object if target doesn't exist
-                            }
+                    if let Some(val) = doc.get_mut(&ident)
+                        && let Some(target_e_num) = val.as_u64()
+                    {
+                        if let Some(sub_doc) = sub_results.get(&target_e_num) {
+                            *val = JsonValue::Object(sub_doc.clone());
+                        } else {
+                            *val = JsonValue::Object(Map::new()); // Empty object if target doesn't exist
                         }
                     }
                 }
@@ -253,7 +256,7 @@ impl<'a> PullEngine<'a> {
             JsonValue::Object(map) => {
                 let mut new_map = Map::new();
                 for (k, v) in map {
-                    let new_k = if k.starts_with(':') { &k[1..] } else { k };
+                    let new_k = k.strip_prefix(':').unwrap_or(k);
                     new_map.insert(new_k.to_string(), Self::strip_colons(v));
                 }
                 JsonValue::Object(new_map)

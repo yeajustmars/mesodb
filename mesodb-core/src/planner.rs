@@ -5,10 +5,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use crate::ast::{FindSpec, Query, RuleDef, RuleSet, Term, WhereClause};
-use crate::db::OutputFormat;
-use crate::error::MesoError;
-use crate::schema::SchemaTimeline;
+use crate::{
+    ast::{Binding, FindSpec, Query, RuleDef, RuleSet, Term, WhereClause},
+    db::OutputFormat,
+    error::MesoError,
+    schema::{SchemaTimeline, ValueType},
+};
 
 pub struct QueryPlanner<'a> {
     ctx: &'a SessionContext,
@@ -18,6 +20,11 @@ pub struct QueryPlanner<'a> {
     as_of: Option<i64>,
     ruleset: Option<RuleSet>,
 }
+
+type PlanPartFroms = Vec<String>;
+type PlanPartWheres = Vec<String>;
+type PlanPartVars = HashMap<String, String>;
+type PlanParts = (PlanPartFroms, PlanPartWheres, PlanPartVars);
 
 impl<'a> QueryPlanner<'a> {
     pub fn new(
@@ -38,10 +45,7 @@ impl<'a> QueryPlanner<'a> {
         }
     }
 
-    fn build_logical_plan(
-        &self,
-        clauses: &[WhereClause],
-    ) -> Result<(Vec<String>, Vec<String>, HashMap<String, String>), MesoError> {
+    fn build_logical_plan(&self, clauses: &[WhereClause]) -> Result<PlanParts, MesoError> {
         let target_tx = if let Some(t) = self.as_of {
             self.timeline.tx_for_timestamp(t)
         } else {
@@ -116,13 +120,13 @@ impl<'a> QueryPlanner<'a> {
                         Term::Variable(var_name) => {
                             let col_type = if let Some(attr) = current_attr {
                                 match attr.value_type {
-                                    crate::schema::ValueType::Boolean => "v_bool",
-                                    crate::schema::ValueType::Int64 => "v_int",
-                                    crate::schema::ValueType::Float64 => "v_float",
-                                    crate::schema::ValueType::String => "v_str",
-                                    crate::schema::ValueType::Ref => "v_ref",
-                                    crate::schema::ValueType::Timestamp => "v_time",
-                                    crate::schema::ValueType::Uuid => "v_uuid",
+                                    ValueType::Boolean => "v_bool",
+                                    ValueType::Int64 => "v_int",
+                                    ValueType::Float64 => "v_float",
+                                    ValueType::String => "v_str",
+                                    ValueType::Ref => "v_ref",
+                                    ValueType::Timestamp => "v_time",
+                                    ValueType::Uuid => "v_uuid",
                                 }
                             } else {
                                 "v_str"
@@ -247,11 +251,8 @@ impl<'a> QueryPlanner<'a> {
                     };
 
                     if let Some(b) = binding {
-                        match b {
-                            crate::ast::Binding::Scalar(var_name) => {
-                                var_to_column.insert(var_name.clone(), sql_expr);
-                            }
-                            _ => {}
+                        if let Binding::Scalar(var_name) = b {
+                            var_to_column.insert(var_name.clone(), sql_expr);
                         }
                     } else {
                         where_conditions.push(sql_expr);
@@ -273,7 +274,7 @@ impl<'a> QueryPlanner<'a> {
 
                     for (idx, clause) in or_clauses.iter().enumerate() {
                         let (sub_froms, sub_wheres, sub_vars) =
-                            self.build_logical_plan(&[clause.clone()])?;
+                            self.build_logical_plan(std::slice::from_ref(clause))?;
 
                         if idx == 0 {
                             for k in sub_vars.keys() {
@@ -456,7 +457,7 @@ impl<'a> QueryPlanner<'a> {
         if !cte_blocks.is_empty() {
             final_sql.push_str("WITH RECURSIVE ");
             final_sql.push_str(&cte_blocks.join(",\n"));
-            final_sql.push_str("\n");
+            final_sql.push('\n');
         }
 
         final_sql.push_str(&format!(

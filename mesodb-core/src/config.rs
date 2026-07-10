@@ -55,19 +55,6 @@ pub struct CompactorConfig {
     pub backpressure_threshold: usize,
 }
 
-// --- Defaults ---
-
-/*
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            storage: StorageConfig::default(),
-            compactor: CompactorConfig::default(),
-        }
-    }
-}
-*/
-
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
@@ -87,8 +74,6 @@ impl Default for CompactorConfig {
         }
     }
 }
-
-// --- Loading Logic ---
 
 impl Config {
     /// Loads a configuration from a TOML file path.

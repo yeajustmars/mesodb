@@ -27,8 +27,9 @@ impl Datom {
             t,
             op: true,
             valid_from,
-            valid_to: i64::MAX, // Assertions are valid until the end of time (or until retracted)
+            valid_to: i64::MAX,
         }
+        // Assertions are valid until the end of time (or until retracted)
     }
 
     pub fn retract(

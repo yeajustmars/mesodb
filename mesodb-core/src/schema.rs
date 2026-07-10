@@ -41,17 +41,25 @@ pub struct SchemaTimeline {
     latest_tx: u64,
 }
 
-impl SchemaTimeline {
-    pub fn new() -> Self {
+impl Default for SchemaTimeline {
+    fn default() -> Self {
         let mut versions = BTreeMap::new();
-        let mut time_index = BTreeMap::new();
         versions.insert(0, Arc::new(SchemaMap::new()));
+
+        let mut time_index = BTreeMap::new();
         time_index.insert(0, 0); // Genesis time
+
         Self {
             versions,
             time_index,
             latest_tx: 0,
         }
+    }
+}
+
+impl SchemaTimeline {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn append_version(&mut self, tx_id: u64, timestamp: i64, new_schema: SchemaMap) {

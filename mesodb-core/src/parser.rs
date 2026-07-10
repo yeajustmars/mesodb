@@ -194,7 +194,7 @@ fn parse_where_elem(where_elem: pest::iterators::Pair<Rule>) -> WhereClause {
                 terms.push(parse_term(part));
             }
 
-            let e = terms.get(0).cloned().unwrap_or(Term::Blank);
+            let e = terms.first().cloned().unwrap_or(Term::Blank);
             let a = terms.get(1).cloned().unwrap_or(Term::Blank);
             let v = terms.get(2).cloned().unwrap_or(Term::Blank);
             let tx = terms.get(3).cloned();
