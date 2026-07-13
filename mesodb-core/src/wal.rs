@@ -1,13 +1,13 @@
 use rkyv::{Archive, Deserialize, Serialize};
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::{
+    fs::File,
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+};
 
-use crate::config::WalSyncMode;
-use crate::datom::Datom;
-use crate::error::MesoError;
-use crate::schema::SchemaMutation;
-use crate::types::Result;
+use crate::{
+    config::WalSyncMode, datom::Datom, error::MesoError, schema::SchemaMutation, types::Result,
+};
 
 #[derive(Debug, Archive, Serialize, Deserialize)]
 pub enum WalEntry {

@@ -1,11 +1,13 @@
-use arrow::array::*;
-use arrow::datatypes::*;
-use arrow::record_batch::RecordBatch;
+// mesodb-core/src/memtable.rs
+
+use arrow::{array::*, datatypes::*, record_batch::RecordBatch};
 use std::sync::Arc;
 
-use crate::datom::Datom;
-use crate::error::MesoError;
-use crate::types::{Result, Value};
+use crate::{
+    datom::Datom,
+    error::MesoError,
+    types::{Result, Value},
+};
 
 #[derive(Debug)]
 pub struct MemTable {

@@ -1,5 +1,8 @@
-use crate::types::{AttributeId, EntityId, TimestampMicros, TxId, Value};
+// mesodb-core/src/dataom.rs
+
 use rkyv::{Archive, Deserialize, Serialize};
+
+use crate::types::{AttributeId, EntityId, TimestampMicros, TxId, Value};
 
 #[derive(Debug, Clone, PartialEq, Archive, Serialize, Deserialize)]
 pub struct Datom {

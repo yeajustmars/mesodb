@@ -1,8 +1,9 @@
+// mesodb-core/src/error.rs
+
 use std::io;
 use thiserror::Error;
 
-use crate::schema::ValueType;
-use crate::types::Value;
+use crate::{schema::ValueType, types::Value};
 
 #[derive(Error, Debug)]
 pub enum MesoError {

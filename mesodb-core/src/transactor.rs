@@ -1,19 +1,24 @@
 // mesodb-core/src/transactor.rs
 
 use arrow::record_batch::RecordBatch;
-use std::collections::HashSet;
-use std::path::Path;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::HashSet,
+    path::Path,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-use crate::config::Config;
-use crate::datom::Datom;
-use crate::error::MesoError;
-use crate::index::IndexManager;
-use crate::memtable::MemTable;
-use crate::schema::{SchemaMap, SchemaTimeline, ValueType};
-use crate::types::{EntityId, Result, TxId, Value};
-use crate::wal::{Wal, WalEntry};
+use crate::{
+    config::Config,
+    datom::Datom,
+    error::MesoError,
+    index::IndexManager,
+    memtable::MemTable,
+    schema::{Attribute, SchemaMutation},
+    schema::{SchemaMap, SchemaTimeline, ValueType},
+    types::{EntityId, Result, TxId, Value},
+    wal::{Wal, WalEntry},
+};
 
 pub struct Transactor {
     pub config: Config,
@@ -72,7 +77,7 @@ impl Transactor {
                     }
                 }
                 WalEntry::SchemaMutation(mutation) => match mutation {
-                    crate::schema::SchemaMutation::AddAttribute {
+                    SchemaMutation::AddAttribute {
                         tx_id,
                         timestamp,
                         attribute,
@@ -87,7 +92,7 @@ impl Transactor {
             }
         }
 
-        // NEW: Seal the recovered batch
+        // Seal the recovered batch
         let recovered_batch = recovery_memtable.finish()?;
 
         Ok((
@@ -107,7 +112,7 @@ impl Transactor {
         ident: &str,
         value_type: ValueType,
         is_unique: bool,
-    ) -> Result<Arc<crate::schema::Attribute>> {
+    ) -> Result<Arc<Attribute>> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -117,7 +122,7 @@ impl Transactor {
 
         let attr = self.schema.add_attribute(ident, value_type, is_unique);
 
-        let mutation = crate::schema::SchemaMutation::AddAttribute {
+        let mutation = SchemaMutation::AddAttribute {
             tx_id,
             timestamp: now,
             attribute: (*attr).clone(),
@@ -183,10 +188,10 @@ impl Transactor {
                     _ => ValueType::String,
                 };
 
-                // JIT Schema Bug Fix: Make JIT schema durable!
+                // Make JIT schema durable!
                 let new_attr = self.schema.add_attribute(&fact.ident, inferred_type, false);
 
-                let mutation = crate::schema::SchemaMutation::AddAttribute {
+                let mutation = SchemaMutation::AddAttribute {
                     tx_id,
                     timestamp: now,
                     attribute: (*new_attr).clone(),
@@ -275,7 +280,7 @@ impl Transactor {
                     }
                 }
 
-                // THE BITEMPORAL FIX: Retract existing value if it differs
+                // Retract existing value if it differs
                 if let Some(existing_v) =
                     self.indices
                         .get_value_at(fact.e, attr_id, resolved_valid_time)
@@ -386,10 +391,7 @@ mod tests {
         schema.add_attribute(":user/name", ValueType::String, false);
         schema.add_attribute(":user/email", ValueType::String, true);
         let config = Config::default();
-
-        // SURGICAL FIX: Add `(transactor, _)`
         let (transactor, _) = Transactor::new(temp_file.path(), schema, config).unwrap();
-
         (transactor, temp_file)
     }
 

@@ -1,8 +1,7 @@
 // mesodb-core/src/config.rs
 
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::Path;
+use std::{fs, path::Path};
 
 use crate::error::MesoError;
 

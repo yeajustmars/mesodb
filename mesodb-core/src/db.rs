@@ -2,17 +2,26 @@
 
 use arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
-use std::collections::BTreeMap;
-use std::fs::create_dir_all;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::{
+    collections::BTreeMap,
+    fs::create_dir_all,
+    path::{Path, PathBuf},
+    sync::{Arc, RwLock},
+};
 use tokio::sync::{Mutex, mpsc};
 
-use crate::config::Config;
-use crate::schema::SchemaMap;
-use crate::storage::BackgroundCompactor;
-use crate::transactor::{Fact, Transactor, TxReport};
-use crate::types::Result;
+use crate::{
+    config::Config,
+    error::MesoError,
+    formatter,
+    memtable::MemTable,
+    parser,
+    planner::QueryPlanner,
+    schema::{Attribute, SchemaMap, SchemaTimeline, ValueType},
+    storage::BackgroundCompactor,
+    transactor::{Fact, Transactor, TxReport},
+    types::{Result, Value},
+};
 
 pub struct MesoDB {
     /// The transactor is the single writer, guarded by a Tokio Mutex.
@@ -33,7 +42,7 @@ impl MesoDB {
         let (transactor, recovered_batch) = Transactor::new(path, schema.clone(), config.clone())?;
 
         let mut initial_ram = BTreeMap::new();
-        let empty_batch = crate::memtable::MemTable::new(0).finish()?;
+        let empty_batch = MemTable::new(0).finish()?;
         initial_ram.insert(0, empty_batch);
 
         // If we recovered uncompacted data, mount it. Otherwise, mount an empty schema batch.
@@ -41,7 +50,7 @@ impl MesoDB {
             // Use the current_tx_id as the key so the background flusher can eventually process it
             initial_ram.insert(transactor.current_tx_id, recovered_batch);
         } else {
-            let empty_batch = crate::memtable::MemTable::new(0).finish()?;
+            let empty_batch = MemTable::new(0).finish()?;
             initial_ram.insert(0, empty_batch);
         }
 
@@ -114,7 +123,7 @@ impl MesoDB {
     pub async fn transact_schema(
         &self,
         attributes: Vec<AttributeDefinition>,
-    ) -> Result<Vec<Arc<crate::schema::Attribute>>> {
+    ) -> Result<Vec<Arc<Attribute>>> {
         let mut tx = self.transactor.lock().await;
         let mut added_attrs = Vec::with_capacity(attributes.len());
 
@@ -197,11 +206,11 @@ impl MesoDB {
         query_str: &str,
         options: QueryOptions,
     ) -> Result<Vec<RecordBatch>> {
-        let ast = crate::parser::parse_query(query_str)?;
+        let ast = parser::parse_query(query_str)?;
         let view = { self.world_view.read().unwrap().clone() };
         let ctx = SessionContext::new();
         let ruleset = if let Some(r) = &options.rules {
-            Some(crate::parser::parse_ruleset(r)?)
+            Some(parser::parse_ruleset(r)?)
         } else {
             None
         };
@@ -347,10 +356,10 @@ impl MesoDB {
         let resolved_df = ctx
             .sql(&resolved_sql)
             .await
-            .map_err(crate::error::MesoError::DataFusion)?;
+            .map_err(MesoError::DataFusion)?;
         ctx.register_table("resolved_datoms", resolved_df.into_view())?;
 
-        let planner = crate::planner::QueryPlanner::new(
+        let planner = QueryPlanner::new(
             &ctx,
             view.timeline.as_ref(),
             "resolved_datoms",
@@ -362,38 +371,35 @@ impl MesoDB {
         let final_df = planner.plan(&ast).await?;
 
         // Explicit error propagation to prevent silent failures
-        let batches = final_df
-            .collect()
-            .await
-            .map_err(crate::error::MesoError::DataFusion)?;
+        let batches = final_df.collect().await.map_err(MesoError::DataFusion)?;
         Ok(batches)
     }
 
     pub async fn query_native(
         &self,
         query_str: &str,
-    ) -> Result<Vec<std::collections::HashMap<String, crate::types::Value>>> {
+    ) -> Result<Vec<std::collections::HashMap<String, Value>>> {
         let batches = self.query(query_str).await?;
-        crate::formatter::to_native(&batches)
+        formatter::to_native(&batches)
     }
 
     pub async fn query_native_with_options(
         &self,
         query_str: &str,
         options: QueryOptions,
-    ) -> Result<Vec<std::collections::HashMap<String, crate::types::Value>>> {
+    ) -> Result<Vec<std::collections::HashMap<String, Value>>> {
         let batches = self.query_with_options(query_str, options).await?;
-        crate::formatter::to_native(&batches)
+        formatter::to_native(&batches)
     }
 
     pub async fn query_json(&self, query_str: &str) -> Result<String> {
-        let ast = crate::parser::parse_query(query_str)?;
+        let ast = parser::parse_query(query_str)?;
         let opts = QueryOptions {
             format: OutputFormat::Json,
             ..Default::default()
         };
         let batches = self.query_with_options(query_str, opts).await?;
-        Ok(crate::formatter::to_json_string(&batches, &ast.find))
+        Ok(formatter::to_json_string(&batches, &ast.find))
     }
 
     pub async fn query_json_with_options(
@@ -401,20 +407,20 @@ impl MesoDB {
         query_str: &str,
         mut options: QueryOptions,
     ) -> Result<String> {
-        let ast = crate::parser::parse_query(query_str)?;
+        let ast = parser::parse_query(query_str)?;
         options.format = OutputFormat::Json; // Enforce JSON for this pipeline
         let batches = self.query_with_options(query_str, options).await?;
-        Ok(crate::formatter::to_json_string(&batches, &ast.find))
+        Ok(formatter::to_json_string(&batches, &ast.find))
     }
 
     pub async fn query_edn(&self, query_str: &str) -> Result<String> {
-        let ast = crate::parser::parse_query(query_str)?;
+        let ast = parser::parse_query(query_str)?;
         let opts = QueryOptions {
             format: OutputFormat::Edn,
             ..Default::default()
         };
         let batches = self.query_with_options(query_str, opts).await?;
-        Ok(crate::formatter::to_edn_string(&batches, &ast.find))
+        Ok(formatter::to_edn_string(&batches, &ast.find))
     }
 
     // =====================================================================
@@ -435,31 +441,31 @@ impl MesoDB {
     pub async fn history_native(
         &self,
         query_str: &str,
-    ) -> Result<Vec<std::collections::HashMap<String, crate::types::Value>>> {
+    ) -> Result<Vec<std::collections::HashMap<String, Value>>> {
         let batches = self.history(query_str).await?;
-        crate::formatter::to_native(&batches)
+        formatter::to_native(&batches)
     }
 
     pub async fn history_json(&self, query_str: &str) -> Result<String> {
-        let ast = crate::parser::parse_query(query_str)?;
+        let ast = parser::parse_query(query_str)?;
         let opts = QueryOptions {
             format: OutputFormat::Json,
             history: true,
             ..Default::default()
         };
         let batches = self.query_with_options(query_str, opts).await?;
-        Ok(crate::formatter::to_json_string(&batches, &ast.find))
+        Ok(formatter::to_json_string(&batches, &ast.find))
     }
 
     pub async fn history_edn(&self, query_str: &str) -> Result<String> {
-        let ast = crate::parser::parse_query(query_str)?;
+        let ast = parser::parse_query(query_str)?;
         let opts = QueryOptions {
             format: OutputFormat::Edn,
             history: true,
             ..Default::default()
         };
         let batches = self.query_with_options(query_str, opts).await?;
-        Ok(crate::formatter::to_edn_string(&batches, &ast.find))
+        Ok(formatter::to_edn_string(&batches, &ast.find))
     }
 }
 
@@ -468,7 +474,7 @@ pub struct WorldView {
     pub ram_batches: Arc<BTreeMap<u64, RecordBatch>>,
     pub data_dir: PathBuf,
     pub schema: Arc<SchemaMap>,
-    pub timeline: Arc<crate::schema::SchemaTimeline>,
+    pub timeline: Arc<SchemaTimeline>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -490,7 +496,7 @@ pub struct QueryOptions {
 #[derive(Debug, Clone)]
 pub struct AttributeDefinition {
     pub ident: String,
-    pub value_type: crate::schema::ValueType,
+    pub value_type: ValueType,
     pub is_unique: bool,
 }
 
@@ -942,8 +948,8 @@ mod tests {
     async fn test_recursive_datalog_rules() {
         let dir = tempfile::tempdir().unwrap();
         let mut schema = SchemaMap::new();
-        schema.add_attribute(":person/parent", crate::schema::ValueType::Ref, false);
-        schema.add_attribute(":person/name", crate::schema::ValueType::String, false);
+        schema.add_attribute(":person/parent", ValueType::Ref, false);
+        schema.add_attribute(":person/name", ValueType::String, false);
 
         let db = MesoDB::open(dir.path().join("rules.db"), schema, Config::default()).unwrap();
 
@@ -1309,7 +1315,7 @@ mod tests {
     async fn test_history_api_5_tuple_audit() {
         let dir = tempfile::tempdir().unwrap();
         let mut schema = SchemaMap::new();
-        schema.add_attribute(":user/status", crate::schema::ValueType::String, false);
+        schema.add_attribute(":user/status", ValueType::String, false);
 
         let db = MesoDB::open(dir.path().join("history.db"), schema, Config::default()).unwrap();
 
@@ -1318,7 +1324,7 @@ mod tests {
             vec![Fact {
                 e: 1,
                 ident: ":user/status".into(),
-                v: crate::types::Value::String("active".into()),
+                v: Value::String("active".into()),
                 op: true,
                 cas_old_v: None,
                 valid_time: None,
@@ -1334,7 +1340,7 @@ mod tests {
             vec![Fact {
                 e: 1,
                 ident: ":user/status".into(),
-                v: crate::types::Value::String("inactive".into()),
+                v: Value::String("inactive".into()),
                 op: true,
                 cas_old_v: None,
                 valid_time: None,
@@ -1408,7 +1414,7 @@ mod tests {
     async fn test_point_in_time_snapshot_state() {
         let dir = tempfile::tempdir().unwrap();
         let mut schema = SchemaMap::new();
-        schema.add_attribute(":item/price", crate::schema::ValueType::Int64, false);
+        schema.add_attribute(":item/price", ValueType::Int64, false);
         let db = MesoDB::open(dir.path().join("pit1.db"), schema, Config::default()).unwrap();
 
         // T=100: Assert Initial Price
@@ -1486,7 +1492,7 @@ mod tests {
     async fn test_point_in_time_retraction_visibility() {
         let dir = tempfile::tempdir().unwrap();
         let mut schema = SchemaMap::new();
-        schema.add_attribute(":user/tag", crate::schema::ValueType::String, false);
+        schema.add_attribute(":user/tag", ValueType::String, false);
         let db = MesoDB::open(dir.path().join("pit2.db"), schema, Config::default()).unwrap();
 
         // T=10: Assert Tag
@@ -1563,7 +1569,7 @@ mod tests {
     async fn test_across_time_entity_audit_trail() {
         let dir = tempfile::tempdir().unwrap();
         let mut schema = SchemaMap::new();
-        schema.add_attribute(":order/status", crate::schema::ValueType::String, false);
+        schema.add_attribute(":order/status", ValueType::String, false);
         let db = MesoDB::open(dir.path().join("at1.db"), schema, Config::default()).unwrap();
 
         db.transact_at(
@@ -1614,7 +1620,7 @@ mod tests {
     async fn test_across_time_temporal_self_join() {
         let dir = tempfile::tempdir().unwrap();
         let mut schema = SchemaMap::new();
-        schema.add_attribute(":device/state", crate::schema::ValueType::String, false);
+        schema.add_attribute(":device/state", ValueType::String, false);
         let db = MesoDB::open(dir.path().join("at2.db"), schema, Config::default()).unwrap();
 
         db.transact_at(
@@ -1692,7 +1698,7 @@ mod tests {
     async fn setup_history_db(name: &str) -> MesoDB {
         let dir = tempfile::tempdir().unwrap();
         let mut schema = SchemaMap::new();
-        schema.add_attribute(":doc/title", crate::schema::ValueType::String, false);
+        schema.add_attribute(":doc/title", ValueType::String, false);
 
         let db = MesoDB::open(dir.path().join(name), schema, Config::default()).unwrap();
 
@@ -1861,8 +1867,8 @@ mod tests {
     async fn test_datalog_or_clause() {
         let dir = tempfile::tempdir().unwrap();
         let mut schema = SchemaMap::new();
-        schema.add_attribute(":account/status", crate::schema::ValueType::String, false);
-        schema.add_attribute(":account/type", crate::schema::ValueType::String, false);
+        schema.add_attribute(":account/status", ValueType::String, false);
+        schema.add_attribute(":account/type", ValueType::String, false);
 
         let db = MesoDB::open(dir.path().join("or_logic.db"), schema, Config::default()).unwrap();
 
@@ -1961,8 +1967,8 @@ mod tests {
     async fn test_datalog_not_clause() {
         let dir = tempfile::tempdir().unwrap();
         let mut schema = SchemaMap::new();
-        schema.add_attribute(":account/status", crate::schema::ValueType::String, false);
-        schema.add_attribute(":account/type", crate::schema::ValueType::String, false);
+        schema.add_attribute(":account/status", ValueType::String, false);
+        schema.add_attribute(":account/type", ValueType::String, false);
 
         let db = MesoDB::open(dir.path().join("not_logic.db"), schema, Config::default()).unwrap();
 
@@ -2045,8 +2051,8 @@ mod tests {
     async fn test_reified_transactions() {
         let dir = tempfile::tempdir().unwrap();
         let mut schema = SchemaMap::new();
-        schema.add_attribute(":tx/author", crate::schema::ValueType::String, false);
-        schema.add_attribute(":user/name", crate::schema::ValueType::String, false);
+        schema.add_attribute(":tx/author", ValueType::String, false);
+        schema.add_attribute(":user/name", ValueType::String, false);
 
         let db = MesoDB::open(dir.path().join("reified.db"), schema, Config::default()).unwrap();
 

@@ -1,12 +1,12 @@
 // mesodb-core/src/formatter.rs
 
-use arrow::array::*;
-use arrow::datatypes::DataType;
-use arrow::record_batch::RecordBatch;
+use arrow::{array::*, datatypes::DataType, record_batch::RecordBatch};
 use std::collections::HashMap;
 
-use crate::ast::FindSpec;
-use crate::types::{Result, Value};
+use crate::{
+    ast::FindSpec,
+    types::{Result, Value},
+};
 
 /// Formats a series of RecordBatches directly into a JSON string with zero intermediate structs.
 pub fn to_json_string(batches: &[RecordBatch], finds: &[FindSpec]) -> String {

@@ -1,8 +1,9 @@
 // mesodb-core/src/index.rs
 
-use crate::types::{AttributeId, EntityId, Value};
 use ahash::AHashMap;
 use std::collections::BTreeMap;
+
+use crate::types::{AttributeId, EntityId, Value};
 
 #[derive(Debug, Default, Clone)]
 pub struct IndexManager {

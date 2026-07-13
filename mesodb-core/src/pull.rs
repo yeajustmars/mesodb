@@ -1,7 +1,10 @@
 // mesodb-core/src/pull.rs
 
-use arrow::array::Array;
-use arrow::array::StringArray;
+use arrow::array::{
+    Array as ArrowArray, BooleanArray as ArrowBooleanArray, Float64Array as ArrowFloat64Array,
+    Int64Array as ArrowInt64Array, StringArray as ArrowStringArray,
+    UInt32Array as ArrowUInt32Array, UInt64Array as ArrowUInt64Array,
+};
 use datafusion::prelude::*;
 use serde_json::{Map, Value as JsonValue};
 use std::{
@@ -10,10 +13,13 @@ use std::{
     pin::Pin,
 };
 
-use crate::ast::{PullAttribute, PullPattern};
-use crate::db::OutputFormat;
-use crate::error::MesoError;
-use crate::schema::SchemaMap;
+use crate::{
+    ast::{PullAttribute, PullPattern},
+    db::OutputFormat,
+    error::MesoError,
+    schema::SchemaMap,
+    schema::ValueType,
+};
 
 pub struct PullEngine<'a> {
     ctx: &'a SessionContext,
@@ -47,7 +53,7 @@ impl<'a> PullEngine<'a> {
         &self,
         entity_ids: &[u64],
         pattern: &PullPattern,
-    ) -> Result<StringArray, MesoError> {
+    ) -> Result<ArrowStringArray, MesoError> {
         // 1. Execute the batched fetch for all entities
         let mut doc_map = self.pull_entities(entity_ids, pattern).await?;
 
@@ -68,7 +74,7 @@ impl<'a> PullEngine<'a> {
             results.push(serialized);
         }
 
-        Ok(StringArray::from(results))
+        Ok(ArrowStringArray::from(results))
     }
 
     // The Recursive, BATCHED Graph Walker
@@ -138,37 +144,37 @@ impl<'a> PullEngine<'a> {
                 let e_col = batch
                     .column(0)
                     .as_any()
-                    .downcast_ref::<arrow::array::UInt64Array>()
+                    .downcast_ref::<ArrowUInt64Array>()
                     .unwrap();
                 let a_col = batch
                     .column(1)
                     .as_any()
-                    .downcast_ref::<arrow::array::UInt32Array>()
+                    .downcast_ref::<ArrowUInt32Array>()
                     .unwrap();
                 let bool_col = batch
                     .column(2)
                     .as_any()
-                    .downcast_ref::<arrow::array::BooleanArray>()
+                    .downcast_ref::<ArrowBooleanArray>()
                     .unwrap();
                 let int_col = batch
                     .column(3)
                     .as_any()
-                    .downcast_ref::<arrow::array::Int64Array>()
+                    .downcast_ref::<ArrowInt64Array>()
                     .unwrap();
                 let float_col = batch
                     .column(4)
                     .as_any()
-                    .downcast_ref::<arrow::array::Float64Array>()
+                    .downcast_ref::<ArrowFloat64Array>()
                     .unwrap();
                 let str_col = batch
                     .column(5)
                     .as_any()
-                    .downcast_ref::<arrow::array::StringArray>()
+                    .downcast_ref::<ArrowStringArray>()
                     .unwrap();
                 let ref_col = batch
                     .column(6)
                     .as_any()
-                    .downcast_ref::<arrow::array::UInt64Array>()
+                    .downcast_ref::<ArrowUInt64Array>()
                     .unwrap();
 
                 for i in 0..batch.num_rows() {
@@ -188,21 +194,19 @@ impl<'a> PullEngine<'a> {
                     }
 
                     let json_val = match attr_meta.value_type {
-                        crate::schema::ValueType::Boolean if bool_col.is_valid(i) => {
+                        ValueType::Boolean if bool_col.is_valid(i) => {
                             JsonValue::Bool(bool_col.value(i))
                         }
-                        crate::schema::ValueType::Int64 if int_col.is_valid(i) => {
+                        ValueType::Int64 if int_col.is_valid(i) => {
                             JsonValue::Number(serde_json::Number::from(int_col.value(i)))
                         }
-                        crate::schema::ValueType::Float64 if float_col.is_valid(i) => {
-                            JsonValue::Number(
-                                serde_json::Number::from_f64(float_col.value(i)).unwrap(),
-                            )
-                        }
-                        crate::schema::ValueType::String if str_col.is_valid(i) => {
+                        ValueType::Float64 if float_col.is_valid(i) => JsonValue::Number(
+                            serde_json::Number::from_f64(float_col.value(i)).unwrap(),
+                        ),
+                        ValueType::String if str_col.is_valid(i) => {
                             JsonValue::String(str_col.value(i).to_string())
                         }
-                        crate::schema::ValueType::Ref if ref_col.is_valid(i) => {
+                        ValueType::Ref if ref_col.is_valid(i) => {
                             let target_e = ref_col.value(i);
                             if requested_maps.contains_key(ident) {
                                 // Add to our batched fetch list and place a temporary placeholder!

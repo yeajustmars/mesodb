@@ -1,9 +1,9 @@
 // mesodb-core/src/parser.rs
+
 use pest::Parser;
 use pest_derive::Parser;
 
-use crate::ast::*;
-use crate::error::MesoError;
+use crate::{ast::*, error::MesoError};
 
 #[derive(Parser)]
 #[grammar = "datalog.pest"]

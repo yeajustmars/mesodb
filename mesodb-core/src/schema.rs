@@ -1,10 +1,11 @@
 use ahash::AHashMap;
 use rkyv::{Archive, Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
-use crate::error::MesoError;
-use crate::types::{AttributeId, Result, Value};
+use crate::{
+    error::MesoError,
+    types::{AttributeId, Result, Value},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Archive, Serialize, Deserialize)]
 pub enum ValueType {

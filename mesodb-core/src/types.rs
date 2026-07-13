@@ -1,6 +1,5 @@
 use rkyv::{Archive, Deserialize, Serialize};
-use std::cmp::Ordering;
-use std::fmt;
+use std::{cmp::Ordering, fmt};
 
 use crate::error::MesoError;
 

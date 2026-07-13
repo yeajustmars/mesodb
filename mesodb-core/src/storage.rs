@@ -1,13 +1,12 @@
 use arrow::record_batch::RecordBatch;
-use datafusion::dataframe::DataFrameWriteOptions;
-use datafusion::prelude::*;
-use parquet::arrow::arrow_writer::ArrowWriter;
-use parquet::file::properties::WriterProperties;
-use std::fs::File;
-use std::path::PathBuf;
+use datafusion::{dataframe::DataFrameWriteOptions, prelude::*};
+use parquet::{arrow::arrow_writer::ArrowWriter, file::properties::WriterProperties};
+use std::{
+    fs::{self, File},
+    path::PathBuf,
+};
 
-use crate::error::MesoError;
-use crate::types::Result;
+use crate::{error::MesoError, types::Result};
 
 pub struct BackgroundCompactor {
     data_dir: PathBuf,
@@ -15,8 +14,8 @@ pub struct BackgroundCompactor {
 
 impl BackgroundCompactor {
     pub fn new(data_dir: PathBuf) -> Self {
-        std::fs::create_dir_all(&data_dir).expect("Failed to create base data directory");
-        std::fs::create_dir_all(data_dir.join("parquet"))
+        fs::create_dir_all(&data_dir).expect("Failed to create base data directory");
+        fs::create_dir_all(data_dir.join("parquet"))
             .expect("Failed to create parquet subdirectory");
 
         Self { data_dir }
@@ -69,7 +68,8 @@ impl BackgroundCompactor {
         let sql = r#"
             WITH bounds AS (
                 SELECT *,
-                       LEAD(valid_from) OVER (PARTITION BY e, a ORDER BY valid_from ASC, t ASC, op ASC) as next_from
+                    LEAD(valid_from)
+                    OVER (PARTITION BY e, a ORDER BY valid_from ASC, t ASC, op ASC) as next_from
                 FROM raw_fragments
             )
             SELECT
@@ -90,7 +90,7 @@ impl BackgroundCompactor {
 
         // 4. Cleanup the old, fragmented files
         for path in file_paths {
-            let _ = std::fs::remove_file(path);
+            let _ = fs::remove_file(path);
         }
 
         Ok(output_path)

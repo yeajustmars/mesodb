@@ -1,14 +1,18 @@
 // mesodb-core/src/planner.rs
-use arrow::record_batch::RecordBatch;
-use datafusion::prelude::*;
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::time::SystemTime;
+
+use arrow::{
+    array::{Array as ArrowArray, UInt64Array as ArrowUInt64Array},
+    datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema},
+    record_batch::RecordBatch,
+};
+use datafusion::{datasource::memory::MemTable as DataFusionMemTable, prelude::*};
+use std::{collections::HashMap, sync::Arc, time::SystemTime};
 
 use crate::{
     ast::{Binding, FindSpec, Query, RuleDef, RuleSet, Term, WhereClause},
     db::OutputFormat,
     error::MesoError,
+    pull::PullEngine,
     schema::{SchemaTimeline, ValueType},
 };
 
@@ -490,7 +494,7 @@ impl<'a> QueryPlanner<'a> {
 
             let mut final_batches = Vec::new();
             for batch in batches {
-                let mut new_columns: Vec<Arc<dyn arrow::array::Array>> = Vec::new();
+                let mut new_columns: Vec<Arc<dyn ArrowArray>> = Vec::new();
                 let mut new_fields = Vec::new();
 
                 for (i, find_spec) in query.find.iter().enumerate() {
@@ -498,7 +502,7 @@ impl<'a> QueryPlanner<'a> {
                         FindSpec::Variable(v) => {
                             let clean_var = v.replace("?", "");
                             new_columns.push(batch.column(i).clone());
-                            new_fields.push(arrow::datatypes::Field::new(
+                            new_fields.push(ArrowField::new(
                                 clean_var,
                                 batch.column(i).data_type().clone(),
                                 true,
@@ -509,7 +513,7 @@ impl<'a> QueryPlanner<'a> {
                             let e_col = batch
                                 .column(i)
                                 .as_any()
-                                .downcast_ref::<arrow::array::UInt64Array>()
+                                .downcast_ref::<ArrowUInt64Array>()
                                 .unwrap();
                             let e_ids: Vec<u64> =
                                 (0..e_col.len()).map(|idx| e_col.value(idx)).collect();
@@ -521,25 +525,17 @@ impl<'a> QueryPlanner<'a> {
                             };
                             let active_schema = self.timeline.get_schema_at(target_tx);
 
-                            let pull_engine = crate::pull::PullEngine::new(
-                                self.ctx,
-                                &active_schema,
-                                &self.format,
-                                self.as_of,
-                            );
+                            let pull_engine =
+                                PullEngine::new(self.ctx, &active_schema, &self.format, self.as_of);
                             let string_arr = pull_engine.execute_pull(&e_ids, pattern).await?;
 
                             new_columns.push(Arc::new(string_arr));
-                            new_fields.push(arrow::datatypes::Field::new(
-                                clean_var,
-                                arrow::datatypes::DataType::Utf8,
-                                true,
-                            ));
+                            new_fields.push(ArrowField::new(clean_var, ArrowDataType::Utf8, true));
                         }
                         FindSpec::Aggregate(func, v) => {
                             let clean_var = format!("{}_{}", func, v.replace("?", ""));
                             new_columns.push(batch.column(i).clone());
-                            new_fields.push(arrow::datatypes::Field::new(
+                            new_fields.push(ArrowField::new(
                                 clean_var,
                                 batch.column(i).data_type().clone(),
                                 true,
@@ -547,17 +543,15 @@ impl<'a> QueryPlanner<'a> {
                         }
                     }
                 }
-                let new_schema = Arc::new(arrow::datatypes::Schema::new(new_fields));
+                let new_schema = Arc::new(ArrowSchema::new(new_fields));
                 let new_batch =
                     RecordBatch::try_new(new_schema, new_columns).map_err(MesoError::Arrow)?;
                 final_batches.push(new_batch);
             }
 
-            let mem_table = datafusion::datasource::memory::MemTable::try_new(
-                final_batches[0].schema(),
-                vec![final_batches],
-            )
-            .unwrap();
+            let mem_table =
+                DataFusionMemTable::try_new(final_batches[0].schema(), vec![final_batches])
+                    .unwrap();
             let temp_ctx = SessionContext::new();
             temp_ctx.register_table("pull_results", Arc::new(mem_table))?;
             temp_ctx
