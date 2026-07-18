@@ -480,9 +480,10 @@ pub struct WorldView {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum OutputFormat {
     #[default]
+    Arrow,
+    Edn,
     Tabular,
     Json,
-    Edn,
 }
 
 #[derive(Debug, Default, Clone)]

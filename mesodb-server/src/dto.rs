@@ -19,8 +19,7 @@ pub struct WireFact {
     pub cas_old_v: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)] // TODO: remove this once implemented
+#[derive(Debug, Deserialize, Serialize)]
 pub struct QueryRequest {
     pub query: String,
     pub as_of: Option<i64>,
