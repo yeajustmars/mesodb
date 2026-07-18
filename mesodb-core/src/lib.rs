@@ -15,3 +15,5 @@ pub mod storage;
 pub mod transactor;
 pub mod types;
 pub mod wal;
+pub mod wire;
+
