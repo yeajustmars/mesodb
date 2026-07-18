@@ -429,4 +429,163 @@ mod tests {
         assert_eq!(name_col.value(0), "Alice");
         assert_eq!(age_col.value(0), 30);
     }
+
+    // =====================================================================
+    // TEST 1: AGGREGATIONS & MATH OVER ARROW IPC
+    // =====================================================================
+    #[tokio::test]
+    async fn test_flight_aggregation_query() {
+        let (_server_handle, mut client) = setup_test_server().await;
+
+        // 1. Ingest Multiple Users
+        let mut builder = WireBatchBuilder::new(2);
+        builder
+            .append(&Fact {
+                e: 1,
+                ident: ":user/age".into(),
+                v: Value::Int64(30),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            })
+            .unwrap();
+        builder
+            .append(&Fact {
+                e: 2,
+                ident: ":user/age".into(),
+                v: Value::Int64(40),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            })
+            .unwrap();
+
+        let batch_stream = futures::stream::iter(vec![Ok(builder.finish().unwrap())]);
+        let flight_data_stream = arrow_flight::encode::FlightDataEncoderBuilder::new()
+            .build(batch_stream)
+            .map(|res| res.expect("Flight encoding failed"));
+
+        client.do_put(flight_data_stream).await.unwrap();
+
+        // 2. Query the Sum over the network
+        let query_dto = crate::dto::QueryRequest {
+            query: r#"[:find (sum ?age) :where [?e :user/age ?age]]"#.to_string(),
+            as_of: None,
+            rules: None,
+            format: Default::default(),
+        };
+
+        let descriptor = FlightDescriptor::new_cmd(serde_json::to_vec(&query_dto).unwrap());
+        let info = client
+            .get_flight_info(descriptor)
+            .await
+            .unwrap()
+            .into_inner();
+        let ticket = info.endpoint[0].ticket.clone().unwrap();
+
+        let flight_stream = client.do_get(ticket).await.unwrap().into_inner();
+        let mut decoder = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
+            flight_stream.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e))),
+        );
+
+        let batch = decoder.next().await.unwrap().unwrap();
+
+        // 3. Verify Aggregation
+        assert_eq!(
+            batch.num_rows(),
+            1,
+            "Sum aggregation should yield exactly one row"
+        );
+        let sum_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(
+            sum_col.value(0),
+            70,
+            "30 + 40 should equal 70 over the wire"
+        );
+    }
+
+    // =====================================================================
+    // TEST 2: SCHEMA HANDSHAKES FOR EMPTY RESULT SETS
+    // =====================================================================
+    #[tokio::test]
+    async fn test_flight_empty_result_schema() {
+        let (_server_handle, mut client) = setup_test_server().await;
+
+        // Query for a non-existent name
+        let query_dto = crate::dto::QueryRequest {
+            query: r#"[:find ?name :where [?e :user/name ?name] [(= ?name "Nonexistent")]]"#
+                .to_string(),
+            as_of: None,
+            rules: None,
+            format: Default::default(),
+        };
+
+        // 1. Request Flight Info
+        let descriptor = FlightDescriptor::new_cmd(serde_json::to_vec(&query_dto).unwrap());
+        let info = client
+            .get_flight_info(descriptor)
+            .await
+            .unwrap()
+            .into_inner();
+
+        // 2. The server must still return a valid schema despite having no data!
+        assert!(
+            !info.schema.is_empty(),
+            "Schema bytes must be populated for Arrow clients to initialize"
+        );
+
+        let ticket = info.endpoint[0].ticket.clone().unwrap();
+        let flight_stream = client.do_get(ticket).await.unwrap().into_inner();
+        let mut decoder = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
+            flight_stream.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e))),
+        );
+
+        // 3. Stream Should Yield No Data Batches
+        let next_result = decoder.next().await;
+        assert!(
+            next_result.is_none(),
+            "The data stream should immediately yield None for an empty result set"
+        );
+    }
+
+    // =====================================================================
+    // TEST 3: RPC ERROR PROPAGATION FOR MALFORMED QUERIES
+    // =====================================================================
+    #[tokio::test]
+    async fn test_flight_invalid_query_error_propagation() {
+        let (_server_handle, mut client) = setup_test_server().await;
+
+        // Construct a syntactically invalid Datalog query
+        let query_dto = crate::dto::QueryRequest {
+            query: r#"[:find ?name :where [?e :user/name ?name] WAIT THIS IS NOT DATALOG]"#
+                .to_string(),
+            as_of: None,
+            rules: None,
+            format: Default::default(),
+        };
+
+        let descriptor = FlightDescriptor::new_cmd(serde_json::to_vec(&query_dto).unwrap());
+
+        // Ensure the client doesn't panic, but successfully captures the Tonic gRPC Error Status
+        let response = client.get_flight_info(descriptor).await;
+
+        assert!(response.is_err(), "Server should reject malformed queries");
+
+        let status = response.unwrap_err();
+        assert_eq!(
+            status.code(),
+            tonic::Code::Internal,
+            "Should map to an Internal gRPC status"
+        );
+        assert!(
+            status.message().to_lowercase().contains("parse error")
+                || status.message().to_lowercase().contains("failed"),
+            "Error message should propagate the parser's context to the client. Got: {}",
+            status.message()
+        );
+    }
 }
