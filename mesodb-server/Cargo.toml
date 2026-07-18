@@ -8,14 +8,21 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-mesodb-core = { workspace = true }
-axum = { workspace = true }
-tokio = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
-color-eyre = { workspace = true }
+mesodb-core.workspace = true
+
+arrow.workspace = true
+arrow-flight.workspace = true
+axum.workspace = true
+color-eyre.workspace = true
+futures.workspace = true
+prost.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

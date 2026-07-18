@@ -17,39 +17,34 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 mesodb-core = { path = "mesodb-core", version = "0.1.0" }
 
-# Config
-toml = "1.1.2"
-
-# Data, Engine & Storage
+# Core system (core, server, CLI, ...)
 arrow = "58.2.0"
+arrow-flight = "58.2.0"
 ahash = "0.8.12"
+axum = { version = "0.8.9", features = ["json", "macros"] }
 chrono = "0.4.44"
+clap = { version = "4.6.1", features = ["derive"] }
+color-eyre = "0.6.5"
+comfy-table = "7.2.2"
+datafusion = "53.1.0"
+futures = "0.3.32"
 ordered-float = "5.3.0"
 parquet = "58.2.0"
+pest = "2.8.6"
+pest_derive = "2.8.6"
+prost = "0.14.4"
+reedline = "0.38.0"
+reqwest = { version = "0.13.3", features = ["json"] }
 rkyv = "0.8.16"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-
-# Parsing & Query
-datafusion = "53.1.0"
-pest = "2.8.6"
-pest_derive = "2.8.6"
-
-# Async & Web
-tokio = { version = "1.52.2", features = ["full"] }
-axum = { version = "0.8.9", features = ["json", "macros"] }
-
-# Observability & Errors
 thiserror = "2.0.18"
-color-eyre = "0.6.5"
+tokio = { version = "1.52.2", features = ["full"] }
+tokio-stream = "0.1.18"
+toml = "1.1.2"
+tonic = "0.14.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-
-# CLI
-clap = { version = "4.6.1", features = ["derive"] }
-comfy-table = "7.2.2"
-reqwest = { version = "0.13.3", features = ["json"] }
-reedline = "0.38.0"
 
 # Docs
 mdcat = "2.12.0"
