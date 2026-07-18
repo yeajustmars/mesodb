@@ -30,6 +30,7 @@ async fn main() -> color_eyre::Result<()> {
     let schema = SchemaMap::new();
 
     // Initialize DB
+    // TODO: fix hardcoded config path
     let db_path = PathBuf::from("./data/prod_server.db");
     let config = Config::default();
     let db = Arc::new(MesoDB::open(db_path, schema, config)?);
