@@ -29,3 +29,7 @@ harness = false
 [[bench]]
 name = "velocity_sentinel"
 harness = false
+
+[[bench]]
+name = "compiler"
+harness = false
