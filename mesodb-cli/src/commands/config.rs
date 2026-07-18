@@ -1,4 +1,4 @@
-// src/commands/config.rs
+// mesodb-cli/src/commands/config.rs
 
 use crate::SessionState;
 use reqwest::Client;

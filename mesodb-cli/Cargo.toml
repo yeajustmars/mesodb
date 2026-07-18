@@ -19,3 +19,4 @@ tempfile.workspace = true
 tokio.workspace = true
 
 mesodb-core = { path = "../mesodb-core" }
+mesodb-doc = { path = "../mesodb-doc" }

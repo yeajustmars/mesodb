@@ -1,29 +1,35 @@
-// src/commands/transact.rs
+// mesodb-cli/src/commands/transact.rs
 
 use reqwest::Client;
-use serde_json::Value;
 
-pub async fn execute(client: &Client, base_url: &str, facts_json: &str) -> color_eyre::Result<()> {
+use crate::edn;
+
+pub async fn execute(client: &Client, base_url: &str, input: &str) -> color_eyre::Result<()> {
     let url = format!("{}/transact", base_url);
 
-    // Note: Temporary JSON parser. Will be replaced by EDN parser later.
-    let parsed_facts: Value = match serde_json::from_str(facts_json) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("Invalid JSON syntax: {}", e);
-            return Ok(());
-        }
-    };
+    // 1. Validate syntax locally to fail fast before hitting the network
+    if let Err(e) = edn::parse_edn_tx(input) {
+        eprintln!("Syntax Error: {}", e);
+        return Ok(());
+    }
 
-    let payload = serde_json::json!({ "facts": parsed_facts });
-    let res = client.post(&url).json(&payload).send().await?;
+    // 2. Stream the native EDN string directly to the server
+    let res = client
+        .post(&url)
+        .header("Content-Type", "application/edn")
+        .body(input.to_string())
+        .send()
+        .await?;
+
     let status = res.status();
     let body_text = res.text().await?;
 
+    // 3. Print the server's EDN TxReport acknowledgement
     if status.is_success() {
-        println!("Success: {}", body_text);
+        println!("✅ Transacted: {}", body_text);
     } else {
-        eprintln!("Error ({}): {}", status, body_text);
+        eprintln!("❌ Error ({}): {}", status, body_text);
     }
+
     Ok(())
 }

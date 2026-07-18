@@ -1,0 +1,15 @@
+# mesodb-doc/Cargo.toml
+[package]
+name = "mesodb-doc"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+mdcat.workspace = true
+pulldown-cmark.workspace = true
+pulldown-cmark-mdcat.workspace = true
+rust-embed.workspace = true
+syntect.workspace = true
+thiserror.workspace = true

@@ -4,7 +4,7 @@ use comfy_table::{Cell, Table, modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL
 use mesodb_core::config::Config;
 use mesodb_core::db::{MesoDB, OutputFormat, QueryOptions};
 use mesodb_core::schema::SchemaMap;
-use mesodb_core::transactor::Fact;
+// use mesodb_core::transactor::Fact;
 use tempfile::TempDir;
 
 pub mod hr_story;
@@ -43,7 +43,7 @@ impl TutorSession {
         let schema = SchemaMap::new();
         let db = MesoDB::open(db_path, schema, config).expect("Failed to boot embedded MesoDB");
 
-        let mut session = Self {
+        let session = Self {
             story,
             current_step: 0,
             db,
@@ -56,15 +56,15 @@ impl TutorSession {
     }
 
     async fn load_current_fixture(&self) {
-        if let Some(step) = self.story.steps.get(self.current_step) {
-            if let Some(edn) = step.auto_fixture {
-                println!("⏳ [System] Provisioning sandbox data...");
-                match crate::edn::parse_edn_tx(edn) {
-                    Ok(facts) => {
-                        let _ = self.db.transact(facts).await;
-                    }
-                    Err(e) => println!("⚠️ Sandbox Setup Error: {}", e),
+        if let Some(step) = self.story.steps.get(self.current_step)
+            && let Some(edn) = step.auto_fixture
+        {
+            println!("⏳ [System] Provisioning sandbox data...");
+            match crate::edn::parse_edn_tx(edn) {
+                Ok(facts) => {
+                    let _ = self.db.transact(facts).await;
                 }
+                Err(e) => println!("⚠️ Sandbox Setup Error: {}", e),
             }
         }
     }

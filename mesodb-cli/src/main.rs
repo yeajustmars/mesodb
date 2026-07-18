@@ -1,8 +1,10 @@
-// src/main.rs
+// mesodb-cli/src/main.rs
 
 use clap::{Parser, Subcommand};
 use reedline::{FileBackedHistory, Reedline, Signal};
 use reqwest::Client;
+
+use mesodb_doc::print_doc_to_terminal;
 
 mod commands;
 mod edn;
@@ -119,7 +121,12 @@ async fn main() -> color_eyre::Result<()> {
                 if input.starts_with('.') {
                     match cmd {
                         ".connect" => commands::config::connect(&mut session, input),
-                        ".doc" => println!("(Doc system coming soon...)"),
+                        ".doc" => {
+                            // TODO: handle unicode strings (even though they're not valid here)
+                            let name = input.get(5..).expect("Failed to get doc substring");
+                            print_doc_to_terminal(name)?
+                        }
+                        ".help" => println!("TODO: impl help"),
                         ".learn" => {
                             let session_machine =
                                 tutor::TutorSession::new(tutor::hr_story::build()).await;

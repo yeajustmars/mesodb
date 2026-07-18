@@ -1,4 +1,4 @@
-// src/edn.rs
+// mesodb-cli/src/edn.rs
 
 use chrono::DateTime;
 use mesodb_core::transactor::Fact;
@@ -69,7 +69,7 @@ fn parse_fact_vector(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result
                 // Parse String
                 chars.next();
                 let mut s = String::new();
-                while let Some(sc) = chars.next() {
+                for sc in chars.by_ref() {
                     if sc == '"' {
                         break;
                     }
@@ -98,7 +98,7 @@ fn parse_fact_vector(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result
                         return Err("Expected '\"' after #inst".into());
                     }
                     let mut s = String::new();
-                    while let Some(sc) = chars.next() {
+                    for sc in chars.by_ref() {
                         if sc == '"' {
                             break;
                         }
@@ -180,6 +180,7 @@ fn parse_fact_vector(chars: &mut std::iter::Peekable<std::str::Chars>) -> Result
     })
 }
 
+#[allow(dead_code)] // TODO: <- remote this allow-dead-code
 #[derive(Debug)]
 enum Token {
     Keyword(String),
