@@ -2,13 +2,13 @@
 
 use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
-    HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
-    decode::FlightRecordBatchStream, encode::FlightDataEncoderBuilder,
+    HandshakeRequest, HandshakeResponse, PollInfo, PutResult, Result as ArrowFlightResult,
+    SchemaResult, Ticket, decode::FlightRecordBatchStream, encode::FlightDataEncoderBuilder,
     flight_service_server::FlightService,
 };
 use futures::{Stream, StreamExt};
 use std::pin::Pin;
-use std::result::Result;
+use std::result::Result as StdResult;
 use std::sync::Arc;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -31,22 +31,22 @@ impl MesoFlightServer {
 #[tonic::async_trait]
 impl FlightService for MesoFlightServer {
     type HandshakeStream =
-        Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send + 'static>>;
+        Pin<Box<dyn Stream<Item = StdResult<HandshakeResponse, Status>> + Send + 'static>>;
     type ListFlightsStream =
-        Pin<Box<dyn Stream<Item = Result<FlightInfo, Status>> + Send + 'static>>;
-    type DoGetStream = Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send + 'static>>;
-    type DoPutStream = Pin<Box<dyn Stream<Item = Result<PutResult, Status>> + Send + 'static>>;
+        Pin<Box<dyn Stream<Item = StdResult<FlightInfo, Status>> + Send + 'static>>;
+    type DoGetStream = Pin<Box<dyn Stream<Item = StdResult<FlightData, Status>> + Send + 'static>>;
+    type DoPutStream = Pin<Box<dyn Stream<Item = StdResult<PutResult, Status>> + Send + 'static>>;
     type DoActionStream =
-        Pin<Box<dyn Stream<Item = Result<arrow_flight::Result, Status>> + Send + 'static>>;
+        Pin<Box<dyn Stream<Item = StdResult<ArrowFlightResult, Status>> + Send + 'static>>;
     type ListActionsStream =
-        Pin<Box<dyn Stream<Item = Result<ActionType, Status>> + Send + 'static>>;
+        Pin<Box<dyn Stream<Item = StdResult<ActionType, Status>> + Send + 'static>>;
     type DoExchangeStream =
-        Pin<Box<dyn Stream<Item = Result<FlightData, Status>> + Send + 'static>>;
+        Pin<Box<dyn Stream<Item = StdResult<FlightData, Status>> + Send + 'static>>;
 
     async fn do_get(
         &self,
         request: Request<Ticket>,
-    ) -> std::result::Result<Response<Self::DoGetStream>, Status> {
+    ) -> StdResult<Response<Self::DoGetStream>, Status> {
         let ticket = request.into_inner().ticket;
 
         // 1. Decode the Ticket bytes as our JSON QueryRequest DTO
@@ -91,7 +91,7 @@ impl FlightService for MesoFlightServer {
     async fn do_put(
         &self,
         request: Request<Streaming<FlightData>>,
-    ) -> std::result::Result<Response<Self::DoPutStream>, Status> {
+    ) -> StdResult<Response<Self::DoPutStream>, Status> {
         let stream = request.into_inner();
 
         // Map the tonic::Status error into an arrow_flight::error::FlightError
@@ -142,7 +142,7 @@ impl FlightService for MesoFlightServer {
     async fn do_action(
         &self,
         _request: Request<Action>,
-    ) -> Result<Response<Self::DoActionStream>, Status> {
+    ) -> StdResult<Response<Self::DoActionStream>, Status> {
         Err(Status::unimplemented("do_action not yet implemented"))
     }
 
@@ -151,28 +151,28 @@ impl FlightService for MesoFlightServer {
     async fn poll_flight_info(
         &self,
         _request: Request<FlightDescriptor>,
-    ) -> Result<Response<PollInfo>, Status> {
+    ) -> StdResult<Response<PollInfo>, Status> {
         Err(Status::unimplemented("poll_flight_info not implemented"))
     }
 
     async fn handshake(
         &self,
         _request: Request<Streaming<HandshakeRequest>>,
-    ) -> Result<Response<Self::HandshakeStream>, Status> {
+    ) -> StdResult<Response<Self::HandshakeStream>, Status> {
         Err(Status::unimplemented("handshake not implemented"))
     }
 
     async fn list_flights(
         &self,
         _request: Request<Criteria>,
-    ) -> Result<Response<Self::ListFlightsStream>, Status> {
+    ) -> StdResult<Response<Self::ListFlightsStream>, Status> {
         Err(Status::unimplemented("list_flights not implemented"))
     }
 
     async fn get_flight_info(
         &self,
         request: Request<FlightDescriptor>,
-    ) -> std::result::Result<Response<FlightInfo>, Status> {
+    ) -> StdResult<Response<FlightInfo>, Status> {
         let descriptor = request.into_inner();
 
         // 1. Extract the JSON payload from the FlightDescriptor command
@@ -233,21 +233,21 @@ impl FlightService for MesoFlightServer {
     async fn get_schema(
         &self,
         _request: Request<FlightDescriptor>,
-    ) -> Result<Response<SchemaResult>, Status> {
+    ) -> StdResult<Response<SchemaResult>, Status> {
         Err(Status::unimplemented("get_schema not implemented"))
     }
 
     async fn list_actions(
         &self,
         _request: Request<Empty>,
-    ) -> Result<Response<Self::ListActionsStream>, Status> {
+    ) -> StdResult<Response<Self::ListActionsStream>, Status> {
         Err(Status::unimplemented("list_actions not implemented"))
     }
 
     async fn do_exchange(
         &self,
         _request: Request<Streaming<FlightData>>,
-    ) -> Result<Response<Self::DoExchangeStream>, Status> {
+    ) -> StdResult<Response<Self::DoExchangeStream>, Status> {
         Err(Status::unimplemented("do_exchange not implemented"))
     }
 }
