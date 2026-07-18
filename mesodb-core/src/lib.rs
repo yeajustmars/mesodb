@@ -2,6 +2,7 @@ pub mod ast;
 pub mod config;
 pub mod datom;
 pub mod db;
+pub mod edn;
 pub mod error;
 pub mod formatter;
 pub mod index;

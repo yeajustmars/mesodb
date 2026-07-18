@@ -1,5 +1,37 @@
 // mesodb-cli/src/edn.rs
 
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+
 use chrono::DateTime;
 use mesodb_core::transactor::Fact;
 use mesodb_core::types::Value;
@@ -190,3 +222,35 @@ enum Token {
     Inst(i64),
     Symbol(String),
 }
+
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
+// TODO: REMOVE THIS TO USE mesodb_core::edn
