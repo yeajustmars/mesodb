@@ -16,6 +16,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 mesodb-core = { path = "mesodb-core", version = "0.1.0" }
+mesodb-server = { path = "mesodb-server", version = "0.1.0" }
 
 # Core system (core, server, CLI, ...)
 arrow = "58.2.0"

@@ -8,11 +8,20 @@ license.workspace = true
 [dependencies]
 ahash.workspace = true
 arrow.workspace = true
+arrow-flight.workspace = true
 datafusion.workspace = true
+futures.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full"] }
+tokio-stream.workspace = true
+tonic.workspace = true
 
-mesodb-core = { path = "../mesodb-core" }
+mesodb-core.workspace = true
+mesodb-server.workspace = true
+
+# mesodb-core = { path = "../mesodb-core" }
+# mesodb-server = { path = "../mesodb-server" }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["async_tokio"] }
@@ -32,4 +41,8 @@ harness = false
 
 [[bench]]
 name = "compiler"
+harness = false
+
+[[bench]]
+name = "flight"
 harness = false

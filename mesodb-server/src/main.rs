@@ -7,14 +7,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tonic::transport::Server as TonicServer;
 
-use crate::flight::MesoFlightServer;
 use mesodb_core::config::Config;
 use mesodb_core::db::MesoDB;
 use mesodb_core::schema::SchemaMap;
-
-mod dto;
-mod flight;
-mod handlers;
+use mesodb_server::{flight::MesoFlightServer, handlers};
 
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {

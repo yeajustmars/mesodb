@@ -3456,12 +3456,18 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "arrow",
+ "arrow-flight",
  "criterion",
  "datafusion",
+ "futures",
  "mesodb-core",
+ "mesodb-server",
  "proptest",
+ "serde_json",
  "tempfile",
  "tokio",
+ "tokio-stream",
+ "tonic",
 ]
 
 [[package]]
