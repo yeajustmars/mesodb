@@ -292,13 +292,36 @@ impl MesoDB {
                 SELECT * FROM compacted_datoms UNION ALL SELECT * FROM volatile_datoms
             ),
             reconstructed_retractions AS (
-                SELECT e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid, t, false as op, valid_to as valid_from, (CASE WHEN false THEN valid_to ELSE NULL END) as next_from, valid_to
-                FROM compacted_datoms WHERE op = true AND CAST(valid_to AS BIGINT) < 9223372036854775807
+                SELECT
+                    e,
+                    a,
+                    v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid,
+                    t,
+                    false as op,
+                    valid_to as valid_from,
+                    (CASE WHEN false THEN valid_to ELSE NULL END) as next_from,
+                    valid_to
+                FROM
+                    compacted_datoms
+                WHERE
+                    op = true
+                    AND CAST(valid_to AS BIGINT) < 9223372036854775807
             )
-            SELECT e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid, t, op, valid_from, (CASE WHEN false THEN valid_from ELSE NULL END) as next_from, valid_to FROM raw_combined
+            SELECT
+                e,
+                a,
+                v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid,
+                t,
+                op,
+                valid_from,
+                (CASE WHEN false THEN valid_from ELSE NULL END) as next_from,
+                valid_to
+            FROM
+                raw_combined
             UNION ALL
             SELECT * FROM reconstructed_retractions
-            "#.to_string()
+            "#
+            .to_string()
         } else {
             // Dynamically construct time filters to safely evaluate 'current state' vs 'past state'
             let t = options.as_of.unwrap_or(i64::MAX);
@@ -306,10 +329,12 @@ impl MesoDB {
                 Some(_) => (
                     format!("WHERE CAST(valid_from AS BIGINT) <= {t}"),
                     format!(
-                        "AND CAST(valid_from AS BIGINT) <= {t} AND CAST(COALESCE(next_from, valid_to) AS BIGINT) >= {t}"
+                        "AND CAST(valid_from AS BIGINT) <= {t}
+                        AND CAST(COALESCE(next_from, valid_to) AS BIGINT) >= {t}"
                     ),
                     format!(
-                        "AND CAST(c.valid_from AS BIGINT) <= {t} AND CAST(c.valid_to AS BIGINT) >= {t}"
+                        "AND CAST(c.valid_from AS BIGINT) <= {t}
+                        AND CAST(c.valid_to AS BIGINT) >= {t}"
                     ),
                 ),
                 None => (
@@ -326,22 +351,49 @@ impl MesoDB {
                     SELECT * FROM volatile_datoms {vol_filter}
                 ),
                 volatile_bounds AS (
-                    SELECT *, LEAD(valid_from) OVER (PARTITION BY e, a ORDER BY valid_from ASC, t ASC, op ASC) as next_from
+                    SELECT
+                        *,
+                        LEAD(valid_from)
+                        OVER (PARTITION BY e, a ORDER BY valid_from ASC, t ASC, op ASC) as next_from
                     FROM volatile_filtered
                 ),
                 active_volatile AS (
-                    SELECT e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid, t, op, valid_from, next_from, COALESCE(next_from, valid_to) as valid_to
-                    FROM volatile_bounds
-                    WHERE op = true {active_vol_filter}
+                    SELECT
+                        e,
+                        a,
+                        v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid,
+                        t,
+                        op,
+                        valid_from,
+                        next_from,
+                        COALESCE(next_from, valid_to) as valid_to
+                    FROM
+                        volatile_bounds
+                    WHERE
+                        op = true {active_vol_filter}
                 ),
                 volatile_mask AS (
                     SELECT DISTINCT e, a FROM volatile_filtered
                 ),
                 surviving_compacted AS (
-                    SELECT c.e, c.a, c.v_bool, c.v_int, c.v_float, c.v_str, c.v_ref, c.v_time, c.v_uuid, c.t, c.op, c.valid_from, (CASE WHEN false THEN c.valid_from ELSE NULL END) as next_from, c.valid_to
-                    FROM compacted_datoms c
-                    WHERE c.op = true {comp_filter}
-                      AND NOT EXISTS (SELECT 1 FROM volatile_mask m WHERE m.e = c.e AND m.a = c.a)
+                    SELECT
+                        c.e,
+                        c.a,
+                        c.v_bool, c.v_int, c.v_float, c.v_str, c.v_ref, c.v_time, c.v_uuid,
+                        c.t,
+                        c.op,
+                        c.valid_from,
+                        (CASE WHEN false THEN c.valid_from ELSE NULL END) as next_from,
+                        c.valid_to
+                    FROM
+                        compacted_datoms c
+                    WHERE
+                        c.op = true {comp_filter}
+                        AND NOT EXISTS (SELECT 1
+                                        FROM volatile_mask m
+                                        WHERE
+                                            m.e = c.e
+                                            AND m.a = c.a)
                 )
                 SELECT * FROM surviving_compacted
                 UNION ALL
