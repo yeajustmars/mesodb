@@ -7,11 +7,11 @@ license.workspace = true
 
 [dependencies]
 ahash.workspace = true
-arc-swap.workspace = true
 arrow.workspace = true
 chrono.workspace = true
 datafusion.workspace = true
 ordered-float.workspace = true
+parking_lot.workspace = true
 parquet.workspace = true
 pest.workspace = true
 pest_derive.workspace = true

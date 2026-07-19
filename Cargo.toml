@@ -19,7 +19,6 @@ mesodb-core = { path = "mesodb-core", version = "0.1.0" }
 mesodb-server = { path = "mesodb-server", version = "0.1.0" }
 
 # Core system (core, server, CLI, ...)
-arc-swap = "1.9.2"
 arrow = "58.2.0"
 arrow-flight = "58.2.0"
 ahash = "0.8.12"
@@ -31,6 +30,7 @@ comfy-table = "7.2.2"
 datafusion = "53.1.0"
 futures = "0.3.32"
 ordered-float = "5.3.0"
+parking_lot = "0.12.5"
 parquet = "58.2.0"
 pest = "2.8.6"
 pest_derive = "2.8.6"
