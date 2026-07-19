@@ -1,6 +1,7 @@
 // mesodb-core/src/transactor.rs
 
 use arrow::record_batch::RecordBatch;
+use parking_lot::RwLock;
 use std::{
     collections::HashSet,
     path::Path,
@@ -9,6 +10,7 @@ use std::{
 };
 
 use crate::{
+    btree::NowIndex,
     config::Config,
     datom::Datom,
     error::MesoError,
@@ -26,6 +28,7 @@ pub struct Transactor {
     pub schema: SchemaMap,
     pub timeline: SchemaTimeline,
     pub indices: IndexManager,
+    pub now_index: Arc<RwLock<NowIndex>>,
     pub current_tx_id: TxId,
 }
 
@@ -34,6 +37,7 @@ impl Transactor {
         wal_path: P,
         mut schema: SchemaMap,
         config: Config,
+        now_index: Arc<RwLock<NowIndex>>,
     ) -> Result<(Self, RecordBatch)> {
         let mut wal = Wal::open(wal_path)?;
         let mut indices = IndexManager::new();
@@ -102,6 +106,7 @@ impl Transactor {
                 schema,
                 timeline,
                 indices,
+                now_index,
                 current_tx_id,
             },
             recovered_batch,
@@ -331,6 +336,7 @@ impl Transactor {
 
         // --- PHASE 3: Update RAM Indices & Build Arrow Batch ---
         let mut tx_memtable = MemTable::new(pending_datoms.len());
+        let mut now_idx_guard = self.now_index.write();
 
         for datom in &pending_datoms {
             let is_unique = self.schema.get_by_id(datom.a).unwrap().is_unique;
@@ -342,9 +348,11 @@ impl Transactor {
                     is_unique,
                     datom.valid_from,
                 );
+                let _ = now_idx_guard.put(datom.e, datom.a, &datom.v);
             } else {
                 self.indices
                     .remove(datom.e, datom.a, &datom.v, is_unique, datom.valid_from);
+                let _ = now_idx_guard.delete(datom.e, datom.a);
             }
             tx_memtable.append(datom.clone());
         }
@@ -383,16 +391,24 @@ pub struct TxReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
 
-    fn setup_transactor() -> (Transactor, NamedTempFile) {
-        let temp_file = NamedTempFile::new().unwrap();
+    fn setup_transactor() -> (Transactor, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("wal");
+        let idx_path = dir.path().join("idx");
+
+        let now_index = std::sync::Arc::new(parking_lot::RwLock::new(
+            crate::btree::NowIndex::open(idx_path).unwrap(),
+        ));
+
         let mut schema = SchemaMap::new();
         schema.add_attribute(":user/name", ValueType::String, false);
         schema.add_attribute(":user/email", ValueType::String, true);
+
         let config = Config::default();
-        let (transactor, _) = Transactor::new(temp_file.path(), schema, config).unwrap();
-        (transactor, temp_file)
+        let (transactor, _) = Transactor::new(wal_path, schema, config, now_index).unwrap();
+
+        (transactor, dir)
     }
 
     #[test]
@@ -536,13 +552,20 @@ mod tests {
 
     #[test]
     fn test_jit_schema_durability_and_recovery() {
-        let temp_file = NamedTempFile::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("wal");
+        let idx_path = dir.path().join("idx");
         let config = Config::default();
 
         // 1. Boot fresh transactor and transact a totally unknown attribute
         {
+            let now_index = std::sync::Arc::new(parking_lot::RwLock::new(
+                crate::btree::NowIndex::open(&idx_path).unwrap(),
+            ));
+
             let (mut t, _) =
-                Transactor::new(temp_file.path(), SchemaMap::new(), config.clone()).unwrap();
+                Transactor::new(&wal_path, SchemaMap::new(), config.clone(), now_index).unwrap();
+
             t.transact(vec![Fact {
                 e: 1,
                 ident: ":new/jit_attr".into(), // Does not exist in the initial SchemaMap!
@@ -559,8 +582,12 @@ mod tests {
 
         // 2. Re-open from the exact same WAL file
         {
+            let now_index = std::sync::Arc::new(parking_lot::RwLock::new(
+                crate::btree::NowIndex::open(&idx_path).unwrap(),
+            ));
+
             let (t_recovered, _) =
-                Transactor::new(temp_file.path(), SchemaMap::new(), config).unwrap();
+                Transactor::new(&wal_path, SchemaMap::new(), config, now_index).unwrap();
 
             // If the SchemaMutation wasn't durable, this would fail!
             assert!(t_recovered.schema.contains_ident(":new/jit_attr"));

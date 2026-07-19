@@ -39,16 +39,19 @@ impl MesoDB {
         create_dir_all(&data_dir)?;
         create_dir_all(data_dir.join("parquet"))?;
 
-        // Destructure the tuple to grab the recovered RAM batch
-        let (transactor, recovered_batch) = Transactor::new(path, schema.clone(), config.clone())?;
+        // Initialize the Tier 1 B+Tree
+        let now_idx_path = data_dir.join("now.idx");
+        let now_index = Arc::new(RwLock::new(crate::btree::NowIndex::open(now_idx_path)?));
+
+        // Pass the B+Tree into the transactor
+        let (transactor, recovered_batch) =
+            Transactor::new(path, schema.clone(), config.clone(), now_index.clone())?;
 
         let mut initial_ram = BTreeMap::new();
         let empty_batch = MemTable::new(0).finish()?;
         initial_ram.insert(0, empty_batch);
 
-        // If we recovered uncompacted data, mount it. Otherwise, mount an empty schema batch.
         if recovered_batch.num_rows() > 0 {
-            // Use the current_tx_id as the key so the background flusher can eventually process it
             initial_ram.insert(transactor.current_tx_id, recovered_batch);
         } else {
             let empty_batch = MemTable::new(0).finish()?;
@@ -60,6 +63,7 @@ impl MesoDB {
             data_dir: data_dir.clone(),
             schema: Arc::new(schema),
             timeline: Arc::new(transactor.timeline.clone()),
+            now_index,
         })));
 
         let (flush_tx, flush_rx) = mpsc::channel(config.compactor.backpressure_threshold);
@@ -100,6 +104,7 @@ impl MesoDB {
                     data_dir: current_view.data_dir.clone(),
                     schema: current_view.schema.clone(),
                     timeline: current_view.timeline.clone(),
+                    now_index: current_view.now_index.clone(),
                 });
 
                 *writer = new_view;
@@ -144,6 +149,7 @@ impl MesoDB {
                 data_dir: current_view.data_dir.clone(),
                 schema: Arc::new(tx.schema.clone()),
                 timeline: Arc::new(tx.timeline.clone()),
+                now_index: current_view.now_index.clone(),
             });
 
             *writer = new_view;
@@ -178,6 +184,7 @@ impl MesoDB {
                     data_dir: current_view.data_dir.clone(),
                     schema: new_schema,
                     timeline: new_timeline,
+                    now_index: current_view.now_index.clone(),
                 });
 
                 *writer = new_view;
@@ -202,6 +209,128 @@ impl MesoDB {
     // STANDARD QUERY API PIPELINE
     // =====================================================================
 
+    /// Evaluates if an AST qualifies for the Tier 1 zero-copy Fast-Path.
+    /// If it does, it queries the memory-mapped B+Tree and short-circuits DataFusion entirely.
+    fn try_fast_path(
+        &self,
+        ast: &crate::ast::Query,
+        options: &QueryOptions,
+        view: &WorldView,
+    ) -> Result<Option<Vec<RecordBatch>>> {
+        // Must be a "Now" query
+        if options.history || options.as_of.is_some() || options.rules.is_some() {
+            return Ok(None);
+        }
+
+        // AST must be a simple identity point-lookup: [:find ?v :where [42 :attr ?v]]
+        if ast.find.len() != 1 || ast.where_clauses.len() != 1 {
+            return Ok(None);
+        }
+
+        let find_var = match &ast.find[0] {
+            crate::ast::FindSpec::Variable(v) => v,
+            _ => return Ok(None),
+        };
+
+        let (e_id, a_ident, v_var) = match &ast.where_clauses[0] {
+            crate::ast::WhereClause::DataPattern {
+                e: crate::ast::Term::Integer(id),
+                a: crate::ast::Term::Keyword(kw),
+                v: crate::ast::Term::Variable(var),
+                tx: None,
+                op: None,
+            } => (*id as u64, kw, var),
+            _ => return Ok(None),
+        };
+
+        if v_var != find_var {
+            return Ok(None);
+        }
+
+        let a_id = match view.schema.get_id(a_ident) {
+            Some(id) => id,
+            None => return Ok(Some(vec![])), // Valid empty response (Attribute doesn't exist)
+        };
+
+        // --- THE FIX ---
+        // Verify the attribute's ValueType is supported by the Tier 1 B+Tree.
+        // Strings and UUIDs require overflow pages (Pending), so they must drop to the slow path.
+        let attr = view.schema.get_by_id(a_id).unwrap();
+        match attr.value_type {
+            ValueType::String | ValueType::Uuid => return Ok(None),
+            _ => {} // Supported natively by the 16-byte fixed layout
+        }
+
+        // AST is verified. Hit the zero-copy B+Tree!
+        let now_index = view.now_index.read();
+        if let Some(val) = now_index.get(e_id, a_id)? {
+            let clean_var = find_var.replace("?", "");
+
+            // Reconstruct a single-row Arrow batch manually to bypass DataFusion
+            let (field, array): (arrow::datatypes::Field, Arc<dyn arrow::array::Array>) = match val
+            {
+                Value::String(s) => (
+                    arrow::datatypes::Field::new(
+                        &clean_var,
+                        arrow::datatypes::DataType::Utf8,
+                        true,
+                    ),
+                    Arc::new(arrow::array::StringArray::from(vec![s])),
+                ),
+                Value::Int64(i) => (
+                    arrow::datatypes::Field::new(
+                        &clean_var,
+                        arrow::datatypes::DataType::Int64,
+                        true,
+                    ),
+                    Arc::new(arrow::array::Int64Array::from(vec![i])),
+                ),
+                Value::Float64(f) => (
+                    arrow::datatypes::Field::new(
+                        &clean_var,
+                        arrow::datatypes::DataType::Float64,
+                        true,
+                    ),
+                    Arc::new(arrow::array::Float64Array::from(vec![f])),
+                ),
+                Value::Boolean(b) => (
+                    arrow::datatypes::Field::new(
+                        &clean_var,
+                        arrow::datatypes::DataType::Boolean,
+                        true,
+                    ),
+                    Arc::new(arrow::array::BooleanArray::from(vec![b])),
+                ),
+                Value::Ref(r) => (
+                    arrow::datatypes::Field::new(
+                        &clean_var,
+                        arrow::datatypes::DataType::UInt64,
+                        true,
+                    ),
+                    Arc::new(arrow::array::UInt64Array::from(vec![r])),
+                ),
+                Value::Timestamp(t) => (
+                    arrow::datatypes::Field::new(
+                        &clean_var,
+                        arrow::datatypes::DataType::Timestamp(
+                            arrow::datatypes::TimeUnit::Microsecond,
+                            None,
+                        ),
+                        true,
+                    ),
+                    Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![t])),
+                ),
+                Value::Uuid(_) => return Ok(None), // Fallback safety
+            };
+
+            let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
+            let batch = RecordBatch::try_new(schema, vec![array]).map_err(MesoError::Arrow)?;
+            return Ok(Some(vec![batch]));
+        }
+
+        Ok(Some(vec![])) // Entity not found, valid Fast-Path empty return
+    }
+
     pub async fn query(&self, query_str: &str) -> Result<Vec<RecordBatch>> {
         self.query_with_options(query_str, QueryOptions::default())
             .await
@@ -214,6 +343,12 @@ impl MesoDB {
     ) -> Result<Vec<RecordBatch>> {
         let ast = parser::parse_query(query_str)?;
         let view = { self.world_view.read().clone() };
+
+        // --- FAST PATH ROUTER ---
+        if let Some(fast_result) = self.try_fast_path(&ast, &options, &view)? {
+            return Ok(fast_result);
+        }
+
         let ctx = SessionContext::new();
         let ruleset = if let Some(r) = &options.rules {
             Some(parser::parse_ruleset(r)?)
@@ -481,6 +616,7 @@ pub struct WorldView {
     pub data_dir: PathBuf,
     pub schema: Arc<SchemaMap>,
     pub timeline: Arc<SchemaTimeline>,
+    pub now_index: Arc<RwLock<crate::btree::NowIndex>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -2174,6 +2310,7 @@ mod tests {
                 data_dir: current_view.data_dir.clone(),
                 schema: current_view.schema.clone(),
                 timeline: current_view.timeline.clone(),
+                now_index: current_view.now_index.clone(),
             });
         });
 
@@ -2356,6 +2493,7 @@ mod tests {
                 data_dir: current_view.data_dir.clone(),
                 schema: current_view.schema.clone(),
                 timeline: current_view.timeline.clone(),
+                now_index: current_view.now_index.clone(),
             });
         });
 

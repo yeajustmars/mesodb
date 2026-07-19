@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::{
     error::MesoError,
-    page::{IndexKey, IndexValue, NUM_CELLS, NodePage},
+    page::{IndexKey, IndexValue, NUM_CELLS},
     pager::Pager,
     types::{AttributeId, EntityId, Value},
 };
@@ -55,7 +55,12 @@ impl NowIndex {
                 }
 
                 if left < num_cells && node.keys[left] == target_key {
-                    return Ok(Some(Self::decode_value(&node.values[left])));
+                    let iv = &node.values[left];
+                    // 254 is our Tombstone tag for retracted values
+                    if iv.type_tag == 254 {
+                        return Ok(None);
+                    }
+                    return Ok(Some(Self::decode_value(iv)));
                 }
                 return Ok(None);
             } else {
@@ -64,14 +69,45 @@ impl NowIndex {
                 while child_idx < num_cells && target_key >= node.keys[child_idx] {
                     child_idx += 1;
                 }
-                // If it's smaller than the first key, we still follow the 0th child
-                // because it's a new absolute minimum being inserted.
                 if child_idx > 0 {
-                    child_idx -= 1;
+                    child_idx = child_idx.saturating_sub(1);
                 }
                 current_page_id = Self::child_page_id(&node.values[child_idx]);
             }
         }
+    }
+
+    /// Retracts a value from the current state index by inserting a Tombstone.
+    pub fn delete(&mut self, e: EntityId, a: AttributeId) -> Result<(), MesoError> {
+        let key = IndexKey { e, a, _pad: 0 };
+        let tombstone = IndexValue {
+            type_tag: 254,
+            padding: [0; 7],
+            payload: [0; 8],
+        };
+
+        if let Some((split_key, right_page_id)) =
+            self.insert_into_node(self.root_page_id, key, tombstone)?
+        {
+            // Re-use the exact same root-split logic from `put`
+            let new_left_id = self.pager.allocate_page()?;
+            {
+                let root_node = self.pager.get_node(self.root_page_id)?;
+                let new_left_node = *root_node;
+                let left_node_mut = self.pager.get_node_mut(new_left_id)?;
+                *left_node_mut = new_left_node;
+            }
+            let left_min_key = self.pager.get_node(new_left_id)?.keys[0];
+            let root_mut = self.pager.get_node_mut(self.root_page_id)?;
+
+            root_mut.header.is_leaf = 0;
+            root_mut.header.num_cells = 2;
+            root_mut.keys[0] = left_min_key;
+            root_mut.values[0] = Self::make_child_ptr(new_left_id);
+            root_mut.keys[1] = split_key;
+            root_mut.values[1] = Self::make_child_ptr(right_page_id);
+        }
+        Ok(())
     }
 
     pub fn put(&mut self, e: EntityId, a: AttributeId, v: &Value) -> Result<(), MesoError> {
@@ -145,7 +181,7 @@ impl NowIndex {
                 node_mut.keys[insert_idx] = target_key;
                 node_mut.values[insert_idx] = target_val;
                 node_mut.header.num_cells += 1;
-                return Ok(None);
+                Ok(None)
             } else {
                 // SPLIT LEAF NODE
                 let mut temp_keys = [IndexKey {
@@ -198,7 +234,7 @@ impl NowIndex {
                 left_node.keys[..left_count].copy_from_slice(&temp_keys[..left_count]);
                 left_node.values[..left_count].copy_from_slice(&temp_vals[..left_count]);
 
-                return Ok(Some((temp_keys[left_count], right_page_id)));
+                Ok(Some((temp_keys[left_count], right_page_id)))
             }
         } else {
             // INTERNAL NODE
@@ -210,7 +246,7 @@ impl NowIndex {
                     child_idx += 1;
                 }
                 if child_idx > 0 {
-                    child_idx -= 1;
+                    child_idx = child_idx.saturating_sub(1);
                 }
                 child_page_id = Self::child_page_id(&node.values[child_idx]);
             }
