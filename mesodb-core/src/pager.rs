@@ -23,13 +23,11 @@ impl Pager {
         let file_len = file.metadata()?.len();
         let target_len = (initial_pages as u64) * (PAGE_SIZE as u64);
 
-        // Pre-allocate the physical file space if it's too small
         if file_len < target_len {
             file.set_len(target_len)?;
         }
 
-        // Map the entire file directly into virtual memory
-        let mmap = unsafe { MmapOptions::new().map_mut(&file)? };
+        let mmap = unsafe { MmapOptions::new().map_mut(&file).map_err(MesoError::Io)? };
         let num_pages = (mmap.len() / PAGE_SIZE) as u32;
 
         Ok(Self {
@@ -39,7 +37,33 @@ impl Pager {
         })
     }
 
-    /// Fetches a mutable reference to a B+Tree Node, zero-copy.
+    /// Dynamically grows the memory-mapped file, allocating a new zeroed page.
+    pub fn allocate_page(&mut self) -> Result<u32, MesoError> {
+        let page_id = self.num_pages;
+        let needed_len = ((page_id + 1) as u64) * (PAGE_SIZE as u64);
+
+        // If we exceed our virtual map, double the file size and remap
+        if needed_len > self.mmap.len() as u64 {
+            self.flush()?;
+            let new_len = std::cmp::max(needed_len, (self.mmap.len() * 2) as u64);
+            self.file.set_len(new_len).map_err(MesoError::Io)?;
+            self.mmap = unsafe {
+                MmapOptions::new()
+                    .map_mut(&self.file)
+                    .map_err(MesoError::Io)?
+            };
+        }
+
+        self.num_pages += 1;
+
+        // Guarantee the new page is zero-initialized for safety
+        let offset = (page_id as usize) * PAGE_SIZE;
+        let page_bytes = &mut self.mmap[offset..(offset + PAGE_SIZE)];
+        page_bytes.fill(0);
+
+        Ok(page_id)
+    }
+
     pub fn get_node_mut(&mut self, page_id: u32) -> Result<&mut NodePage, MesoError> {
         if page_id >= self.num_pages {
             return Err(MesoError::Serialization(format!(
@@ -47,16 +71,11 @@ impl Pager {
                 page_id
             )));
         }
-
         let offset = (page_id as usize) * PAGE_SIZE;
         let page_bytes = &mut self.mmap[offset..(offset + PAGE_SIZE)];
-
-        // The cast boundary: Bytes to struct instantly
-        let node: &mut NodePage = bytemuck::from_bytes_mut(page_bytes);
-        Ok(node)
+        Ok(bytemuck::from_bytes_mut(page_bytes))
     }
 
-    /// Fetches a read-only reference to a B+Tree Node, zero-copy.
     pub fn get_node(&self, page_id: u32) -> Result<&NodePage, MesoError> {
         if page_id >= self.num_pages {
             return Err(MesoError::Serialization(format!(
@@ -64,12 +83,9 @@ impl Pager {
                 page_id
             )));
         }
-
         let offset = (page_id as usize) * PAGE_SIZE;
         let page_bytes = &self.mmap[offset..(offset + PAGE_SIZE)];
-
-        let node: &NodePage = bytemuck::from_bytes(page_bytes);
-        Ok(node)
+        Ok(bytemuck::from_bytes(page_bytes))
     }
 
     pub fn flush(&self) -> Result<(), MesoError> {
