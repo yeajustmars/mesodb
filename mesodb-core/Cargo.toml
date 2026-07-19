@@ -8,8 +8,10 @@ license.workspace = true
 [dependencies]
 ahash.workspace = true
 arrow.workspace = true
+bytemuck.workspace = true
 chrono.workspace = true
 datafusion.workspace = true
+memmap2.workspace = true
 ordered-float.workspace = true
 parking_lot.workspace = true
 parquet.workspace = true
