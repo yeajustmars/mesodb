@@ -279,15 +279,6 @@ impl MesoDB {
             None => return Ok(Some(vec![])), // Valid empty response (Attribute doesn't exist)
         };
 
-        // --- THE FIX ---
-        // Verify the attribute's ValueType is supported by the Tier 1 B+Tree.
-        // Strings and UUIDs require overflow pages (Pending), so they must drop to the slow path.
-        let attr = view.schema.get_by_id(a_id).unwrap();
-        match attr.value_type {
-            ValueType::String | ValueType::Uuid => return Ok(None),
-            _ => {}
-        }
-
         // AST is verified. Hit the zero-copy B+Tree!
         let now_index = view.now_index.read();
         if let Some(val) = now_index.get(e_id, a_id)? {
