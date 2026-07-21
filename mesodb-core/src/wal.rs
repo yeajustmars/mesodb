@@ -35,7 +35,6 @@ impl Wal {
         Ok(Self { file, path: p })
     }
 
-    // UPDATED: Now takes a WalEntry enum
     pub fn append_entry(&mut self, entry: &WalEntry, sync_mode: &WalSyncMode) -> Result<()> {
         self.file.seek(SeekFrom::End(0))?;
 
@@ -59,7 +58,6 @@ impl Wal {
         Ok(())
     }
 
-    // UPDATED: Returns Vec<WalEntry>
     pub fn recover(&mut self) -> Result<Vec<WalEntry>> {
         self.file.seek(SeekFrom::Start(0))?;
         let mut all_entries = Vec::new();
@@ -97,6 +95,64 @@ impl Wal {
 
         self.file.seek(SeekFrom::End(0))?;
         Ok(all_entries)
+    }
+
+    /// Checkpoints the WAL by rewriting it.
+    /// Drops any DataBatch with a transaction ID <= `safe_tx_id`.
+    /// Retains all SchemaMutations and newer DataBatches.
+    pub fn checkpoint(&mut self, safe_tx_id: u64) -> Result<()> {
+        let entries = self.recover()?;
+        let mut retained = Vec::new();
+
+        for entry in entries {
+            match &entry {
+                WalEntry::DataBatch(datoms) => {
+                    // Only keep batches that contain datoms newer than our safe checkpoint
+                    let max_t = datoms.iter().map(|d| d.t).max().unwrap_or(0);
+                    if max_t > safe_tx_id {
+                        retained.push(entry);
+                    }
+                }
+                WalEntry::SchemaMutation(_) => {
+                    // Schema mutations define our timeline and must be preserved
+                    // until we build a dedicated Parquet schema catalog.
+                    retained.push(entry);
+                }
+            }
+        }
+
+        // Write to a temporary file first to guarantee crash safety during the checkpoint
+        let tmp_path = self.path.with_extension("tmp");
+        let mut tmp_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true) // Ensure we start fresh
+            .open(&tmp_path)?;
+
+        for entry in &retained {
+            let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(entry)
+                .map_err(|e| MesoError::Serialization(e.to_string()))?;
+            let len = bytes.len() as u64;
+
+            tmp_file.write_all(&len.to_ne_bytes())?;
+            tmp_file.write_all(&bytes)?;
+        }
+        tmp_file.sync_all()?;
+
+        // Atomic file swap
+        std::fs::rename(&tmp_path, &self.path)?;
+
+        // Re-open the main file handle and seek to the end for future appends
+        self.file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false) // Satisfy Clippy: explicitly declare we are not truncating
+            .open(&self.path)?;
+        self.file.seek(SeekFrom::End(0))?;
+
+        Ok(())
     }
 
     pub fn data_dir(&self) -> PathBuf {
@@ -172,5 +228,74 @@ mod tests {
 
         // Only the valid envelope survives
         assert_eq!(recovered.len(), 1);
+    }
+
+    #[test]
+    fn test_wal_checkpoint_pruning() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut wal = Wal::open(temp_file.path()).unwrap();
+
+        // 1. DataBatch (Tx 1) - Should be pruned
+        wal.append_entry(
+            &WalEntry::DataBatch(vec![Datom::assert(1, 10, Value::Int64(100), 1, 1000)]),
+            &WalSyncMode::Strict,
+        )
+        .unwrap();
+
+        // 2. SchemaMutation (Tx 2) - MUST be retained
+        let schema_mutation = crate::schema::SchemaMutation::AddAttribute {
+            tx_id: 2,
+            timestamp: 1500,
+            attribute: crate::schema::Attribute {
+                id: 11,
+                ident: ":test/new".into(),
+                value_type: crate::schema::ValueType::String,
+                is_unique: false,
+            },
+        };
+        wal.append_entry(
+            &WalEntry::SchemaMutation(schema_mutation),
+            &WalSyncMode::Strict,
+        )
+        .unwrap();
+
+        // 3. DataBatch (Tx 3) - MUST be retained (newer than safe_tx_id)
+        wal.append_entry(
+            &WalEntry::DataBatch(vec![Datom::assert(
+                2,
+                11,
+                Value::String("keep".into()),
+                3,
+                2000,
+            )]),
+            &WalSyncMode::Strict,
+        )
+        .unwrap();
+
+        // EXECUTE CHECKPOINT: Declare everything up to Tx 2 is safely in Parquet.
+        wal.checkpoint(2).unwrap();
+
+        // RECOVER AND VERIFY
+        let mut recovering_wal = Wal::open(temp_file.path()).unwrap();
+        let recovered = recovering_wal.recover().unwrap();
+
+        // We expect exactly 2 envelopes: The Schema (Tx 2) and the Data (Tx 3)
+        assert_eq!(
+            recovered.len(),
+            2,
+            "WAL should have pruned exactly 1 DataBatch"
+        );
+
+        match &recovered[0] {
+            WalEntry::SchemaMutation(m) => match m {
+                crate::schema::SchemaMutation::AddAttribute { tx_id, .. } => assert_eq!(*tx_id, 2),
+            },
+            _ => panic!("Expected first retained entry to be a SchemaMutation"),
+        }
+
+        match &recovered[1] {
+            WalEntry::DataBatch(datoms) => assert_eq!(datoms[0].t, 3),
+            _ => panic!("Expected second retained entry to be the newer DataBatch"),
+        }
     }
 }
