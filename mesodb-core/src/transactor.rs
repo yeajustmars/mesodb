@@ -170,8 +170,7 @@ impl Transactor {
         for mut fact in facts {
             let resolved_valid_time = fact.valid_time.unwrap_or(now);
 
-            // --- REIFIED TRANSACTIONS ---
-            // Entity ID 0 is a reserved pointer to the current transaction.
+            // Reified Transactions: Entity ID 0 points to current transaction
             if fact.e == 0 {
                 fact.e = tx_id;
             }
@@ -189,7 +188,6 @@ impl Transactor {
                     _ => ValueType::String,
                 };
 
-                // Make JIT schema durable!
                 let new_attr = self.schema.add_attribute(&fact.ident, inferred_type, false);
 
                 let mutation = SchemaMutation::AddAttribute {
@@ -213,7 +211,7 @@ impl Transactor {
                 )));
             };
 
-            // --- JIT TYPE COERCION ---
+            // JIT Type Coercion
             if let Some(attr) = self.schema.get_by_id(attr_id)
                 && attr.value_type == ValueType::Ref
                 && let Value::Int64(i) = fact.v
@@ -231,7 +229,7 @@ impl Transactor {
                     .get_value_at(fact.e, attr_id, resolved_valid_time);
                 let current_matches = match current_v {
                     Some(v) => v == expected_v,
-                    None => false, // Standard CAS requires the old value to exist
+                    None => false,
                 };
 
                 if !current_matches {
@@ -243,7 +241,7 @@ impl Transactor {
             }
 
             if fact.op {
-                // Assertions
+                // --- UNIQUE CONSTRAINT VALIDATION ---
                 if is_unique {
                     let key = (attr_id, fact.v.clone());
 
@@ -279,7 +277,7 @@ impl Transactor {
                     }
                 }
 
-                // Retract existing value if it differs
+                // Automatic Retraction Check (RESTORED unconditionally)
                 if let Some(existing_v) =
                     self.indices
                         .get_value_at(fact.e, attr_id, resolved_valid_time)
@@ -293,7 +291,7 @@ impl Transactor {
                             resolved_valid_time,
                         ));
                     } else {
-                        continue; // No-op: value is already exactly this
+                        continue; // No-op: value already set
                     }
                 }
 
@@ -305,7 +303,7 @@ impl Transactor {
                     resolved_valid_time,
                 ));
             } else {
-                // Retractions
+                // Retraction (RESTORED verification)
                 if let Some(existing_v) =
                     self.indices
                         .get_value_at(fact.e, attr_id, resolved_valid_time)
@@ -322,17 +320,19 @@ impl Transactor {
             }
         }
 
-        // --- PHASE 2: WAL Persistence (Crash Safety) ---
+        // --- PHASE 2: WAL Persistence ---
         self.wal.append_entry(
             &WalEntry::DataBatch(pending_datoms.clone()),
             &self.config.storage.wal_sync_mode,
         )?;
 
-        // --- PHASE 3: Update RAM Indices & Build Arrow Batch ---
+        // --- PHASE 3: Build Arrow Batch & Maintain Validation Index ---
         let mut tx_memtable = MemTable::new(pending_datoms.len());
 
         for datom in &pending_datoms {
             let is_unique = self.schema.get_by_id(datom.a).unwrap().is_unique;
+
+            // RESTORED unconditionally to maintain EAVT for history and CAS
             if datom.op {
                 self.indices.insert(
                     datom.e,
@@ -345,6 +345,7 @@ impl Transactor {
                 self.indices
                     .remove(datom.e, datom.a, &datom.v, is_unique, datom.valid_from);
             }
+
             tx_memtable.append(datom.clone());
         }
 
@@ -355,7 +356,7 @@ impl Transactor {
             tx_id,
             timestamp: now,
             datoms_written: pending_datoms.len(),
-            batch, // Ready to be consumed lock-free by readers!
+            batch,
         })
     }
 }
