@@ -88,6 +88,33 @@ impl Pager {
         Ok(bytemuck::from_bytes(page_bytes))
     }
 
+    pub fn get_overflow_mut(
+        &mut self,
+        page_id: u32,
+    ) -> Result<&mut crate::page::OverflowPage, MesoError> {
+        if page_id >= self.num_pages {
+            return Err(MesoError::Serialization(format!(
+                "Page out of bounds: {}",
+                page_id
+            )));
+        }
+        let offset = (page_id as usize) * crate::page::PAGE_SIZE;
+        let page_bytes = &mut self.mmap[offset..(offset + crate::page::PAGE_SIZE)];
+        Ok(bytemuck::from_bytes_mut(page_bytes))
+    }
+
+    pub fn get_overflow(&self, page_id: u32) -> Result<&crate::page::OverflowPage, MesoError> {
+        if page_id >= self.num_pages {
+            return Err(MesoError::Serialization(format!(
+                "Page out of bounds: {}",
+                page_id
+            )));
+        }
+        let offset = (page_id as usize) * crate::page::PAGE_SIZE;
+        let page_bytes = &self.mmap[offset..(offset + crate::page::PAGE_SIZE)];
+        Ok(bytemuck::from_bytes(page_bytes))
+    }
+
     pub fn flush(&self) -> Result<(), MesoError> {
         self.mmap.flush().map_err(MesoError::Io)
     }

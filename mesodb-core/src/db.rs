@@ -258,7 +258,7 @@ impl MesoDB {
         let attr = view.schema.get_by_id(a_id).unwrap();
         match attr.value_type {
             ValueType::String | ValueType::Uuid => return Ok(None),
-            _ => {} // Supported natively by the 16-byte fixed layout
+            _ => {}
         }
 
         // AST is verified. Hit the zero-copy B+Tree!
@@ -320,7 +320,35 @@ impl MesoDB {
                     ),
                     Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![t])),
                 ),
-                Value::Uuid(_) => return Ok(None), // Fallback safety
+                Value::Uuid(u) => {
+                    let uuid_str = format!(
+                        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                        u[0],
+                        u[1],
+                        u[2],
+                        u[3],
+                        u[4],
+                        u[5],
+                        u[6],
+                        u[7],
+                        u[8],
+                        u[9],
+                        u[10],
+                        u[11],
+                        u[12],
+                        u[13],
+                        u[14],
+                        u[15]
+                    );
+                    (
+                        arrow::datatypes::Field::new(
+                            &clean_var,
+                            arrow::datatypes::DataType::Utf8,
+                            true,
+                        ),
+                        Arc::new(arrow::array::StringArray::from(vec![uuid_str])),
+                    )
+                }
             };
 
             let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));

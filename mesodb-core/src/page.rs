@@ -51,9 +51,21 @@ pub struct NodePage {
     pub _padding: [u8; 24],
 }
 
-// Safely mark our exact 4096-byte struct as Plain Old Data
-unsafe impl Zeroable for NodePage {}
-unsafe impl Pod for NodePage {}
+// Manually implement bytemuck traits for NodePage due to array length limits
+unsafe impl bytemuck::Zeroable for NodePage {}
+unsafe impl bytemuck::Pod for NodePage {}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct OverflowPage {
+    pub next_page_id: u32,
+    pub length: u32,
+    pub data: [u8; 4088], // 4 + 4 + 4088 = 4096 bytes
+}
+
+// Manually implement bytemuck traits to bypass array length limits in the derive macro
+unsafe impl bytemuck::Zeroable for OverflowPage {}
+unsafe impl bytemuck::Pod for OverflowPage {}
 
 #[cfg(test)]
 mod tests {

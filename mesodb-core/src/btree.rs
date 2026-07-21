@@ -60,7 +60,7 @@ impl NowIndex {
                     if iv.type_tag == 254 {
                         return Ok(None);
                     }
-                    return Ok(Some(Self::decode_value(iv)));
+                    return Ok(Some(self.decode_value(iv)?));
                 }
                 return Ok(None);
             } else {
@@ -112,7 +112,7 @@ impl NowIndex {
 
     pub fn put(&mut self, e: EntityId, a: AttributeId, v: &Value) -> Result<(), MesoError> {
         let key = IndexKey { e, a, _pad: 0 };
-        let val = Self::encode_value(v)?;
+        let val = self.encode_value(v)?;
 
         if let Some((split_key, right_page_id)) =
             self.insert_into_node(self.root_page_id, key, val)?
@@ -348,7 +348,7 @@ impl NowIndex {
         }
     }
 
-    fn encode_value(v: &Value) -> Result<IndexValue, MesoError> {
+    fn encode_value(&mut self, v: &Value) -> Result<IndexValue, MesoError> {
         let mut payload = [0u8; 8];
         let type_tag = match v {
             Value::Boolean(b) => {
@@ -363,10 +363,20 @@ impl NowIndex {
                 payload.copy_from_slice(&f.to_ne_bytes());
                 2
             }
-            Value::String(_) => {
-                return Err(MesoError::Serialization(
-                    "String indexing pending overflow pages".into(),
-                ));
+            Value::String(s) => {
+                let bytes = s.as_bytes();
+                if bytes.len() > 4088 {
+                    panic!(
+                        "FATAL: String exceeds 4088 bytes. Chained overflow pages are pending implementation."
+                    );
+                }
+                let page_id = self.pager.allocate_page()?;
+                let overflow = self.pager.get_overflow_mut(page_id)?;
+                overflow.length = bytes.len() as u32;
+                overflow.next_page_id = 0;
+                overflow.data[..bytes.len()].copy_from_slice(bytes);
+                payload[0..4].copy_from_slice(&page_id.to_ne_bytes());
+                3
             }
             Value::Ref(r) => {
                 payload.copy_from_slice(&r.to_ne_bytes());
@@ -376,10 +386,15 @@ impl NowIndex {
                 payload.copy_from_slice(&t.to_ne_bytes());
                 5
             }
-            Value::Uuid(_) => {
-                return Err(MesoError::Serialization(
-                    "UUID indexing pending overflow pages".into(),
-                ));
+            Value::Uuid(u) => {
+                let page_id = self.pager.allocate_page()?;
+                let overflow = self.pager.get_overflow_mut(page_id)?;
+                overflow.length = 16;
+                overflow.next_page_id = 0;
+                // 'u' is already a &[u8; 16]
+                overflow.data[..16].copy_from_slice(u);
+                payload[0..4].copy_from_slice(&page_id.to_ne_bytes());
+                6
             }
         };
 
@@ -390,14 +405,35 @@ impl NowIndex {
         })
     }
 
-    fn decode_value(iv: &IndexValue) -> Value {
+    fn decode_value(&self, iv: &IndexValue) -> Result<Value, MesoError> {
         match iv.type_tag {
-            0 => Value::Boolean(iv.payload[0] != 0),
-            1 => Value::Int64(i64::from_ne_bytes(iv.payload)),
-            2 => Value::Float64(f64::from_ne_bytes(iv.payload)),
-            4 => Value::Ref(u64::from_ne_bytes(iv.payload)),
-            5 => Value::Timestamp(i64::from_ne_bytes(iv.payload)),
-            _ => Value::Boolean(false),
+            0 => Ok(Value::Boolean(iv.payload[0] != 0)),
+            1 => Ok(Value::Int64(i64::from_ne_bytes(iv.payload))),
+            2 => Ok(Value::Float64(f64::from_ne_bytes(iv.payload))),
+            3 => {
+                let mut bytes = [0u8; 4];
+                bytes.copy_from_slice(&iv.payload[0..4]);
+                let page_id = u32::from_ne_bytes(bytes);
+                let overflow = self.pager.get_overflow(page_id)?;
+                let len = overflow.length as usize;
+                let s = std::str::from_utf8(&overflow.data[..len])
+                    .map_err(|_| MesoError::Serialization("Invalid UTF-8 in overflow".into()))?
+                    .to_string();
+                Ok(Value::String(s))
+            }
+            4 => Ok(Value::Ref(u64::from_ne_bytes(iv.payload))),
+            5 => Ok(Value::Timestamp(i64::from_ne_bytes(iv.payload))),
+            6 => {
+                let mut bytes = [0u8; 4];
+                bytes.copy_from_slice(&iv.payload[0..4]);
+                let page_id = u32::from_ne_bytes(bytes);
+                let overflow = self.pager.get_overflow(page_id)?;
+
+                let mut u = [0u8; 16];
+                u.copy_from_slice(&overflow.data[..16]);
+                Ok(Value::Uuid(u))
+            }
+            _ => Ok(Value::Boolean(false)),
         }
     }
 }

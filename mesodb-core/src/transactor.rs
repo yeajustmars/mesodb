@@ -348,11 +348,11 @@ impl Transactor {
                     is_unique,
                     datom.valid_from,
                 );
-                let _ = now_idx_guard.put(datom.e, datom.a, &datom.v);
+                now_idx_guard.put(datom.e, datom.a, &datom.v)?;
             } else {
                 self.indices
                     .remove(datom.e, datom.a, &datom.v, is_unique, datom.valid_from);
-                let _ = now_idx_guard.delete(datom.e, datom.a);
+                now_idx_guard.delete(datom.e, datom.a)?;
             }
             tx_memtable.append(datom.clone());
         }
