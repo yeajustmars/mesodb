@@ -4,7 +4,6 @@ use arrow::record_batch::RecordBatch;
 use datafusion::prelude::*;
 use parking_lot::RwLock;
 use std::{
-    collections::BTreeMap,
     fs::create_dir_all,
     path::{Path, PathBuf},
     sync::Arc,
@@ -47,15 +46,14 @@ impl MesoDB {
         let (transactor, recovered_batch) =
             Transactor::new(path, schema.clone(), config.clone(), now_index.clone())?;
 
-        let mut initial_ram = BTreeMap::new();
+        let mut initial_ram = Vec::new();
         let empty_batch = MemTable::new(0).finish()?;
-        initial_ram.insert(0, empty_batch);
 
         if recovered_batch.num_rows() > 0 {
-            initial_ram.insert(transactor.current_tx_id, recovered_batch);
+            initial_ram.push((0, empty_batch.clone()));
+            initial_ram.push((transactor.current_tx_id, recovered_batch));
         } else {
-            let empty_batch = MemTable::new(0).finish()?;
-            initial_ram.insert(0, empty_batch);
+            initial_ram.push((0, empty_batch));
         }
 
         let world_view = Arc::new(RwLock::new(Arc::new(WorldView {
@@ -90,6 +88,10 @@ impl MesoDB {
             let compactor = BackgroundCompactor::new(data_dir);
             let mut uncompacted_files = Vec::new();
 
+            let mut evict_queue = Vec::with_capacity(20);
+            // TODO: Set EVICT_THRESHOLD in config.toml
+            const EVICT_THRESHOLD: usize = 20;
+
             while let Some((tx_id, batch)) = flush_rx.recv().await {
                 // 1. Write the batch to a Volatile Parquet file
                 let file_path = match compactor.flush_to_parquet(batch, tx_id) {
@@ -101,28 +103,27 @@ impl MesoDB {
                 };
                 uncompacted_files.push(file_path);
 
-                // 2. Safely remove from RAM using the lock-free pointer swap
-                {
-                    let mut writer = world_view.write();
-                    let current_view = writer.as_ref().clone();
+                // Queue the transaction ID for eviction
+                evict_queue.push(tx_id);
 
-                    let mut new_ram = current_view.ram_batches.as_ref().clone();
-                    new_ram.remove(&tx_id);
+                let trigger_compaction =
+                    uncompacted_files.len() >= config.compactor.backpressure_threshold;
+                let trigger_eviction = evict_queue.len() >= EVICT_THRESHOLD;
 
-                    let new_view = Arc::new(WorldView {
-                        ram_batches: Arc::new(new_ram),
-                        data_dir: current_view.data_dir.clone(),
-                        schema: current_view.schema.clone(),
-                        timeline: current_view.timeline.clone(),
-                        now_index: current_view.now_index.clone(),
-                    });
+                // 2. Safely remove from RAM in batches OR when a compaction is triggered
+                if trigger_eviction || trigger_compaction {
+                    {
+                        let mut writer = world_view.write();
+                        let world_view_mut = Arc::make_mut(&mut *writer);
+                        let ram_vec_mut = Arc::make_mut(&mut world_view_mut.ram_batches);
 
-                    *writer = new_view;
+                        ram_vec_mut.retain(|(id, _)| !evict_queue.contains(id));
+                    }
+                    evict_queue.clear(); // Ensure we clear the queue after eviction!
                 }
 
                 // 3. Enforce Config Limits & Trigger Compaction
-                // If we reach our configured threshold of uncompacted volatile files, merge them.
-                if uncompacted_files.len() >= config.compactor.backpressure_threshold {
+                if trigger_compaction {
                     // Take ownership of the current batch of files to send to a new thread
                     let files_to_compact = std::mem::take(&mut uncompacted_files);
                     let compactor_clone = compactor.clone();
@@ -169,17 +170,9 @@ impl MesoDB {
         // so that read-queries can instantly recognize the new attributes.
         if !added_attrs.is_empty() {
             let mut writer = self.world_view.write();
-            let current_view = writer.as_ref().clone();
-
-            let new_view = Arc::new(WorldView {
-                ram_batches: current_view.ram_batches.clone(), // Data is unchanged
-                data_dir: current_view.data_dir.clone(),
-                schema: Arc::new(tx.schema.clone()),
-                timeline: Arc::new(tx.timeline.clone()),
-                now_index: current_view.now_index.clone(),
-            });
-
-            *writer = new_view;
+            let world_view_mut = Arc::make_mut(&mut *writer);
+            world_view_mut.schema = Arc::new(tx.schema.clone());
+            world_view_mut.timeline = Arc::new(tx.timeline.clone());
         }
 
         Ok(added_attrs)
@@ -198,24 +191,19 @@ impl MesoDB {
             let new_schema = Arc::new(tx.schema.clone());
             let new_timeline = Arc::new(tx.timeline.clone());
 
-            // OPTION 1: IN-LOCK MUTATION
+            // FAST PATH: In-place O(1) buffer append via Arc::make_mut
             {
                 let mut writer = self.world_view.write();
-                let current_view = writer.as_ref().clone();
 
-                let mut new_ram = current_view.ram_batches.as_ref().clone();
-                new_ram.insert(report.tx_id, batch_clone);
+                // 1. Mutate or CoW the top-level WorldView
+                let world_view_mut = Arc::make_mut(&mut *writer);
+                world_view_mut.schema = new_schema;
+                world_view_mut.timeline = new_timeline;
 
-                let new_view = Arc::new(WorldView {
-                    ram_batches: Arc::new(new_ram),
-                    data_dir: current_view.data_dir.clone(),
-                    schema: new_schema,
-                    timeline: new_timeline,
-                    now_index: current_view.now_index.clone(),
-                });
-
-                *writer = new_view;
-            } // Write lock releases instantly here!
+                // 2. Mutate or CoW the underlying ram_batches Vec in-place (O(1) amortized)
+                let ram_vec_mut = Arc::make_mut(&mut world_view_mut.ram_batches);
+                ram_vec_mut.push((report.tx_id, batch_clone));
+            } // Lock releases in nanoseconds!
 
             // --- THE COMPACTION COMPLIANCE THRESHOLD ---
             if report.batch.num_rows() >= tx.config.storage.memtable_max_rows
@@ -402,7 +390,7 @@ impl MesoDB {
             None
         };
 
-        let arrow_schema = view.ram_batches.get(&0).unwrap().schema();
+        let arrow_schema = view.ram_batches.first().unwrap().1.schema();
         let pq_options =
             datafusion::prelude::ParquetReadOptions::default().schema(arrow_schema.as_ref());
 
@@ -455,23 +443,27 @@ impl MesoDB {
 
         let mut ram_vec: Vec<RecordBatch> = view
             .ram_batches
-            .values()
+            .iter()
+            .map(|(_, b)| b.clone())
             .filter(|b| b.num_rows() > 0)
-            .cloned()
             .collect();
+
         if ram_vec.is_empty() {
             ram_vec.push(arrow::record_batch::RecordBatch::new_empty(
                 arrow_schema.clone(),
             ));
         }
+
         let ram_provider =
             datafusion::datasource::memory::MemTable::try_new(arrow_schema.clone(), vec![ram_vec])
                 .unwrap();
+
         ctx.register_table("ram_datoms", Arc::new(ram_provider))?;
 
         let df_vol = ctx
             .sql("SELECT * FROM volatile_parquet UNION ALL SELECT * FROM ram_datoms")
             .await?;
+
         ctx.register_table("volatile_datoms", df_vol.into_view())?;
 
         // 2. The Vectorized Option A SQL Router
@@ -658,7 +650,7 @@ impl MesoDB {
 
 #[derive(Clone)]
 pub struct WorldView {
-    pub ram_batches: Arc<BTreeMap<u64, RecordBatch>>,
+    pub ram_batches: Arc<Vec<(u64, RecordBatch)>>, // Flat, contiguous array
     pub data_dir: PathBuf,
     pub schema: Arc<SchemaMap>,
     pub timeline: Arc<SchemaTimeline>,
@@ -2349,7 +2341,7 @@ mod tests {
 
             let current_view = writer.as_ref().clone();
             let mut new_ram = current_view.ram_batches.as_ref().clone();
-            new_ram.remove(&initial_tx_id);
+            new_ram.retain(|(id, _)| *id != initial_tx_id);
 
             *writer = Arc::new(WorldView {
                 ram_batches: Arc::new(new_ram),
@@ -2379,11 +2371,17 @@ mod tests {
 
         // VALIDATION: The split-lock bug is dead! The compactor removal succeeded, AND the new transaction exists.
         assert!(
-            !final_view.ram_batches.contains_key(&initial_tx_id),
+            !final_view
+                .ram_batches
+                .iter()
+                .any(|(id, _)| id == &initial_tx_id),
             "Background removal should succeed"
         );
         assert!(
-            final_view.ram_batches.keys().any(|&k| k > initial_tx_id),
+            final_view
+                .ram_batches
+                .iter()
+                .any(|(k, _)| *k > initial_tx_id),
             "Concurrent transaction insertion should succeed"
         );
     }
@@ -2532,7 +2530,7 @@ mod tests {
 
             let current_view = writer.as_ref().clone();
             let mut new_ram = current_view.ram_batches.as_ref().clone();
-            new_ram.remove(&tx_id);
+            new_ram.retain(|(id, _)| *id != tx_id);
 
             *writer = Arc::new(WorldView {
                 ram_batches: Arc::new(new_ram),
@@ -2556,7 +2554,7 @@ mod tests {
 
         let final_view = db.world_view.read().clone();
         assert!(
-            !final_view.ram_batches.contains_key(&tx_id),
+            !final_view.ram_batches.iter().any(|(id, _)| id == &tx_id),
             "The compactor must successfully remove the batch"
         );
         assert!(
@@ -2579,9 +2577,10 @@ mod tests {
         {
             let writer = db.world_view.write();
             let current_view = writer.as_ref().clone();
-            let mut new_ram = current_view.ram_batches.as_ref().clone();
+            let new_ram = current_view.ram_batches.as_ref().clone();
 
-            if new_ram.remove(&9999).is_none() {
+            let pos = new_ram.iter().position(|(id, _)| *id == 9999);
+            if pos.is_none() {
                 // Do nothing. Drop the lock. The pointer remains entirely unmodified.
             } else {
                 panic!("Should not execute");
