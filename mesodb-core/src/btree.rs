@@ -586,4 +586,77 @@ mod tests {
             "The tree must have dynamically requested and formatted dozens of new pages from the OS"
         );
     }
+
+    #[test]
+    fn test_now_index_string_overflow_basic() {
+        let (mut index, _f) = setup_index();
+        let s = "Hello, Overflow World!".to_string();
+
+        index.put(1, 10, &Value::String(s.clone())).unwrap();
+        let val = index.get(1, 10).unwrap().unwrap();
+
+        assert_eq!(val, Value::String(s));
+        assert!(
+            index.pager.num_pages >= 2,
+            "An overflow page should have been allocated"
+        );
+    }
+
+    #[test]
+    fn test_now_index_uuid_overflow_basic() {
+        let (mut index, _f) = setup_index();
+        // A dummy 16-byte UUID array
+        let u = [0xAB; 16];
+
+        index.put(2, 20, &Value::Uuid(u)).unwrap();
+        let val = index.get(2, 20).unwrap().unwrap();
+
+        assert_eq!(val, Value::Uuid(u));
+    }
+
+    #[test]
+    fn test_now_index_string_exact_limit() {
+        let (mut index, _f) = setup_index();
+        // Exactly matches the 4088-byte limit of a single OverflowPage
+        let s = "A".repeat(4088);
+
+        index.put(3, 30, &Value::String(s.clone())).unwrap();
+        let val = index.get(3, 30).unwrap().unwrap();
+
+        assert_eq!(val, Value::String(s));
+    }
+
+    #[test]
+    #[should_panic(expected = "FATAL: String exceeds 4088 bytes")]
+    fn test_now_index_string_exceeds_limit_panics() {
+        let (mut index, _f) = setup_index();
+        // 4089 bytes forces the explicit panic to prevent silent truncation or memory corruption
+        let s = "A".repeat(4089);
+
+        let _ = index.put(4, 40, &Value::String(s));
+    }
+
+    #[test]
+    fn test_now_index_multiple_overflows_no_collision() {
+        let (mut index, _f) = setup_index();
+        let s1 = "First String".to_string();
+        let u1 = [0x11; 16];
+        let s2 = "Second String".to_string();
+
+        // Insert interleaved data requiring multiple dynamic page allocations
+        index.put(5, 50, &Value::String(s1.clone())).unwrap();
+        index.put(5, 51, &Value::Uuid(u1)).unwrap();
+        index.put(5, 52, &Value::String(s2.clone())).unwrap();
+
+        // Validate pointers resolve to their exact independent pages
+        assert_eq!(index.get(5, 50).unwrap().unwrap(), Value::String(s1));
+        assert_eq!(index.get(5, 51).unwrap().unwrap(), Value::Uuid(u1));
+        assert_eq!(index.get(5, 52).unwrap().unwrap(), Value::String(s2));
+
+        // Root + at least 3 distinct overflow pages
+        assert!(
+            index.pager.num_pages >= 4,
+            "Must allocate distinct pages for each overflow value"
+        );
+    }
 }
