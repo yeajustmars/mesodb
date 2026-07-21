@@ -1,23 +1,39 @@
 // mesodb-core/src/index.rs
 
 use ahash::AHashMap;
-use std::collections::BTreeMap;
 
 use crate::types::{AttributeId, EntityId, Value};
 
 #[derive(Debug, Default, Clone)]
 pub struct IndexManager {
-    /// Flattened EAVT Index: (EntityId, AttributeId) -> `ValidTime` -> `Option<Value>`
-    /// A `None` value represents a retraction (closing the bitemporal interval).
-    pub eavt: AHashMap<(EntityId, AttributeId), BTreeMap<i64, Option<Value>>>,
+    /// Flattened EAVT Index: (EntityId, AttributeId) -> flat timeline vector
+    pub eavt: AHashMap<(EntityId, AttributeId), Vec<(i64, Option<Value>)>>,
 
-    /// Flattened Unique Index: (AttributeId, Value) -> `ValidTime` -> `Option<EntityId>`
-    pub unique_index: AHashMap<(AttributeId, Value), BTreeMap<i64, Option<EntityId>>>,
+    /// Two-Level Unique Index: AttributeId -> Value -> flat timeline vector
+    /// This structure allows us to query by `&Value` without cloning!
+    pub unique_index: AHashMap<AttributeId, AHashMap<Value, Vec<(i64, Option<EntityId>)>>>,
 }
 
 impl IndexManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Fast-path chronological insertion. If an out-of-order time-travel fact arrives,
+    /// it correctly shifts it into place, but 99.9% of the time it is a raw O(1) push.
+    #[inline(always)]
+    fn insert_timeline<T>(timeline: &mut Vec<(i64, Option<T>)>, valid_time: i64, val: Option<T>) {
+        if timeline
+            .last()
+            .map_or(true, |(last_t, _)| *last_t <= valid_time)
+        {
+            timeline.push((valid_time, val));
+        } else {
+            let pos = timeline
+                .binary_search_by_key(&valid_time, |&(t, _)| t)
+                .unwrap_or_else(|e| e);
+            timeline.insert(pos, (valid_time, val));
+        }
     }
 
     pub fn insert(
@@ -28,15 +44,17 @@ impl IndexManager {
         is_unique: bool,
         valid_time: i64,
     ) {
-        self.eavt
-            .entry((e, a))
-            .or_default()
-            .insert(valid_time, Some(v.clone()));
+        let eavt_timeline = self.eavt.entry((e, a)).or_default();
+        Self::insert_timeline(eavt_timeline, valid_time, Some(v.clone()));
+
         if is_unique {
-            self.unique_index
-                .entry((a, v))
+            let unique_timeline = self
+                .unique_index
+                .entry(a)
                 .or_default()
-                .insert(valid_time, Some(e));
+                .entry(v)
+                .or_default();
+            Self::insert_timeline(unique_timeline, valid_time, Some(e));
         }
     }
 
@@ -48,23 +66,24 @@ impl IndexManager {
         is_unique: bool,
         valid_time: i64,
     ) {
-        // We append `None` to the timeline to officially close the interval at `valid_time`.
-        self.eavt
-            .entry((e, a))
-            .or_default()
-            .insert(valid_time, None);
+        let eavt_timeline = self.eavt.entry((e, a)).or_default();
+        Self::insert_timeline(eavt_timeline, valid_time, None);
+
         if is_unique {
-            self.unique_index
-                .entry((a, v.clone()))
-                .or_default()
-                .insert(valid_time, None);
+            if let Some(val_map) = self.unique_index.get_mut(&a) {
+                let unique_timeline = val_map.entry(v.clone()).or_default();
+                Self::insert_timeline(unique_timeline, valid_time, None);
+            }
         }
     }
 
     pub fn get_value_at(&self, e: EntityId, a: AttributeId, valid_time: i64) -> Option<&Value> {
         self.eavt
             .get(&(e, a))
-            .and_then(|timeline| timeline.range(..=valid_time).next_back())
+            .and_then(|timeline| {
+                // Reverse search is instant because timelines are almost always 1-2 items long
+                timeline.iter().rev().find(|(t, _)| *t <= valid_time)
+            })
             .and_then(|(_, opt_v)| opt_v.as_ref())
     }
 
@@ -75,8 +94,9 @@ impl IndexManager {
         valid_time: i64,
     ) -> Option<EntityId> {
         self.unique_index
-            .get(&(a, v.clone()))
-            .and_then(|timeline| timeline.range(..=valid_time).next_back())
+            .get(&a)
+            .and_then(|val_map| val_map.get(v)) // ZERO CLONING!
+            .and_then(|timeline| timeline.iter().rev().find(|(t, _)| *t <= valid_time))
             .and_then(|(_, opt_e)| opt_e.as_ref())
             .copied()
     }
@@ -89,12 +109,14 @@ impl IndexManager {
         requester: EntityId,
         valid_time: i64,
     ) -> Option<EntityId> {
-        if let Some(timeline) = self.unique_index.get(&(a, v.clone())) {
-            for (_, opt_owner) in timeline.range(valid_time..) {
-                if let Some(owner) = opt_owner
-                    && *owner != requester
-                {
-                    return Some(*owner);
+        if let Some(timeline) = self.unique_index.get(&a).and_then(|m| m.get(v)) {
+            for (t, opt_owner) in timeline.iter() {
+                if *t >= valid_time {
+                    if let Some(owner) = opt_owner {
+                        if *owner != requester {
+                            return Some(*owner);
+                        }
+                    }
                 }
             }
         }
