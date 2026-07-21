@@ -365,17 +365,38 @@ impl NowIndex {
             }
             Value::String(s) => {
                 let bytes = s.as_bytes();
-                if bytes.len() > 4088 {
-                    panic!(
-                        "FATAL: String exceeds 4088 bytes. Chained overflow pages are pending implementation."
-                    );
+                let mut first_page_id = 0;
+                let mut prev_page_id = 0;
+
+                // .chunks() handles empty slices by returning an empty iterator
+                for (i, chunk) in bytes.chunks(4088).enumerate() {
+                    let page_id = self.pager.allocate_page()?;
+
+                    if i == 0 {
+                        first_page_id = page_id;
+                    } else {
+                        // Link the previous page to this newly allocated page
+                        self.pager.get_overflow_mut(prev_page_id)?.next_page_id = page_id;
+                    }
+
+                    let overflow = self.pager.get_overflow_mut(page_id)?;
+                    overflow.length = chunk.len() as u32;
+                    overflow.next_page_id = 0;
+                    overflow.data[..chunk.len()].copy_from_slice(chunk);
+
+                    prev_page_id = page_id;
                 }
-                let page_id = self.pager.allocate_page()?;
-                let overflow = self.pager.get_overflow_mut(page_id)?;
-                overflow.length = bytes.len() as u32;
-                overflow.next_page_id = 0;
-                overflow.data[..bytes.len()].copy_from_slice(bytes);
-                payload[0..4].copy_from_slice(&page_id.to_ne_bytes());
+
+                // Edge case: Empty strings still need a valid (but empty) overflow page
+                if first_page_id == 0 {
+                    let page_id = self.pager.allocate_page()?;
+                    let overflow = self.pager.get_overflow_mut(page_id)?;
+                    overflow.length = 0;
+                    overflow.next_page_id = 0;
+                    first_page_id = page_id;
+                }
+
+                payload[0..4].copy_from_slice(&first_page_id.to_ne_bytes());
                 3
             }
             Value::Ref(r) => {
@@ -413,12 +434,24 @@ impl NowIndex {
             3 => {
                 let mut bytes = [0u8; 4];
                 bytes.copy_from_slice(&iv.payload[0..4]);
-                let page_id = u32::from_ne_bytes(bytes);
-                let overflow = self.pager.get_overflow(page_id)?;
-                let len = overflow.length as usize;
-                let s = std::str::from_utf8(&overflow.data[..len])
-                    .map_err(|_| MesoError::Serialization("Invalid UTF-8 in overflow".into()))?
-                    .to_string();
+                let mut current_page_id = u32::from_ne_bytes(bytes);
+                let mut string_bytes = Vec::new();
+
+                // Walk the linked list of overflow pages
+                loop {
+                    let overflow = self.pager.get_overflow(current_page_id)?;
+                    let len = overflow.length as usize;
+                    string_bytes.extend_from_slice(&overflow.data[..len]);
+
+                    if overflow.next_page_id == 0 {
+                        break;
+                    }
+                    current_page_id = overflow.next_page_id;
+                }
+
+                let s = String::from_utf8(string_bytes).map_err(|_| {
+                    MesoError::Serialization("Invalid UTF-8 in overflow chain".into())
+                })?;
                 Ok(Value::String(s))
             }
             4 => Ok(Value::Ref(u64::from_ne_bytes(iv.payload))),
@@ -627,13 +660,22 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "FATAL: String exceeds 4088 bytes")]
-    fn test_now_index_string_exceeds_limit_panics() {
+    fn test_now_index_string_chaining() {
         let (mut index, _f) = setup_index();
-        // 4089 bytes forces the explicit panic to prevent silent truncation or memory corruption
-        let s = "A".repeat(4089);
 
-        let _ = index.put(4, 40, &Value::String(s));
+        // 10,000 bytes forces the string across 3 chained pages (4088 + 4088 + 1824)
+        let s = "A".repeat(10_000);
+
+        index.put(4, 40, &Value::String(s.clone())).unwrap();
+        let val = index.get(4, 40).unwrap().unwrap();
+
+        assert_eq!(val, Value::String(s));
+
+        // Root page (1) + 3 chained overflow pages
+        assert!(
+            index.pager.num_pages >= 4,
+            "Should have allocated at least 3 chained overflow pages"
+        );
     }
 
     #[test]
