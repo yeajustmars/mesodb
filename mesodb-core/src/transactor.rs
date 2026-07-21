@@ -1,7 +1,6 @@
 // mesodb-core/src/transactor.rs
 
 use arrow::record_batch::RecordBatch;
-use parking_lot::RwLock;
 use std::{
     collections::HashSet,
     path::Path,
@@ -10,7 +9,6 @@ use std::{
 };
 
 use crate::{
-    btree::NowIndex,
     config::Config,
     datom::Datom,
     error::MesoError,
@@ -28,7 +26,6 @@ pub struct Transactor {
     pub schema: SchemaMap,
     pub timeline: SchemaTimeline,
     pub indices: IndexManager,
-    pub now_index: Arc<RwLock<NowIndex>>,
     pub current_tx_id: TxId,
 }
 
@@ -37,7 +34,6 @@ impl Transactor {
         wal_path: P,
         mut schema: SchemaMap,
         config: Config,
-        now_index: Arc<RwLock<NowIndex>>,
     ) -> Result<(Self, RecordBatch)> {
         let mut wal = Wal::open(wal_path)?;
         let mut indices = IndexManager::new();
@@ -46,7 +42,7 @@ impl Transactor {
 
         timeline.append_version(0, 0, schema.clone());
 
-        // NEW: Initialize a MemTable to rebuild uncompacted RAM state
+        // Initialize a MemTable to rebuild uncompacted RAM state
         let mut recovery_memtable = MemTable::new(10_000);
 
         let recovered_entries = wal.recover()?;
@@ -76,7 +72,7 @@ impl Transactor {
                                 );
                             }
                         }
-                        // NEW: Push the recovered datom into RAM
+                        // Push the recovered datom into RAM
                         recovery_memtable.append(datom);
                     }
                 }
@@ -106,12 +102,12 @@ impl Transactor {
                 schema,
                 timeline,
                 indices,
-                now_index,
                 current_tx_id,
             },
             recovered_batch,
         ))
     }
+
     pub fn transact_schema(
         &mut self,
         ident: &str,
@@ -218,8 +214,6 @@ impl Transactor {
             };
 
             // --- JIT TYPE COERCION ---
-            // JSON numbers parse as Int64 by default. If the schema demands a Ref,
-            // we safely cast it here before validation fails.
             if let Some(attr) = self.schema.get_by_id(attr_id)
                 && attr.value_type == ValueType::Ref
                 && let Value::Int64(i) = fact.v
@@ -336,7 +330,6 @@ impl Transactor {
 
         // --- PHASE 3: Update RAM Indices & Build Arrow Batch ---
         let mut tx_memtable = MemTable::new(pending_datoms.len());
-        let mut now_idx_guard = self.now_index.write();
 
         for datom in &pending_datoms {
             let is_unique = self.schema.get_by_id(datom.a).unwrap().is_unique;
@@ -348,11 +341,9 @@ impl Transactor {
                     is_unique,
                     datom.valid_from,
                 );
-                now_idx_guard.put(datom.e, datom.a, &datom.v)?;
             } else {
                 self.indices
                     .remove(datom.e, datom.a, &datom.v, is_unique, datom.valid_from);
-                now_idx_guard.delete(datom.e, datom.a)?;
             }
             tx_memtable.append(datom.clone());
         }
@@ -395,18 +386,13 @@ mod tests {
     fn setup_transactor() -> (Transactor, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("wal");
-        let idx_path = dir.path().join("idx");
-
-        let now_index = std::sync::Arc::new(parking_lot::RwLock::new(
-            crate::btree::NowIndex::open(idx_path).unwrap(),
-        ));
 
         let mut schema = SchemaMap::new();
         schema.add_attribute(":user/name", ValueType::String, false);
         schema.add_attribute(":user/email", ValueType::String, true);
 
         let config = Config::default();
-        let (transactor, _) = Transactor::new(wal_path, schema, config, now_index).unwrap();
+        let (transactor, _) = Transactor::new(wal_path, schema, config).unwrap();
 
         (transactor, dir)
     }
@@ -554,17 +540,11 @@ mod tests {
     fn test_jit_schema_durability_and_recovery() {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("wal");
-        let idx_path = dir.path().join("idx");
         let config = Config::default();
 
         // 1. Boot fresh transactor and transact a totally unknown attribute
         {
-            let now_index = std::sync::Arc::new(parking_lot::RwLock::new(
-                crate::btree::NowIndex::open(&idx_path).unwrap(),
-            ));
-
-            let (mut t, _) =
-                Transactor::new(&wal_path, SchemaMap::new(), config.clone(), now_index).unwrap();
+            let (mut t, _) = Transactor::new(&wal_path, SchemaMap::new(), config.clone()).unwrap();
 
             t.transact(vec![Fact {
                 e: 1,
@@ -582,12 +562,7 @@ mod tests {
 
         // 2. Re-open from the exact same WAL file
         {
-            let now_index = std::sync::Arc::new(parking_lot::RwLock::new(
-                crate::btree::NowIndex::open(&idx_path).unwrap(),
-            ));
-
-            let (t_recovered, _) =
-                Transactor::new(&wal_path, SchemaMap::new(), config, now_index).unwrap();
+            let (t_recovered, _) = Transactor::new(&wal_path, SchemaMap::new(), config).unwrap();
 
             // If the SchemaMutation wasn't durable, this would fail!
             assert!(t_recovered.schema.contains_ident(":new/jit_attr"));

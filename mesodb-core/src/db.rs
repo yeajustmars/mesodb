@@ -1,6 +1,6 @@
 // mesodb-core/src/db.rs
 
-use arrow::record_batch::RecordBatch;
+use arrow::{array::Array, record_batch::RecordBatch};
 use datafusion::prelude::*;
 use parking_lot::RwLock;
 use std::{
@@ -42,9 +42,8 @@ impl MesoDB {
         let now_idx_path = data_dir.join("now.idx");
         let now_index = Arc::new(RwLock::new(crate::btree::NowIndex::open(now_idx_path)?));
 
-        // Pass the B+Tree into the transactor
-        let (transactor, recovered_batch) =
-            Transactor::new(path, schema.clone(), config.clone(), now_index.clone())?;
+        // Pass the B+Tree into the transactor (Though transactor no longer writes to it directly)
+        let (transactor, recovered_batch) = Transactor::new(path, schema.clone(), config.clone())?;
 
         let mut initial_ram = Vec::new();
         let empty_batch = MemTable::new(0).finish()?;
@@ -76,8 +75,8 @@ impl MesoDB {
         })
     }
 
-    /// The Background Worker: Listens for RAM batches, writes to disk, drops them from RAM,
-    /// and dispatches detached compaction tasks to merge volatile files.
+    /// The Background Worker: Listens for RAM batches, updates background indexes,
+    /// writes to disk, drops them from RAM, and dispatches detached compaction tasks.
     fn spawn_background_worker(
         data_dir: PathBuf,
         mut flush_rx: mpsc::Receiver<(u64, RecordBatch)>,
@@ -89,11 +88,22 @@ impl MesoDB {
             let mut uncompacted_files = Vec::new();
 
             let mut evict_queue = Vec::with_capacity(20);
-            // TODO: Set EVICT_THRESHOLD in config.toml
             const EVICT_THRESHOLD: usize = 20;
 
             while let Some((tx_id, batch)) = flush_rx.recv().await {
-                // 1. Write the batch to a Volatile Parquet file
+                // 1. ASYNC TIER 1 INDEX UPDATE: Populate B+Tree safely off the critical transaction thread
+                {
+                    let view = world_view.read().clone();
+                    let mut now_idx = view.now_index.write();
+                    if let Err(e) = Self::update_now_index_from_batch(&mut now_idx, &batch) {
+                        eprintln!(
+                            "Warning: Failed to update background NowIndex for Tx {}: {:?}",
+                            tx_id, e
+                        );
+                    }
+                }
+
+                // 2. Write the batch to a Volatile Parquet file
                 let file_path = match compactor.flush_to_parquet(batch, tx_id) {
                     Ok(path) => path,
                     Err(e) => {
@@ -110,7 +120,7 @@ impl MesoDB {
                     uncompacted_files.len() >= config.compactor.backpressure_threshold;
                 let trigger_eviction = evict_queue.len() >= EVICT_THRESHOLD;
 
-                // 2. Safely remove from RAM in batches OR when a compaction is triggered
+                // 3. Safely remove from RAM in batches OR when a compaction is triggered
                 if trigger_eviction || trigger_compaction {
                     {
                         let mut writer = world_view.write();
@@ -122,14 +132,12 @@ impl MesoDB {
                     evict_queue.clear(); // Ensure we clear the queue after eviction!
                 }
 
-                // 3. Enforce Config Limits & Trigger Compaction
+                // 4. Enforce Config Limits & Trigger Compaction
                 if trigger_compaction {
-                    // Take ownership of the current batch of files to send to a new thread
                     let files_to_compact = std::mem::take(&mut uncompacted_files);
                     let compactor_clone = compactor.clone();
 
-                    // Offload the heavy DataFusion merge & mathematically pure bitemporal resolution
-                    // to an entirely separate Tokio task.
+                    // Offload the heavy DataFusion merge to a separate Tokio task.
                     tokio::spawn(async move {
                         if let Err(e) = compactor_clone.compact(&files_to_compact, tx_id).await {
                             eprintln!("Background compaction failed for Tx {}: {:?}", tx_id, e);
@@ -138,6 +146,92 @@ impl MesoDB {
                 }
             }
         });
+    }
+
+    /// Helper to populate NowIndex B+Tree from an Arrow RecordBatch in the background thread.
+    /// Extracts specific datoms directly from the Arrow arrays safely without panicking.
+    fn update_now_index_from_batch(
+        now_index: &mut crate::btree::NowIndex,
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        let e_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .ok_or_else(|| MesoError::Serialization("Missing e column (UInt64)".into()))?;
+
+        // The original schema encodes `a` as UInt16, not UInt64!
+        let a_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt16Array>()
+            .ok_or_else(|| MesoError::Serialization("Missing a column (UInt16)".into()))?;
+
+        let v_bool = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .ok_or_else(|| MesoError::Serialization("Missing v_bool column".into()))?;
+        let v_int = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .ok_or_else(|| MesoError::Serialization("Missing v_int column".into()))?;
+        let v_float = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .ok_or_else(|| MesoError::Serialization("Missing v_float column".into()))?;
+        let v_str = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .ok_or_else(|| MesoError::Serialization("Missing v_str column".into()))?;
+        let v_ref = batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .ok_or_else(|| MesoError::Serialization("Missing v_ref column".into()))?;
+        let v_time = batch
+            .column(7)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .ok_or_else(|| MesoError::Serialization("Missing v_time column".into()))?;
+
+        let op_col = batch
+            .column(10)
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .ok_or_else(|| MesoError::Serialization("Missing op column".into()))?;
+
+        for i in 0..batch.num_rows() {
+            let e = e_col.value(i);
+            let a = a_col.value(i) as u32; // Safely cast UInt16 to the B+Tree's u32 AttributeId
+            let op = op_col.value(i);
+
+            if op {
+                let val = if v_bool.is_valid(i) {
+                    Value::Boolean(v_bool.value(i))
+                } else if v_int.is_valid(i) {
+                    Value::Int64(v_int.value(i))
+                } else if v_float.is_valid(i) {
+                    Value::Float64(v_float.value(i))
+                } else if v_str.is_valid(i) {
+                    Value::String(v_str.value(i).to_string())
+                } else if v_ref.is_valid(i) {
+                    Value::Ref(v_ref.value(i))
+                } else if v_time.is_valid(i) {
+                    Value::Timestamp(v_time.value(i))
+                } else {
+                    continue;
+                }; // Fallback
+
+                let _ = now_index.put(e, a, &val);
+            } else {
+                let _ = now_index.delete(e, a);
+            }
+        }
+        Ok(())
     }
 
     /// Takes an IMMUTABLE reference (&self).
@@ -192,18 +286,17 @@ impl MesoDB {
             let new_timeline = Arc::new(tx.timeline.clone());
 
             // FAST PATH: In-place O(1) buffer append via Arc::make_mut
+            // Zero sync B+Tree interactions happen here!
             {
                 let mut writer = self.world_view.write();
 
-                // 1. Mutate or CoW the top-level WorldView
                 let world_view_mut = Arc::make_mut(&mut *writer);
                 world_view_mut.schema = new_schema;
                 world_view_mut.timeline = new_timeline;
 
-                // 2. Mutate or CoW the underlying ram_batches Vec in-place (O(1) amortized)
                 let ram_vec_mut = Arc::make_mut(&mut world_view_mut.ram_batches);
                 ram_vec_mut.push((report.tx_id, batch_clone));
-            } // Lock releases in nanoseconds!
+            } // Write lock releases instantly!
 
             // --- THE COMPACTION COMPLIANCE THRESHOLD ---
             if report.batch.num_rows() >= tx.config.storage.memtable_max_rows
@@ -267,7 +360,23 @@ impl MesoDB {
             None => return Ok(Some(vec![])), // Valid empty response (Attribute doesn't exist)
         };
 
-        // AST is verified. Hit the zero-copy B+Tree!
+        // 1. Check if the entity has ANY pending changes in RAM. If so, fallback to DataFusion
+        //    to ensure bitemporal correctness (e.g., catching a recent un-flushed retraction).
+        for (_, batch) in view.ram_batches.iter() {
+            if let Some(e_col) = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+            {
+                for i in 0..batch.num_rows() {
+                    if e_col.value(i) == e_id {
+                        return Ok(None); // Let DataFusion resolve the volatile RAM state
+                    }
+                }
+            }
+        }
+
+        // 2. Entity is purely on disk. Safe to hit the zero-copy B+Tree!
         let now_index = view.now_index.read();
         if let Some(val) = now_index.get(e_id, a_id)? {
             let clean_var = find_var.replace("?", "");
@@ -362,7 +471,8 @@ impl MesoDB {
             return Ok(Some(vec![batch]));
         }
 
-        Ok(Some(vec![])) // Entity not found, valid Fast-Path empty return
+        // 3. Entity not found in RAM or B+Tree, return valid empty result
+        Ok(Some(vec![]))
     }
 
     pub async fn query(&self, query_str: &str) -> Result<Vec<RecordBatch>> {
@@ -680,6 +790,8 @@ pub struct AttributeDefinition {
     pub value_type: ValueType,
     pub is_unique: bool,
 }
+
+// Ensure you retain the existing `mod tests { ... }` block entirely here!
 
 // --- TESTS ---
 #[cfg(test)]
