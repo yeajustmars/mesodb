@@ -1,3 +1,5 @@
+// mesodb-core/src/storage.rs
+
 use arrow::record_batch::RecordBatch;
 use datafusion::{dataframe::DataFrameWriteOptions, prelude::*};
 use parquet::{arrow::arrow_writer::ArrowWriter, file::properties::WriterProperties};
@@ -8,6 +10,7 @@ use std::{
 
 use crate::{error::MesoError, types::Result};
 
+#[derive(Clone)]
 pub struct BackgroundCompactor {
     data_dir: PathBuf,
 }
@@ -53,6 +56,7 @@ impl BackgroundCompactor {
         let ctx = SessionContext::new();
         let output_path = self
             .data_dir
+            .join("parquet")
             .join(format!("compacted-{:012}.parquet", output_id));
 
         let paths = file_paths

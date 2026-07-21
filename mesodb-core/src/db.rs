@@ -67,7 +67,9 @@ impl MesoDB {
         })));
 
         let (flush_tx, flush_rx) = mpsc::channel(config.compactor.backpressure_threshold);
-        Self::spawn_background_worker(data_dir, flush_rx, world_view.clone());
+
+        // Pass config clone into the background worker
+        Self::spawn_background_worker(data_dir, flush_rx, world_view.clone(), config.clone());
 
         Ok(Self {
             transactor: Mutex::new(transactor),
@@ -76,38 +78,63 @@ impl MesoDB {
         })
     }
 
-    /// The Background Worker: Listens for RAM batches, writes to disk, and drops them from RAM.
+    /// The Background Worker: Listens for RAM batches, writes to disk, drops them from RAM,
+    /// and dispatches detached compaction tasks to merge volatile files.
     fn spawn_background_worker(
         data_dir: PathBuf,
         mut flush_rx: mpsc::Receiver<(u64, RecordBatch)>,
         world_view: Arc<RwLock<Arc<WorldView>>>,
+        config: Config,
     ) {
         tokio::spawn(async move {
             let compactor = BackgroundCompactor::new(data_dir);
+            let mut uncompacted_files = Vec::new();
 
             while let Some((tx_id, batch)) = flush_rx.recv().await {
-                // Write the batch to a Parquet file
-                if let Err(e) = compactor.flush_to_parquet(batch, tx_id) {
-                    eprintln!("Failed to flush Tx {} to Parquet: {:?}", tx_id, e);
-                    continue; // Keep it in RAM if disk fails
+                // 1. Write the batch to a Volatile Parquet file
+                let file_path = match compactor.flush_to_parquet(batch, tx_id) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        eprintln!("Failed to flush Tx {} to Parquet: {:?}", tx_id, e);
+                        continue; // Keep it in RAM if disk fails
+                    }
+                };
+                uncompacted_files.push(file_path);
+
+                // 2. Safely remove from RAM using the lock-free pointer swap
+                {
+                    let mut writer = world_view.write();
+                    let current_view = writer.as_ref().clone();
+
+                    let mut new_ram = current_view.ram_batches.as_ref().clone();
+                    new_ram.remove(&tx_id);
+
+                    let new_view = Arc::new(WorldView {
+                        ram_batches: Arc::new(new_ram),
+                        data_dir: current_view.data_dir.clone(),
+                        schema: current_view.schema.clone(),
+                        timeline: current_view.timeline.clone(),
+                        now_index: current_view.now_index.clone(),
+                    });
+
+                    *writer = new_view;
                 }
 
-                // OPTION 1: IN-LOCK MUTATION (Fixes the split-lock bug)
-                let mut writer = world_view.write();
+                // 3. Enforce Config Limits & Trigger Compaction
+                // If we reach our configured threshold of uncompacted volatile files, merge them.
+                if uncompacted_files.len() >= config.compactor.backpressure_threshold {
+                    // Take ownership of the current batch of files to send to a new thread
+                    let files_to_compact = std::mem::take(&mut uncompacted_files);
+                    let compactor_clone = compactor.clone();
 
-                let current_view = writer.as_ref().clone();
-                let mut new_ram = current_view.ram_batches.as_ref().clone();
-                new_ram.remove(&tx_id);
-
-                let new_view = Arc::new(WorldView {
-                    ram_batches: Arc::new(new_ram),
-                    data_dir: current_view.data_dir.clone(),
-                    schema: current_view.schema.clone(),
-                    timeline: current_view.timeline.clone(),
-                    now_index: current_view.now_index.clone(),
-                });
-
-                *writer = new_view;
+                    // Offload the heavy DataFusion merge & mathematically pure bitemporal resolution
+                    // to an entirely separate Tokio task.
+                    tokio::spawn(async move {
+                        if let Err(e) = compactor_clone.compact(&files_to_compact, tx_id).await {
+                            eprintln!("Background compaction failed for Tx {}: {:?}", tx_id, e);
+                        }
+                    });
+                }
             }
         });
     }
@@ -2683,5 +2710,82 @@ mod tests {
         assert_eq!(pin_1.ram_batches.len(), 1);
         assert_eq!(pin_2.ram_batches.len(), 2);
         assert_eq!(db.world_view.read().ram_batches.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_background_compaction_trigger_and_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("compaction_test.db");
+
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/score", ValueType::Int64, false);
+
+        // Custom config to force fast flushes and compactions
+        let mut config = Config::embedded();
+        config.compactor.backpressure_threshold = 2; // Compact after 2 files
+        config.storage.memtable_max_rows = 1; // Flush every single datom immediately
+
+        let db = MesoDB::open(db_path, schema, config).unwrap();
+
+        // 1. First transaction -> Fills the 1-row MemTable, flushes to part-000000000001.parquet
+        db.transact(vec![Fact {
+            e: 1,
+            ident: ":user/score".into(),
+            v: Value::Int64(100),
+            op: true,
+            cas_old_v: None,
+            valid_time: None,
+        }])
+        .await
+        .unwrap();
+
+        // Give the async worker a moment to write the first file and clear RAM
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // 2. Second transaction -> Fills MemTable, flushes to part-000000000002.parquet
+        // Since our threshold is 2, this TRIGGERS the detached compaction task!
+        db.transact(vec![Fact {
+            e: 2,
+            ident: ":user/score".into(),
+            v: Value::Int64(200),
+            op: true,
+            cas_old_v: None,
+            valid_time: None,
+        }])
+        .await
+        .unwrap();
+
+        // Wait for the heavy background compaction task to finish merging and cleaning up
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+        // 3. Query the data - DataFusion should seamlessly route the query to the new compacted file
+        let query = r#"[:find ?score :where [?e :user/score ?score]]"#;
+        let results = db.query_native(query).await.unwrap();
+
+        assert_eq!(results.len(), 2, "Should find both scores seamlessly");
+
+        // 4. Verify the filesystem state physically matches our architecture
+        let pq_dir = dir.path().join("parquet");
+        let entries = std::fs::read_dir(pq_dir).unwrap();
+        let mut compacted_count = 0;
+        let mut volatile_count = 0;
+
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("compacted-") {
+                compacted_count += 1;
+            } else if name.starts_with("part-") {
+                volatile_count += 1;
+            }
+        }
+
+        assert_eq!(
+            volatile_count, 0,
+            "Volatile parts should have been deleted by the compactor"
+        );
+        assert_eq!(
+            compacted_count, 1,
+            "There should be exactly one compacted file containing all data"
+        );
     }
 }
