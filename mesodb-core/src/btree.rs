@@ -1,5 +1,7 @@
 // mesodb-core/src/btree.rs
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 use crate::{
@@ -9,12 +11,16 @@ use crate::{
     types::{AttributeId, EntityId, Value},
 };
 
-pub struct NowIndex {
+// ==============================================================================
+// CORE B+TREE ENGINE (Raw Key-Value Traversal & Splitting)
+// ==============================================================================
+
+pub struct CoreBTree {
     pub pager: Pager,
     pub root_page_id: u32,
 }
 
-impl NowIndex {
+impl CoreBTree {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, MesoError> {
         let mut pager = Pager::open(path, 1)?;
 
@@ -30,8 +36,7 @@ impl NowIndex {
         })
     }
 
-    pub fn get(&self, e: EntityId, a: AttributeId) -> Result<Option<Value>, MesoError> {
-        let target_key = IndexKey { e, a, _pad: 0 };
+    pub fn get_kv(&self, target_key: IndexKey) -> Result<Option<IndexValue>, MesoError> {
         let mut current_page_id = self.root_page_id;
 
         loop {
@@ -55,12 +60,12 @@ impl NowIndex {
                 }
 
                 if left < num_cells && node.keys[left] == target_key {
-                    let iv = &node.values[left];
+                    let iv = node.values[left];
                     // 254 is our Tombstone tag for retracted values
                     if iv.type_tag == 254 {
                         return Ok(None);
                     }
-                    return Ok(Some(self.decode_value(iv)?));
+                    return Ok(Some(iv));
                 }
                 return Ok(None);
             } else {
@@ -77,43 +82,7 @@ impl NowIndex {
         }
     }
 
-    /// Retracts a value from the current state index by inserting a Tombstone.
-    pub fn delete(&mut self, e: EntityId, a: AttributeId) -> Result<(), MesoError> {
-        let key = IndexKey { e, a, _pad: 0 };
-        let tombstone = IndexValue {
-            type_tag: 254,
-            padding: [0; 7],
-            payload: [0; 8],
-        };
-
-        if let Some((split_key, right_page_id)) =
-            self.insert_into_node(self.root_page_id, key, tombstone)?
-        {
-            // Re-use the exact same root-split logic from `put`
-            let new_left_id = self.pager.allocate_page()?;
-            {
-                let root_node = self.pager.get_node(self.root_page_id)?;
-                let new_left_node = *root_node;
-                let left_node_mut = self.pager.get_node_mut(new_left_id)?;
-                *left_node_mut = new_left_node;
-            }
-            let left_min_key = self.pager.get_node(new_left_id)?.keys[0];
-            let root_mut = self.pager.get_node_mut(self.root_page_id)?;
-
-            root_mut.header.is_leaf = 0;
-            root_mut.header.num_cells = 2;
-            root_mut.keys[0] = left_min_key;
-            root_mut.values[0] = Self::make_child_ptr(new_left_id);
-            root_mut.keys[1] = split_key;
-            root_mut.values[1] = Self::make_child_ptr(right_page_id);
-        }
-        Ok(())
-    }
-
-    pub fn put(&mut self, e: EntityId, a: AttributeId, v: &Value) -> Result<(), MesoError> {
-        let key = IndexKey { e, a, _pad: 0 };
-        let val = self.encode_value(v)?;
-
+    pub fn put_kv(&mut self, key: IndexKey, val: IndexValue) -> Result<(), MesoError> {
         if let Some((split_key, right_page_id)) =
             self.insert_into_node(self.root_page_id, key, val)?
         {
@@ -330,8 +299,6 @@ impl NowIndex {
         self.pager.flush()
     }
 
-    // --- Type Translation Helpers ---
-
     fn child_page_id(val: &IndexValue) -> u32 {
         let mut bytes = [0u8; 4];
         bytes.copy_from_slice(&val.payload[0..4]);
@@ -347,6 +314,53 @@ impl NowIndex {
             payload,
         }
     }
+}
+
+// ==============================================================================
+// NOW INDEX (E-A-V Lookups)
+// ==============================================================================
+
+pub struct NowIndex {
+    pub core: CoreBTree,
+}
+
+impl NowIndex {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, MesoError> {
+        Ok(Self {
+            core: CoreBTree::open(path)?,
+        })
+    }
+
+    pub fn get(&self, e: EntityId, a: AttributeId) -> Result<Option<Value>, MesoError> {
+        let key = IndexKey { e, a, _pad: 0 };
+        if let Some(iv) = self.core.get_kv(key)? {
+            Ok(Some(self.decode_value(&iv)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn delete(&mut self, e: EntityId, a: AttributeId) -> Result<(), MesoError> {
+        let key = IndexKey { e, a, _pad: 0 };
+        let tombstone = IndexValue {
+            type_tag: 254,
+            padding: [0; 7],
+            payload: [0; 8],
+        };
+        self.core.put_kv(key, tombstone)
+    }
+
+    pub fn put(&mut self, e: EntityId, a: AttributeId, v: &Value) -> Result<(), MesoError> {
+        let key = IndexKey { e, a, _pad: 0 };
+        let val = self.encode_value(v)?;
+        self.core.put_kv(key, val)
+    }
+
+    pub fn flush(&self) -> Result<(), MesoError> {
+        self.core.flush()
+    }
+
+    // --- Type Translation Helpers ---
 
     fn encode_value(&mut self, v: &Value) -> Result<IndexValue, MesoError> {
         let mut payload = [0u8; 8];
@@ -368,18 +382,16 @@ impl NowIndex {
                 let mut first_page_id = 0;
                 let mut prev_page_id = 0;
 
-                // .chunks() handles empty slices by returning an empty iterator
                 for (i, chunk) in bytes.chunks(4088).enumerate() {
-                    let page_id = self.pager.allocate_page()?;
+                    let page_id = self.core.pager.allocate_page()?;
 
                     if i == 0 {
                         first_page_id = page_id;
                     } else {
-                        // Link the previous page to this newly allocated page
-                        self.pager.get_overflow_mut(prev_page_id)?.next_page_id = page_id;
+                        self.core.pager.get_overflow_mut(prev_page_id)?.next_page_id = page_id;
                     }
 
-                    let overflow = self.pager.get_overflow_mut(page_id)?;
+                    let overflow = self.core.pager.get_overflow_mut(page_id)?;
                     overflow.length = chunk.len() as u32;
                     overflow.next_page_id = 0;
                     overflow.data[..chunk.len()].copy_from_slice(chunk);
@@ -387,10 +399,9 @@ impl NowIndex {
                     prev_page_id = page_id;
                 }
 
-                // Edge case: Empty strings still need a valid (but empty) overflow page
                 if first_page_id == 0 {
-                    let page_id = self.pager.allocate_page()?;
-                    let overflow = self.pager.get_overflow_mut(page_id)?;
+                    let page_id = self.core.pager.allocate_page()?;
+                    let overflow = self.core.pager.get_overflow_mut(page_id)?;
                     overflow.length = 0;
                     overflow.next_page_id = 0;
                     first_page_id = page_id;
@@ -408,11 +419,10 @@ impl NowIndex {
                 5
             }
             Value::Uuid(u) => {
-                let page_id = self.pager.allocate_page()?;
-                let overflow = self.pager.get_overflow_mut(page_id)?;
+                let page_id = self.core.pager.allocate_page()?;
+                let overflow = self.core.pager.get_overflow_mut(page_id)?;
                 overflow.length = 16;
                 overflow.next_page_id = 0;
-                // 'u' is already a &[u8; 16]
                 overflow.data[..16].copy_from_slice(u);
                 payload[0..4].copy_from_slice(&page_id.to_ne_bytes());
                 6
@@ -437,9 +447,8 @@ impl NowIndex {
                 let mut current_page_id = u32::from_ne_bytes(bytes);
                 let mut string_bytes = Vec::new();
 
-                // Walk the linked list of overflow pages
                 loop {
-                    let overflow = self.pager.get_overflow(current_page_id)?;
+                    let overflow = self.core.pager.get_overflow(current_page_id)?;
                     let len = overflow.length as usize;
                     string_bytes.extend_from_slice(&overflow.data[..len]);
 
@@ -460,7 +469,7 @@ impl NowIndex {
                 let mut bytes = [0u8; 4];
                 bytes.copy_from_slice(&iv.payload[0..4]);
                 let page_id = u32::from_ne_bytes(bytes);
-                let overflow = self.pager.get_overflow(page_id)?;
+                let overflow = self.core.pager.get_overflow(page_id)?;
 
                 let mut u = [0u8; 16];
                 u.copy_from_slice(&overflow.data[..16]);
@@ -468,6 +477,79 @@ impl NowIndex {
             }
             _ => Ok(Value::Boolean(false)),
         }
+    }
+}
+
+// ==============================================================================
+// AVE INDEX (A-V-E Inverted Lookups)
+// ==============================================================================
+
+pub struct AveIndex {
+    pub core: CoreBTree,
+}
+
+impl AveIndex {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, MesoError> {
+        Ok(Self {
+            core: CoreBTree::open(path)?,
+        })
+    }
+
+    fn hash_value(value: &Value) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        match value {
+            Value::Int64(i) => i.hash(&mut hasher),
+            Value::Float64(f) => hasher.write(&f.to_ne_bytes()),
+            Value::Boolean(b) => b.hash(&mut hasher),
+            Value::Timestamp(t) => t.hash(&mut hasher),
+            Value::Ref(r) => r.hash(&mut hasher),
+            Value::String(s) => s.hash(&mut hasher),
+            Value::Uuid(u) => u.hash(&mut hasher),
+        }
+        hasher.finish()
+    }
+
+    /// Maps the 12-byte logical requirements (ValueHash, AttrId) into the physical `IndexKey`
+    fn make_key(a: AttributeId, val_hash: u64) -> IndexKey {
+        IndexKey {
+            e: val_hash,
+            a,
+            _pad: 0,
+        }
+    }
+
+    pub fn put(&mut self, a: AttributeId, v: &Value, e: EntityId) -> Result<(), MesoError> {
+        let key = Self::make_key(a, Self::hash_value(v));
+        let mut payload = [0u8; 8];
+        payload.copy_from_slice(&e.to_ne_bytes());
+
+        let val = IndexValue {
+            type_tag: 1, // Simple tag representing an EntityId payload
+            padding: [0; 7],
+            payload,
+        };
+
+        self.core.put_kv(key, val)
+    }
+
+    pub fn get(&self, a: AttributeId, v: &Value) -> Result<Option<EntityId>, MesoError> {
+        let key = Self::make_key(a, Self::hash_value(v));
+
+        if let Some(iv) = self.core.get_kv(key)? {
+            // Respect tombstones if this inverted index entry was retracted
+            if iv.type_tag == 254 {
+                return Ok(None);
+            }
+            let mut e_bytes = [0u8; 8];
+            e_bytes.copy_from_slice(&iv.payload);
+            Ok(Some(EntityId::from_ne_bytes(e_bytes)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn flush(&self) -> Result<(), MesoError> {
+        self.core.flush()
     }
 }
 
@@ -521,7 +603,7 @@ mod tests {
         }
 
         // Verify the internal page state
-        let root = index.pager.get_node(index.root_page_id).unwrap();
+        let root = index.core.pager.get_node(index.core.root_page_id).unwrap();
         assert_eq!(root.header.num_cells, 50, "Should contain exactly 50 cells");
         assert_eq!(root.keys[0].e, 1, "First key must be the lowest Entity ID");
         assert_eq!(
@@ -537,13 +619,13 @@ mod tests {
         // 1. Initial Insert
         index.put(42, 99, &Value::Int64(100)).unwrap();
 
-        let root_before = index.pager.get_node(index.root_page_id).unwrap();
+        let root_before = index.core.pager.get_node(index.core.root_page_id).unwrap();
         assert_eq!(root_before.header.num_cells, 1);
 
         // 2. Overwrite the exact same (Entity, Attribute) pair
         index.put(42, 99, &Value::Int64(200)).unwrap();
 
-        let root_after = index.pager.get_node(index.root_page_id).unwrap();
+        let root_after = index.core.pager.get_node(index.core.root_page_id).unwrap();
 
         // The cell count MUST remain 1, proving we overwrote the value in place
         assert_eq!(
@@ -568,7 +650,7 @@ mod tests {
             index.put(i as u64, 10, &Value::Int64(i as i64)).unwrap();
         }
 
-        let root = index.pager.get_node(index.root_page_id).unwrap();
+        let root = index.core.pager.get_node(index.core.root_page_id).unwrap();
         assert_eq!(root.header.num_cells as usize, NUM_CELLS);
 
         // Insert the 128th item. This MUST trigger a split instead of an error.
@@ -578,7 +660,7 @@ mod tests {
 
         // Validate the tree structurally expanded
         assert!(
-            index.pager.num_pages >= 3,
+            index.core.pager.num_pages >= 3,
             "A root split should allocate at least two new pages (left child, right child)"
         );
 
@@ -608,14 +690,14 @@ mod tests {
         }
 
         // Validate structural B+Tree state
-        let root = index.pager.get_node(index.root_page_id).unwrap();
+        let root = index.core.pager.get_node(index.core.root_page_id).unwrap();
 
         assert_eq!(
             root.header.is_leaf, 0,
             "Root must have transformed into an internal routing node"
         );
         assert!(
-            index.pager.num_pages > 50,
+            index.core.pager.num_pages > 50,
             "The tree must have dynamically requested and formatted dozens of new pages from the OS"
         );
     }
@@ -630,7 +712,7 @@ mod tests {
 
         assert_eq!(val, Value::String(s));
         assert!(
-            index.pager.num_pages >= 2,
+            index.core.pager.num_pages >= 2,
             "An overflow page should have been allocated"
         );
     }
@@ -673,7 +755,7 @@ mod tests {
 
         // Root page (1) + 3 chained overflow pages
         assert!(
-            index.pager.num_pages >= 4,
+            index.core.pager.num_pages >= 4,
             "Should have allocated at least 3 chained overflow pages"
         );
     }
@@ -697,8 +779,49 @@ mod tests {
 
         // Root + at least 3 distinct overflow pages
         assert!(
-            index.pager.num_pages >= 4,
+            index.core.pager.num_pages >= 4,
             "Must allocate distinct pages for each overflow value"
         );
+    }
+
+    #[test]
+    fn test_ave_index_basic_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ave_test.idx");
+        let mut index = AveIndex::open(&path).unwrap();
+
+        let attr_email = 100;
+        let email_val = Value::String("alice@example.com".to_string());
+        let target_entity = 849202;
+
+        // Put (Attribute, Value) -> EntityId
+        index.put(attr_email, &email_val, target_entity).unwrap();
+
+        // Retrieve EntityId by (Attribute, Value)
+        let resolved = index.get(attr_email, &email_val).unwrap();
+
+        assert_eq!(resolved, Some(target_entity));
+    }
+
+    #[test]
+    fn test_ave_index_different_types_hash_safely() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ave_types_test.idx");
+        let mut index = AveIndex::open(&path).unwrap();
+
+        let attr_age = 200;
+        let age_val = Value::Int64(30);
+
+        let attr_active = 201;
+        let active_val = Value::Boolean(true);
+
+        index.put(attr_age, &age_val, 111).unwrap();
+        index.put(attr_active, &active_val, 222).unwrap();
+
+        assert_eq!(index.get(attr_age, &age_val).unwrap(), Some(111));
+        assert_eq!(index.get(attr_active, &active_val).unwrap(), Some(222));
+
+        // Ensure a miss returns None instead of panicking
+        assert_eq!(index.get(attr_age, &Value::Int64(99)).unwrap(), None);
     }
 }
