@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod bitmap;
 pub mod btree;
 pub mod config;
 pub mod datom;

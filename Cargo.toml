@@ -40,6 +40,7 @@ prost = "0.14.4"
 reedline = "0.38.0"
 reqwest = { version = "0.13.3", features = ["json"] }
 rkyv = "0.8.16"
+roaring = "0.11.5"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 thiserror = "2.0.18"

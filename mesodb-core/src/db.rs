@@ -39,12 +39,12 @@ impl MesoDB {
         create_dir_all(data_dir.join("parquet"))?;
 
         // Initialize Tier 1 B+Trees (Owned by the background worker)
-        let mut now_index = crate::btree::NowIndex::open(data_dir.join("now.idx"))?;
-        let mut ave_index = crate::btree::AveIndex::open(data_dir.join("ave.idx"))?;
+        let now_index = crate::btree::NowIndex::open(data_dir.join("now.idx"))?;
+        let bitmap_store = crate::bitmap::BitmapStore::open(data_dir.join("bitmaps.idx"))?;
 
         // Take initial snapshots for WorldView
         let now_snap = Arc::new(now_index.snapshot());
-        let ave_snap = Arc::new(ave_index.snapshot());
+        let bitmap_snap = Arc::new(bitmap_store.snapshot());
 
         // Pass the B+Tree into the transactor (Though transactor no longer writes to it directly)
         let (transactor, recovered_batch) = Transactor::new(path, schema.clone(), config.clone())?;
@@ -76,7 +76,7 @@ impl MesoDB {
             schema: Arc::new(schema),
             timeline: Arc::new(transactor.timeline.clone()),
             now_index: now_snap,
-            ave_index: ave_snap,
+            bitmap_index: bitmap_snap,
             dirty_entities: Arc::new(initial_dirty),
         })));
 
@@ -89,7 +89,7 @@ impl MesoDB {
             world_view.clone(),
             config.clone(),
             now_index,
-            ave_index,
+            bitmap_store,
         );
 
         Ok(Self {
@@ -107,7 +107,7 @@ impl MesoDB {
         world_view: Arc<RwLock<Arc<WorldView>>>,
         config: Config,
         mut now_index: crate::btree::NowIndex,
-        mut ave_index: crate::btree::AveIndex,
+        mut bitmap_store: crate::bitmap::BitmapStore,
     ) {
         tokio::spawn(async move {
             let compactor = BackgroundCompactor::new(data_dir);
@@ -119,7 +119,7 @@ impl MesoDB {
             while let Some((tx_id, batch)) = flush_rx.recv().await {
                 // 1. UPDATE B-TREES (Writer owns them exclusively now! No RwLock needed)
                 if let Err(e) =
-                    Self::update_indexes_from_batch(&mut now_index, &mut ave_index, &batch)
+                    Self::update_indexes_from_batch(&mut now_index, &mut bitmap_store, &batch)
                 {
                     eprintln!(
                         "Warning: Failed to update background indexes for Tx {}: {:?}",
@@ -147,9 +147,9 @@ impl MesoDB {
                 if trigger_eviction || trigger_compaction {
                     // Flush B-Trees to disk and take fresh lock-free snapshots
                     let _ = now_index.flush();
-                    let _ = ave_index.flush();
+                    let _ = bitmap_store.flush();
                     let new_now_snap = Arc::new(now_index.snapshot());
-                    let new_ave_snap = Arc::new(ave_index.snapshot());
+                    let new_bitmap_snap = Arc::new(bitmap_store.snapshot());
 
                     {
                         let mut writer = world_view.write();
@@ -174,7 +174,7 @@ impl MesoDB {
 
                         // Swap in the new B-Tree snapshots
                         world_view_mut.now_index = new_now_snap;
-                        world_view_mut.ave_index = new_ave_snap;
+                        world_view_mut.bitmap_index = new_bitmap_snap;
                     }
                     evict_queue.clear();
                 }
@@ -198,7 +198,7 @@ impl MesoDB {
     /// Extracts specific datoms directly from the Arrow arrays safely without panicking.
     fn update_indexes_from_batch(
         now_index: &mut crate::btree::NowIndex,
-        ave_index: &mut crate::btree::AveIndex,
+        bitmap_store: &mut crate::bitmap::BitmapStore,
         batch: &RecordBatch,
     ) -> Result<()> {
         let e_col = batch
@@ -255,29 +255,32 @@ impl MesoDB {
             let a = a_col.value(i);
             let op = op_col.value(i);
 
-            if op {
-                let val = if v_bool.is_valid(i) {
-                    Value::Boolean(v_bool.value(i))
-                } else if v_int.is_valid(i) {
-                    Value::Int64(v_int.value(i))
-                } else if v_float.is_valid(i) {
-                    Value::Float64(v_float.value(i))
-                } else if v_str.is_valid(i) {
-                    Value::String(v_str.value(i).to_string())
-                } else if v_ref.is_valid(i) {
-                    Value::Ref(v_ref.value(i))
-                } else if v_time.is_valid(i) {
-                    Value::Timestamp(v_time.value(i))
-                } else {
-                    continue;
-                };
+            // Extract val BEFORE the op check
+            let val = if v_bool.is_valid(i) {
+                Value::Boolean(v_bool.value(i))
+            } else if v_int.is_valid(i) {
+                Value::Int64(v_int.value(i))
+            } else if v_float.is_valid(i) {
+                Value::Float64(v_float.value(i))
+            } else if v_str.is_valid(i) {
+                Value::String(v_str.value(i).to_string())
+            } else if v_ref.is_valid(i) {
+                Value::Ref(v_ref.value(i))
+            } else if v_time.is_valid(i) {
+                Value::Timestamp(v_time.value(i))
+            } else {
+                continue;
+            };
 
+            if op {
                 let _ = now_index.put(e, a, &val);
-                let _ = ave_index.put(a, &val, e);
+                let _ = bitmap_store.put(a, &val, e, true);
             } else {
                 let _ = now_index.delete(e, a);
+                let _ = bitmap_store.put(a, &val, e, false);
             }
         }
+
         Ok(())
     }
 
@@ -508,21 +511,24 @@ impl MesoDB {
 
                             if let Some(val) = literal_val {
                                 if let Some(a_id) = view.schema.get_id(a_ident) {
-                                    // If any entity is dirty in RAM, fall back to DataFusion for safety
                                     if !view.dirty_entities.is_empty() {
                                         return Ok(None);
                                     }
 
-                                    let ave_index = &view.ave_index;
-                                    if let Some(e_id) = ave_index.get(a_id, &val)? {
+                                    let bitmap_index = &view.bitmap_index;
+                                    if let Some(treemap) = bitmap_index.get(a_id, &val)? {
                                         let clean_var = find_var.replace("?", "");
                                         let field = arrow::datatypes::Field::new(
                                             &clean_var,
                                             arrow::datatypes::DataType::UInt64,
                                             true,
                                         );
+
+                                        // Massive Upgrade: Return all matching entities at once via RoaringTreemap IntoIterator!
+                                        let entities: Vec<u64> = treemap.into_iter().collect();
+
                                         let array =
-                                            Arc::new(arrow::array::UInt64Array::from(vec![e_id]));
+                                            Arc::new(arrow::array::UInt64Array::from(entities));
                                         let schema =
                                             Arc::new(arrow::datatypes::Schema::new(vec![field]));
                                         let batch = RecordBatch::try_new(schema, vec![array])
@@ -970,8 +976,8 @@ pub struct WorldView {
     pub data_dir: PathBuf,
     pub schema: Arc<SchemaMap>,
     pub timeline: Arc<SchemaTimeline>,
-    pub now_index: Arc<crate::btree::NowIndexSnapshot>, // No more RwLock!
-    pub ave_index: Arc<crate::btree::AveIndexSnapshot>, // No more RwLock!
+    pub now_index: Arc<crate::btree::NowIndexSnapshot>,
+    pub bitmap_index: Arc<crate::bitmap::BitmapSnapshot>, // Swapped out AveIndex
     pub dirty_entities: Arc<ahash::AHashSet<crate::types::EntityId>>,
 }
 
@@ -2669,7 +2675,7 @@ mod tests {
                 schema: current_view.schema.clone(),
                 timeline: current_view.timeline.clone(),
                 now_index: current_view.now_index.clone(),
-                ave_index: current_view.ave_index.clone(),
+                bitmap_index: current_view.bitmap_index.clone(),
                 dirty_entities: current_view.dirty_entities.clone(),
             });
         });
@@ -2860,7 +2866,7 @@ mod tests {
                 schema: current_view.schema.clone(),
                 timeline: current_view.timeline.clone(),
                 now_index: current_view.now_index.clone(),
-                ave_index: current_view.ave_index.clone(),
+                bitmap_index: current_view.bitmap_index.clone(),
                 dirty_entities: current_view.dirty_entities.clone(),
             });
         });
