@@ -38,19 +38,33 @@ impl MesoDB {
         create_dir_all(&data_dir)?;
         create_dir_all(data_dir.join("parquet"))?;
 
-        // Initialize the Tier 1 B+Tree
+        // Initialize Tier 1 B+Trees
         let now_idx_path = data_dir.join("now.idx");
         let now_index = Arc::new(RwLock::new(crate::btree::NowIndex::open(now_idx_path)?));
 
-        // Pass the B+Tree into the transactor (Though transactor no longer writes to it directly)
+        let ave_idx_path = data_dir.join("ave.idx");
+        let ave_index = Arc::new(RwLock::new(crate::btree::AveIndex::open(ave_idx_path)?));
+
+        // Pass the B+Tree into the transactor
         let (transactor, recovered_batch) = Transactor::new(path, schema.clone(), config.clone())?;
 
         let mut initial_ram = Vec::new();
+        let mut initial_dirty = ahash::AHashSet::new();
         let empty_batch = MemTable::new(0).finish()?;
 
         if recovered_batch.num_rows() > 0 {
             initial_ram.push((0, empty_batch.clone()));
-            initial_ram.push((transactor.current_tx_id, recovered_batch));
+            initial_ram.push((transactor.current_tx_id, recovered_batch.clone()));
+
+            if let Some(e_col) = recovered_batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+            {
+                for i in 0..recovered_batch.num_rows() {
+                    initial_dirty.insert(e_col.value(i));
+                }
+            }
         } else {
             initial_ram.push((0, empty_batch));
         }
@@ -61,11 +75,12 @@ impl MesoDB {
             schema: Arc::new(schema),
             timeline: Arc::new(transactor.timeline.clone()),
             now_index,
+            ave_index,
+            dirty_entities: Arc::new(initial_dirty),
         })));
 
         let (flush_tx, flush_rx) = mpsc::channel(config.compactor.backpressure_threshold);
 
-        // Pass config clone into the background worker
         Self::spawn_background_worker(data_dir, flush_rx, world_view.clone(), config.clone());
 
         Ok(Self {
@@ -91,13 +106,16 @@ impl MesoDB {
             const EVICT_THRESHOLD: usize = 20;
 
             while let Some((tx_id, batch)) = flush_rx.recv().await {
-                // 1. ASYNC TIER 1 INDEX UPDATE: Populate B+Tree safely off the critical transaction thread
+                // 1. ASYNC TIER 1 INDEX UPDATE: Populate B+Trees safely off critical thread
                 {
                     let view = world_view.read().clone();
                     let mut now_idx = view.now_index.write();
-                    if let Err(e) = Self::update_now_index_from_batch(&mut now_idx, &batch) {
+                    let mut ave_idx = view.ave_index.write();
+                    if let Err(e) =
+                        Self::update_indexes_from_batch(&mut now_idx, &mut ave_idx, &batch)
+                    {
                         eprintln!(
-                            "Warning: Failed to update background NowIndex for Tx {}: {:?}",
+                            "Warning: Failed to update background indexes for Tx {}: {:?}",
                             tx_id, e
                         );
                     }
@@ -108,19 +126,18 @@ impl MesoDB {
                     Ok(path) => path,
                     Err(e) => {
                         eprintln!("Failed to flush Tx {} to Parquet: {:?}", tx_id, e);
-                        continue; // Keep it in RAM if disk fails
+                        continue;
                     }
                 };
                 uncompacted_files.push(file_path);
 
-                // Queue the transaction ID for eviction
                 evict_queue.push(tx_id);
 
                 let trigger_compaction =
                     uncompacted_files.len() >= config.compactor.backpressure_threshold;
                 let trigger_eviction = evict_queue.len() >= EVICT_THRESHOLD;
 
-                // 3. Safely remove from RAM in batches OR when a compaction is triggered
+                // 3. Safely remove from RAM and recalculate dirty_entities
                 if trigger_eviction || trigger_compaction {
                     {
                         let mut writer = world_view.write();
@@ -128,16 +145,30 @@ impl MesoDB {
                         let ram_vec_mut = Arc::make_mut(&mut world_view_mut.ram_batches);
 
                         ram_vec_mut.retain(|(id, _)| !evict_queue.contains(id));
+
+                        // Rebuild dirty set from remaining RAM batches in O(RAM_rows)
+                        let mut remaining_dirty = ahash::AHashSet::new();
+                        for (_, b) in ram_vec_mut.iter() {
+                            if let Some(e_col) = b
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<arrow::array::UInt64Array>()
+                            {
+                                for i in 0..b.num_rows() {
+                                    remaining_dirty.insert(e_col.value(i));
+                                }
+                            }
+                        }
+                        world_view_mut.dirty_entities = Arc::new(remaining_dirty);
                     }
-                    evict_queue.clear(); // Ensure we clear the queue after eviction!
+                    evict_queue.clear();
                 }
 
-                // 4. Enforce Config Limits & Trigger Compaction
+                // 4. Trigger Compaction
                 if trigger_compaction {
                     let files_to_compact = std::mem::take(&mut uncompacted_files);
                     let compactor_clone = compactor.clone();
 
-                    // Offload the heavy DataFusion merge to a separate Tokio task.
                     tokio::spawn(async move {
                         if let Err(e) = compactor_clone.compact(&files_to_compact, tx_id).await {
                             eprintln!("Background compaction failed for Tx {}: {:?}", tx_id, e);
@@ -150,8 +181,9 @@ impl MesoDB {
 
     /// Helper to populate NowIndex B+Tree from an Arrow RecordBatch in the background thread.
     /// Extracts specific datoms directly from the Arrow arrays safely without panicking.
-    fn update_now_index_from_batch(
+    fn update_indexes_from_batch(
         now_index: &mut crate::btree::NowIndex,
+        ave_index: &mut crate::btree::AveIndex,
         batch: &RecordBatch,
     ) -> Result<()> {
         let e_col = batch
@@ -160,12 +192,11 @@ impl MesoDB {
             .downcast_ref::<arrow::array::UInt64Array>()
             .ok_or_else(|| MesoError::Serialization("Missing e column (UInt64)".into()))?;
 
-        // The original schema encodes `a` as UInt16, not UInt64!
         let a_col = batch
             .column(1)
             .as_any()
-            .downcast_ref::<arrow::array::UInt16Array>()
-            .ok_or_else(|| MesoError::Serialization("Missing a column (UInt16)".into()))?;
+            .downcast_ref::<arrow::array::UInt32Array>()
+            .ok_or_else(|| MesoError::Serialization("Missing a column (UInt32)".into()))?;
 
         let v_bool = batch
             .column(2)
@@ -206,7 +237,7 @@ impl MesoDB {
 
         for i in 0..batch.num_rows() {
             let e = e_col.value(i);
-            let a = a_col.value(i) as u32; // Safely cast UInt16 to the B+Tree's u32 AttributeId
+            let a = a_col.value(i);
             let op = op_col.value(i);
 
             if op {
@@ -224,9 +255,10 @@ impl MesoDB {
                     Value::Timestamp(v_time.value(i))
                 } else {
                     continue;
-                }; // Fallback
+                };
 
                 let _ = now_index.put(e, a, &val);
+                let _ = ave_index.put(a, &val, e);
             } else {
                 let _ = now_index.delete(e, a);
             }
@@ -285,8 +317,6 @@ impl MesoDB {
             let new_schema = Arc::new(tx.schema.clone());
             let new_timeline = Arc::new(tx.timeline.clone());
 
-            // FAST PATH: In-place O(1) buffer append via Arc::make_mut
-            // Zero sync B+Tree interactions happen here!
             {
                 let mut writer = self.world_view.write();
 
@@ -295,10 +325,21 @@ impl MesoDB {
                 world_view_mut.timeline = new_timeline;
 
                 let ram_vec_mut = Arc::make_mut(&mut world_view_mut.ram_batches);
-                ram_vec_mut.push((report.tx_id, batch_clone));
-            } // Write lock releases instantly!
+                ram_vec_mut.push((report.tx_id, batch_clone.clone()));
 
-            // --- THE COMPACTION COMPLIANCE THRESHOLD ---
+                // Insert dirty entities into WorldView
+                let dirty_mut = Arc::make_mut(&mut world_view_mut.dirty_entities);
+                if let Some(e_col) = batch_clone
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::UInt64Array>()
+                {
+                    for i in 0..batch_clone.num_rows() {
+                        dirty_mut.insert(e_col.value(i));
+                    }
+                }
+            }
+
             if report.batch.num_rows() >= tx.config.storage.memtable_max_rows
                 && self
                     .flush_tx
@@ -330,149 +371,299 @@ impl MesoDB {
             return Ok(None);
         }
 
-        // AST must be a simple identity point-lookup: [:find ?v :where [42 :attr ?v]]
-        if ast.find.len() != 1 || ast.where_clauses.len() != 1 {
-            return Ok(None);
+        // --- PATTERN 1 & 2: Single or Multi-Attribute EAV Point Lookup ---
+        // Match [:find ?v1 ... :where [101 :attr1 ?v1] [101 :attr2 ?v2]]
+        let is_eav_candidate = !ast.find.is_empty()
+            && ast
+                .find
+                .iter()
+                .all(|f| matches!(f, crate::ast::FindSpec::Variable(_)))
+            && !ast.where_clauses.is_empty()
+            && ast.where_clauses.iter().all(|w| {
+                matches!(
+                    w,
+                    crate::ast::WhereClause::DataPattern {
+                        tx: None,
+                        op: None,
+                        ..
+                    }
+                )
+            });
+
+        if is_eav_candidate {
+            let mut target_entity = None;
+            let mut clause_bindings = Vec::new();
+
+            for clause in &ast.where_clauses {
+                if let crate::ast::WhereClause::DataPattern { e, a, v, .. } = clause {
+                    let e_id = match e {
+                        crate::ast::Term::Integer(id) => *id as u64,
+                        _ => return Ok(None), // Must be a constant Entity ID
+                    };
+
+                    if let Some(existing_e) = target_entity {
+                        if existing_e != e_id {
+                            return Ok(None); // All clauses in fast-path must target the same entity
+                        }
+                    } else {
+                        target_entity = Some(e_id);
+                    }
+
+                    let a_ident = match a {
+                        crate::ast::Term::Keyword(kw) => kw,
+                        _ => return Ok(None),
+                    };
+
+                    let v_var = match v {
+                        crate::ast::Term::Variable(var) => var,
+                        _ => return Ok(None),
+                    };
+
+                    clause_bindings.push((a_ident, v_var));
+                }
+            }
+
+            let e_id = match target_entity {
+                Some(id) => id,
+                None => return Ok(None),
+            };
+
+            // Fast O(1) dirty check!
+            if view.dirty_entities.contains(&e_id) {
+                return Ok(None); // Let DataFusion resolve pending RAM state
+            }
+
+            // Direct B+Tree lookup
+            let now_index = view.now_index.read();
+            let mut fields = Vec::new();
+            let mut arrays: Vec<Arc<dyn arrow::array::Array>> = Vec::new();
+
+            for find_spec in &ast.find {
+                if let crate::ast::FindSpec::Variable(find_var) = find_spec {
+                    let binding = clause_bindings.iter().find(|(_, v_var)| *v_var == find_var);
+                    let a_ident = match binding {
+                        Some((a_kw, _)) => a_kw,
+                        None => return Ok(None),
+                    };
+
+                    let a_id = match view.schema.get_id(a_ident) {
+                        Some(id) => id,
+                        None => return Ok(Some(vec![])), // Attribute doesn't exist
+                    };
+
+                    let clean_var = find_var.replace("?", "");
+                    if let Some(val) = now_index.get(e_id, a_id)? {
+                        let (field, array) = Self::val_to_arrow_column(&clean_var, &val);
+                        fields.push(field);
+                        arrays.push(array);
+                    } else {
+                        return Ok(Some(vec![])); // Value missing for entity
+                    }
+                }
+            }
+
+            let schema = Arc::new(arrow::datatypes::Schema::new(fields));
+            let batch = RecordBatch::try_new(schema, arrays).map_err(MesoError::Arrow)?;
+            return Ok(Some(vec![batch]));
         }
 
-        let find_var = match &ast.find[0] {
-            crate::ast::FindSpec::Variable(v) => v,
-            _ => return Ok(None),
-        };
+        // --- PATTERN 3: Inverted AVE Lookup ---
+        // Match [:find ?e :where [?e :attr "literal_value"]]
+        if ast.find.len() == 1 && ast.where_clauses.len() == 1 {
+            if let crate::ast::FindSpec::Variable(find_var) = &ast.find[0] {
+                if let crate::ast::WhereClause::DataPattern {
+                    e,
+                    a,
+                    v,
+                    tx: None,
+                    op: None,
+                } = &ast.where_clauses[0]
+                {
+                    if let (crate::ast::Term::Variable(e_var), crate::ast::Term::Keyword(a_ident)) =
+                        (e, a)
+                    {
+                        if e_var == find_var {
+                            let literal_val = match v {
+                                crate::ast::Term::String(s) => Some(Value::String(s.clone())),
+                                crate::ast::Term::Integer(i) => Some(Value::Int64(*i)),
+                                crate::ast::Term::Boolean(b) => Some(Value::Boolean(*b)),
+                                crate::ast::Term::Float(f) => Some(Value::Float64(*f)),
+                                _ => None,
+                            };
 
-        let (e_id, a_ident, v_var) = match &ast.where_clauses[0] {
-            crate::ast::WhereClause::DataPattern {
-                e: crate::ast::Term::Integer(id),
-                a: crate::ast::Term::Keyword(kw),
-                v: crate::ast::Term::Variable(var),
-                tx: None,
-                op: None,
-            } => (*id as u64, kw, var),
-            _ => return Ok(None),
-        };
+                            if let Some(val) = literal_val {
+                                if let Some(a_id) = view.schema.get_id(a_ident) {
+                                    // If any entity is dirty in RAM, fall back to DataFusion for safety
+                                    if !view.dirty_entities.is_empty() {
+                                        return Ok(None);
+                                    }
 
-        if v_var != find_var {
-            return Ok(None);
-        }
-
-        let a_id = match view.schema.get_id(a_ident) {
-            Some(id) => id,
-            None => return Ok(Some(vec![])), // Valid empty response (Attribute doesn't exist)
-        };
-
-        // 1. Check if the entity has ANY pending changes in RAM. If so, fallback to DataFusion
-        //    to ensure bitemporal correctness (e.g., catching a recent un-flushed retraction).
-        for (_, batch) in view.ram_batches.iter() {
-            if let Some(e_col) = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::UInt64Array>()
-            {
-                for i in 0..batch.num_rows() {
-                    if e_col.value(i) == e_id {
-                        return Ok(None); // Let DataFusion resolve the volatile RAM state
+                                    let ave_index = view.ave_index.read();
+                                    if let Some(e_id) = ave_index.get(a_id, &val)? {
+                                        let clean_var = find_var.replace("?", "");
+                                        let field = arrow::datatypes::Field::new(
+                                            &clean_var,
+                                            arrow::datatypes::DataType::UInt64,
+                                            true,
+                                        );
+                                        let array =
+                                            Arc::new(arrow::array::UInt64Array::from(vec![e_id]));
+                                        let schema =
+                                            Arc::new(arrow::datatypes::Schema::new(vec![field]));
+                                        let batch = RecordBatch::try_new(schema, vec![array])
+                                            .map_err(MesoError::Arrow)?;
+                                        return Ok(Some(vec![batch]));
+                                    } else {
+                                        return Ok(Some(vec![]));
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // 2. Entity is purely on disk. Safe to hit the zero-copy B+Tree!
-        let now_index = view.now_index.read();
-        if let Some(val) = now_index.get(e_id, a_id)? {
-            let clean_var = find_var.replace("?", "");
+        // --- PATTERN 4: Constant Entity Pull ---
+        // Match [:find (pull 101 [:user/name :user/age]) :where ...]
+        if ast.find.len() == 1 && ast.where_clauses.len() == 1 {
+            if let crate::ast::FindSpec::Pull(var, pattern) = &ast.find[0] {
+                if let crate::ast::WhereClause::DataPattern { e, .. } = &ast.where_clauses[0] {
+                    if let crate::ast::Term::Integer(e_id) = e {
+                        let entity_id = *e_id as u64;
+                        if view.dirty_entities.contains(&entity_id) {
+                            return Ok(None);
+                        }
 
-            // Reconstruct a single-row Arrow batch manually to bypass DataFusion
-            let (field, array): (arrow::datatypes::Field, Arc<dyn arrow::array::Array>) = match val
-            {
-                Value::String(s) => (
-                    arrow::datatypes::Field::new(
-                        &clean_var,
-                        arrow::datatypes::DataType::Utf8,
-                        true,
-                    ),
-                    Arc::new(arrow::array::StringArray::from(vec![s])),
-                ),
-                Value::Int64(i) => (
-                    arrow::datatypes::Field::new(
-                        &clean_var,
-                        arrow::datatypes::DataType::Int64,
-                        true,
-                    ),
-                    Arc::new(arrow::array::Int64Array::from(vec![i])),
-                ),
-                Value::Float64(f) => (
-                    arrow::datatypes::Field::new(
-                        &clean_var,
-                        arrow::datatypes::DataType::Float64,
-                        true,
-                    ),
-                    Arc::new(arrow::array::Float64Array::from(vec![f])),
-                ),
-                Value::Boolean(b) => (
-                    arrow::datatypes::Field::new(
-                        &clean_var,
-                        arrow::datatypes::DataType::Boolean,
-                        true,
-                    ),
-                    Arc::new(arrow::array::BooleanArray::from(vec![b])),
-                ),
-                Value::Ref(r) => (
-                    arrow::datatypes::Field::new(
-                        &clean_var,
-                        arrow::datatypes::DataType::UInt64,
-                        true,
-                    ),
-                    Arc::new(arrow::array::UInt64Array::from(vec![r])),
-                ),
-                Value::Timestamp(t) => (
-                    arrow::datatypes::Field::new(
-                        &clean_var,
-                        arrow::datatypes::DataType::Timestamp(
-                            arrow::datatypes::TimeUnit::Microsecond,
-                            None,
-                        ),
-                        true,
-                    ),
-                    Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![t])),
-                ),
-                Value::Uuid(u) => {
-                    let uuid_str = format!(
-                        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                        u[0],
-                        u[1],
-                        u[2],
-                        u[3],
-                        u[4],
-                        u[5],
-                        u[6],
-                        u[7],
-                        u[8],
-                        u[9],
-                        u[10],
-                        u[11],
-                        u[12],
-                        u[13],
-                        u[14],
-                        u[15]
-                    );
-                    (
-                        arrow::datatypes::Field::new(
+                        let now_index = view.now_index.read();
+                        let clean_var = var.replace("?", "");
+
+                        // Direct zero-copy JSON/EDN builder for constant entity pull
+                        let mut map_pairs = Vec::new();
+
+                        for pull_attr in &pattern.0 {
+                            if let crate::ast::PullAttribute::Simple(a_ident) = pull_attr {
+                                if let Some(a_id) = view.schema.get_id(a_ident) {
+                                    if let Some(val) = now_index.get(entity_id, a_id)? {
+                                        let formatted_val = match options.format {
+                                            OutputFormat::Json => match val {
+                                                Value::String(s) => format!("\"{}\"", s),
+                                                Value::Int64(i) => i.to_string(),
+                                                Value::Float64(f) => f.to_string(),
+                                                Value::Boolean(b) => b.to_string(),
+                                                Value::Ref(r) => r.to_string(),
+                                                _ => "null".to_string(),
+                                            },
+                                            _ => match val {
+                                                Value::String(s) => format!("\"{}\"", s),
+                                                _ => val.to_string(),
+                                            },
+                                        };
+                                        let key_name = if options.format == OutputFormat::Edn {
+                                            a_ident.clone()
+                                        } else {
+                                            a_ident.trim_start_matches(':').to_string()
+                                        };
+                                        map_pairs.push((key_name, formatted_val));
+                                    }
+                                }
+                            }
+                        }
+
+                        let pull_json = if options.format == OutputFormat::Edn {
+                            let entry_strs: Vec<String> = map_pairs
+                                .iter()
+                                .map(|(k, v)| format!("{} {}", k, v))
+                                .collect();
+                            format!("{{{}}}", entry_strs.join(" "))
+                        } else {
+                            let entry_strs: Vec<String> = map_pairs
+                                .iter()
+                                .map(|(k, v)| format!("\"{}\":{}", k, v))
+                                .collect();
+                            format!("{{{}}}", entry_strs.join(","))
+                        };
+
+                        let field = arrow::datatypes::Field::new(
                             &clean_var,
                             arrow::datatypes::DataType::Utf8,
                             true,
-                        ),
-                        Arc::new(arrow::array::StringArray::from(vec![uuid_str])),
-                    )
+                        );
+                        let array = Arc::new(arrow::array::StringArray::from(vec![pull_json]));
+                        let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
+                        let batch =
+                            RecordBatch::try_new(schema, vec![array]).map_err(MesoError::Arrow)?;
+                        return Ok(Some(vec![batch]));
+                    }
                 }
-            };
-
-            let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
-            let batch = RecordBatch::try_new(schema, vec![array]).map_err(MesoError::Arrow)?;
-            return Ok(Some(vec![batch]));
+            }
         }
 
-        // 3. Entity not found in RAM or B+Tree, return valid empty result
-        Ok(Some(vec![]))
+        Ok(None)
+    }
+
+    fn val_to_arrow_column(
+        name: &str,
+        val: &Value,
+    ) -> (arrow::datatypes::Field, Arc<dyn arrow::array::Array>) {
+        match val {
+            Value::String(s) => (
+                arrow::datatypes::Field::new(name, arrow::datatypes::DataType::Utf8, true),
+                Arc::new(arrow::array::StringArray::from(vec![s.clone()])),
+            ),
+            Value::Int64(i) => (
+                arrow::datatypes::Field::new(name, arrow::datatypes::DataType::Int64, true),
+                Arc::new(arrow::array::Int64Array::from(vec![*i])),
+            ),
+            Value::Float64(f) => (
+                arrow::datatypes::Field::new(name, arrow::datatypes::DataType::Float64, true),
+                Arc::new(arrow::array::Float64Array::from(vec![*f])),
+            ),
+            Value::Boolean(b) => (
+                arrow::datatypes::Field::new(name, arrow::datatypes::DataType::Boolean, true),
+                Arc::new(arrow::array::BooleanArray::from(vec![*b])),
+            ),
+            Value::Ref(r) => (
+                arrow::datatypes::Field::new(name, arrow::datatypes::DataType::UInt64, true),
+                Arc::new(arrow::array::UInt64Array::from(vec![*r])),
+            ),
+            Value::Timestamp(t) => (
+                arrow::datatypes::Field::new(
+                    name,
+                    arrow::datatypes::DataType::Timestamp(
+                        arrow::datatypes::TimeUnit::Microsecond,
+                        None,
+                    ),
+                    true,
+                ),
+                Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![*t])),
+            ),
+            Value::Uuid(u) => {
+                let uuid_str = format!(
+                    "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                    u[0],
+                    u[1],
+                    u[2],
+                    u[3],
+                    u[4],
+                    u[5],
+                    u[6],
+                    u[7],
+                    u[8],
+                    u[9],
+                    u[10],
+                    u[11],
+                    u[12],
+                    u[13],
+                    u[14],
+                    u[15]
+                );
+                (
+                    arrow::datatypes::Field::new(name, arrow::datatypes::DataType::Utf8, true),
+                    Arc::new(arrow::array::StringArray::from(vec![uuid_str])),
+                )
+            }
+        }
     }
 
     pub async fn query(&self, query_str: &str) -> Result<Vec<RecordBatch>> {
@@ -765,6 +956,8 @@ pub struct WorldView {
     pub schema: Arc<SchemaMap>,
     pub timeline: Arc<SchemaTimeline>,
     pub now_index: Arc<RwLock<crate::btree::NowIndex>>,
+    pub ave_index: Arc<RwLock<crate::btree::AveIndex>>,
+    pub dirty_entities: Arc<ahash::AHashSet<crate::types::EntityId>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -2461,6 +2654,8 @@ mod tests {
                 schema: current_view.schema.clone(),
                 timeline: current_view.timeline.clone(),
                 now_index: current_view.now_index.clone(),
+                ave_index: current_view.ave_index.clone(),
+                dirty_entities: current_view.dirty_entities.clone(),
             });
         });
 
@@ -2650,6 +2845,8 @@ mod tests {
                 schema: current_view.schema.clone(),
                 timeline: current_view.timeline.clone(),
                 now_index: current_view.now_index.clone(),
+                ave_index: current_view.ave_index.clone(),
+                dirty_entities: current_view.dirty_entities.clone(),
             });
         });
 
@@ -2889,5 +3086,178 @@ mod tests {
             compacted_count, 1,
             "There should be exactly one compacted file containing all data"
         );
+    }
+
+    // =====================================================================
+    // PHASE 1: EXPANDED FAST-PATH ROUTER TESTS
+    // =====================================================================
+
+    #[tokio::test]
+    async fn test_fast_path_multi_attribute_eav_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/name", ValueType::String, false);
+        schema.add_attribute(":user/age", ValueType::Int64, false);
+
+        let db = MesoDB::open(dir.path().join("fp_multi.db"), schema, Config::default()).unwrap();
+
+        db.transact(vec![
+            Fact {
+                e: 101,
+                ident: ":user/name".into(),
+                v: Value::String("Alice".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 101,
+                ident: ":user/age".into(),
+                v: Value::Int64(30),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+        ])
+        .await
+        .unwrap();
+
+        // Wait for background worker to flush to index
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let query = r#"[:find ?n ?a :where [101 :user/name ?n] [101 :user/age ?a]]"#;
+        let results = db.query(query).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        let batch = &results[0];
+        assert_eq!(batch.num_rows(), 1);
+
+        let n_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        let a_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+
+        assert_eq!(n_col.value(0), "Alice");
+        assert_eq!(a_col.value(0), 30);
+    }
+
+    #[tokio::test]
+    async fn test_fast_path_ave_inverted_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/email", ValueType::String, true);
+
+        let db = MesoDB::open(dir.path().join("fp_ave.db"), schema, Config::default()).unwrap();
+
+        db.transact(vec![Fact {
+            e: 88,
+            ident: ":user/email".into(),
+            v: Value::String("target@example.com".into()),
+            op: true,
+            cas_old_v: None,
+            valid_time: None,
+        }])
+        .await
+        .unwrap();
+
+        // Wait for background worker to update AveIndex
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let query = r#"[:find ?e :where [?e :user/email "target@example.com"]]"#;
+        let results = db.query(query).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        let batch = &results[0];
+        assert_eq!(batch.num_rows(), 1);
+
+        let e_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .unwrap();
+        assert_eq!(e_col.value(0), 88);
+    }
+
+    #[tokio::test]
+    async fn test_fast_path_constant_entity_pull() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/name", ValueType::String, false);
+        schema.add_attribute(":user/age", ValueType::Int64, false);
+
+        let mut config = Config::default();
+        config.storage.memtable_max_rows = 1;
+        config.compactor.backpressure_threshold = 1;
+
+        let db = MesoDB::open(dir.path().join("fp_pull.db"), schema, config).unwrap();
+
+        db.transact(vec![
+            Fact {
+                e: 42,
+                ident: ":user/name".into(),
+                v: Value::String("Bob".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 42,
+                ident: ":user/age".into(),
+                v: Value::Int64(45),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+        ])
+        .await
+        .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let query = r#"[:find (pull ?e [:user/name :user/age]) :where [42 :user/name _]]"#;
+        let json_res = db.query_json(query).await.unwrap();
+
+        assert!(json_res.contains(r#""user/name":"Bob""#));
+        assert!(json_res.contains(r#""user/age":45"#));
+    }
+
+    #[tokio::test]
+    async fn test_fast_path_ram_dirty_set_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/score", ValueType::Int64, false);
+
+        let db = MesoDB::open(dir.path().join("fp_dirty.db"), schema, Config::default()).unwrap();
+
+        // Fact in RAM (Not yet flushed to index)
+        db.transact(vec![Fact {
+            e: 777,
+            ident: ":user/score".into(),
+            v: Value::Int64(9000),
+            op: true,
+            cas_old_v: None,
+            valid_time: None,
+        }])
+        .await
+        .unwrap();
+
+        // 1. Immediate query when entity is in dirty set -> Must fall back to DataFusion safely and find result
+        let query = r#"[:find ?s :where [777 :user/score ?s]]"#;
+        let results_ram = db.query(query).await.unwrap();
+        let total_rows_ram: usize = results_ram.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows_ram, 1);
+
+        // 2. Wait for flush -> Dirty set clears, fast-path executes from B+Tree directly
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let results_disk = db.query(query).await.unwrap();
+        let total_rows_disk: usize = results_disk.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows_disk, 1);
     }
 }
