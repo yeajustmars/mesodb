@@ -860,13 +860,16 @@ impl MesoDB {
             .map_err(MesoError::DataFusion)?;
         ctx.register_table("resolved_datoms", resolved_df.into_view())?;
 
-        let planner = QueryPlanner::new(
+        let planner = crate::planner::QueryPlanner::new(
             &ctx,
             view.timeline.as_ref(),
             "resolved_datoms",
             options.format.clone(),
             options.as_of,
             ruleset,
+            view.bitmap_index.as_ref(),
+            view.dirty_entities.clone(), // Added parameter
+            view.schema.as_ref(),
         );
 
         let final_df = planner.plan(&ast).await?;

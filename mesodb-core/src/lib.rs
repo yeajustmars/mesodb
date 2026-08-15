@@ -18,5 +18,6 @@ pub mod schema;
 pub mod storage;
 pub mod transactor;
 pub mod types;
+pub mod udf;
 pub mod wal;
 pub mod wire;

@@ -33,6 +33,12 @@ impl BackgroundCompactor {
 
         let props = WriterProperties::builder()
             .set_compression(parquet::basic::Compression::SNAPPY)
+            // Enable chunk-level statistics (Zone Maps: Min/Max) for partition pruning
+            .set_statistics_enabled(parquet::file::properties::EnabledStatistics::Chunk)
+            // Enable Bloom Filters globally, and explicitly force them for 'e' and 'a'
+            .set_bloom_filter_enabled(true)
+            .set_column_bloom_filter_enabled("e".into(), true)
+            .set_column_bloom_filter_enabled("a".into(), true)
             .build();
 
         let mut writer = ArrowWriter::try_new(file, batch.schema(), Some(props))

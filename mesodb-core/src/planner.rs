@@ -16,6 +16,9 @@ use crate::{
     schema::{SchemaTimeline, ValueType},
 };
 
+use crate::bitmap::BitmapSnapshot;
+use crate::schema::SchemaMap;
+
 pub struct QueryPlanner<'a> {
     ctx: &'a SessionContext,
     timeline: &'a SchemaTimeline,
@@ -23,6 +26,9 @@ pub struct QueryPlanner<'a> {
     format: OutputFormat,
     as_of: Option<i64>,
     ruleset: Option<RuleSet>,
+    bitmap_index: &'a BitmapSnapshot,
+    dirty_entities: Arc<ahash::AHashSet<u64>>,
+    schema: &'a SchemaMap,
 }
 
 type PlanPartFroms = Vec<String>;
@@ -38,6 +44,9 @@ impl<'a> QueryPlanner<'a> {
         format: OutputFormat,
         as_of: Option<i64>,
         ruleset: Option<RuleSet>,
+        bitmap_index: &'a BitmapSnapshot,
+        dirty_entities: Arc<ahash::AHashSet<u64>>,
+        schema: &'a SchemaMap,
     ) -> Self {
         Self {
             ctx,
@@ -46,6 +55,9 @@ impl<'a> QueryPlanner<'a> {
             format,
             as_of,
             ruleset,
+            bitmap_index,
+            dirty_entities,
+            schema,
         }
     }
 
@@ -152,8 +164,47 @@ impl<'a> QueryPlanner<'a> {
                         Term::Boolean(b) => {
                             where_conditions.push(format!("{}.v_bool = {}", alias, b))
                         }
+                        Term::Float(f) => {
+                            where_conditions.push(format!("{}.v_float = {}", alias, f))
+                        }
                         _ => {}
                     }
+
+                    // --- PHASE 3: VECTORIZED BITMAP PUSHDOWN ---
+                    // Dynamically map literal value terms into their underlying struct representation
+                    let val_literal = match v {
+                        Term::String(s) => Some(crate::types::Value::String(s.clone())),
+                        Term::Integer(i) => Some(crate::types::Value::Int64(*i)),
+                        Term::Boolean(b) => Some(crate::types::Value::Boolean(*b)),
+                        Term::Float(f) => Some(crate::types::Value::Float64(*f)),
+                        _ => None,
+                    };
+
+                    if let (Term::Keyword(kw), Some(lit)) = (a, val_literal) {
+                        if let Some(a_id) = self.schema.get_id(kw) {
+                            if let Ok(Some(treemap)) = self.bitmap_index.get(a_id, &lit) {
+                                let udf_name = format!(
+                                    "in_bitmap_{}_{}",
+                                    a_id,
+                                    crate::bitmap::hash_value(&lit)
+                                );
+
+                                let udf = datafusion::logical_expr::ScalarUDF::from(
+                                    crate::udf::InBitmapUDF::new(
+                                        treemap,
+                                        udf_name.clone(),
+                                        self.dirty_entities.clone(), // Passed here
+                                    ),
+                                );
+                                let _ = self.ctx.register_udf(udf);
+
+                                where_conditions.push(format!("{}({}.e)", udf_name, alias));
+                            }
+                            // Note: We no longer push FALSE. If the bitmap is empty on disk,
+                            // we just rely on standard Parquet/RAM evaluation to catch dirty entities.
+                        }
+                    }
+
                     if let Some(tx_term) = tx {
                         match tx_term {
                             Term::Variable(var_name) => {
