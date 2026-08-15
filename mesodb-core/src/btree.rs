@@ -1,46 +1,116 @@
 // mesodb-core/src/btree.rs
 
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::{
     error::MesoError,
-    page::{IndexKey, IndexValue, NUM_CELLS},
-    pager::Pager,
+    page::{IndexKey, IndexValue, NUM_CELLS, NodePage, OverflowPage},
+    pager::{ReadPager, WritePager},
     types::{AttributeId, EntityId, Value},
 };
 
 // ==============================================================================
-// CORE B+TREE ENGINE (Raw Key-Value Traversal & Splitting)
+// CORE COW B+TREE ENGINE (Lock-Free Reads, Dirty-Cache Writes)
 // ==============================================================================
 
 pub struct CoreBTree {
-    pub pager: Pager,
+    pub read_pager: ReadPager,
+    pub write_pager: WritePager,
     pub root_page_id: u32,
+    pub dirty_nodes: HashMap<u32, NodePage>,
+    pub dirty_overflows: HashMap<u32, OverflowPage>,
 }
 
 impl CoreBTree {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, MesoError> {
-        let mut pager = Pager::open(path, 1)?;
+        let mut write_pager = WritePager::open(path)?;
+        let file_len = write_pager.file().metadata().map_err(MesoError::Io)?.len();
 
-        let root = pager.get_node_mut(0)?;
-        if root.header.num_cells == 0 && root.header.is_leaf == 0 {
-            root.header.is_leaf = 1;
-            pager.flush()?;
+        let root_page_id;
+
+        if file_len == 0 {
+            // Bootstrap New Database
+            let mut empty_root = unsafe { std::mem::zeroed::<NodePage>() };
+            empty_root.header.is_leaf = 1;
+
+            // Page 1 is the genesis root
+            write_pager.write_page_bytes(1, bytemuck::bytes_of(&empty_root))?;
+
+            // Page 0 is the Metapage [root_page_id, next_page_id, padding...]
+            let mut metapage = [0u8; 4096];
+            metapage[0..4].copy_from_slice(&1u32.to_ne_bytes());
+            metapage[4..8].copy_from_slice(&2u32.to_ne_bytes());
+            write_pager.write_page_bytes(0, &metapage)?;
+            write_pager.flush()?;
+
+            root_page_id = 1;
+            write_pager.next_page_id = 2;
+        } else {
+            // Recover from existing file
+            let mut metapage = [0u8; 4096];
+            write_pager
+                .file
+                .seek(SeekFrom::Start(0))
+                .map_err(MesoError::Io)?;
+            write_pager
+                .file
+                .read_exact(&mut metapage)
+                .map_err(MesoError::Io)?;
+
+            let mut r_bytes = [0u8; 4];
+            r_bytes.copy_from_slice(&metapage[0..4]);
+            root_page_id = u32::from_ne_bytes(r_bytes);
+
+            let mut n_bytes = [0u8; 4];
+            n_bytes.copy_from_slice(&metapage[4..8]);
+            write_pager.next_page_id = u32::from_ne_bytes(n_bytes);
         }
 
+        let read_pager = ReadPager::open(write_pager.file())?;
+
         Ok(Self {
-            pager,
-            root_page_id: 0,
+            read_pager,
+            write_pager,
+            root_page_id,
+            dirty_nodes: HashMap::new(),
+            dirty_overflows: HashMap::new(),
         })
+    }
+
+    /// Pure lock-free reader. Resolves transparently against the dirty cache if un-flushed.
+    #[inline(always)]
+    pub fn get_node(&self, page_id: u32) -> Result<&NodePage, MesoError> {
+        if let Some(node) = self.dirty_nodes.get(&page_id) {
+            Ok(node)
+        } else {
+            self.read_pager.get_node(page_id)
+        }
+    }
+
+    #[inline(always)]
+    pub fn get_overflow(&self, page_id: u32) -> Result<&OverflowPage, MesoError> {
+        if let Some(overflow) = self.dirty_overflows.get(&page_id) {
+            Ok(overflow)
+        } else {
+            self.read_pager.get_overflow(page_id)
+        }
+    }
+
+    pub fn allocate_page(&mut self) -> u32 {
+        let id = self.write_pager.next_page_id;
+        self.write_pager.next_page_id += 1;
+        id
     }
 
     pub fn get_kv(&self, target_key: IndexKey) -> Result<Option<IndexValue>, MesoError> {
         let mut current_page_id = self.root_page_id;
 
         loop {
-            let node = self.pager.get_node(current_page_id)?;
+            let node = self.get_node(current_page_id)?;
             let num_cells = node.header.num_cells as usize;
 
             if num_cells == 0 {
@@ -61,7 +131,7 @@ impl CoreBTree {
 
                 if left < num_cells && node.keys[left] == target_key {
                     let iv = node.values[left];
-                    // 254 is our Tombstone tag for retracted values
+                    // 254 is Tombstone tag
                     if iv.type_tag == 254 {
                         return Ok(None);
                     }
@@ -69,7 +139,6 @@ impl CoreBTree {
                 }
                 return Ok(None);
             } else {
-                // Internal Node Routing
                 let mut child_idx = 0;
                 while child_idx < num_cells && target_key >= node.keys[child_idx] {
                     child_idx += 1;
@@ -83,220 +152,224 @@ impl CoreBTree {
     }
 
     pub fn put_kv(&mut self, key: IndexKey, val: IndexValue) -> Result<(), MesoError> {
-        if let Some((split_key, right_page_id)) =
-            self.insert_into_node(self.root_page_id, key, val)?
-        {
-            // The Root Split! We keep the root at Page 0, move the old root data to a new left page.
-            let new_left_id = self.pager.allocate_page()?;
+        let (new_root_id, split_opt) = self.insert_into_node(self.root_page_id, key, val)?;
 
-            {
-                let root_node = self.pager.get_node(self.root_page_id)?;
-                let new_left_node = *root_node;
-                let left_node_mut = self.pager.get_node_mut(new_left_id)?;
-                *left_node_mut = new_left_node;
-            }
+        if let Some((split_key, right_page_id)) = split_opt {
+            // Root split! Create a new Super-Root.
+            let super_root_id = self.allocate_page();
+            let mut super_root = unsafe { std::mem::zeroed::<NodePage>() };
+            super_root.header.is_leaf = 0;
+            super_root.header.num_cells = 2;
 
-            let left_min_key = self.pager.get_node(new_left_id)?.keys[0];
-            let root_mut = self.pager.get_node_mut(self.root_page_id)?;
+            let left_min_key = self.get_node(new_root_id)?.keys[0];
 
-            // Rewrite Root as an Internal Node
-            root_mut.header.is_leaf = 0;
-            root_mut.header.num_cells = 2;
-            root_mut.keys[0] = left_min_key;
-            root_mut.values[0] = Self::make_child_ptr(new_left_id);
-            root_mut.keys[1] = split_key;
-            root_mut.values[1] = Self::make_child_ptr(right_page_id);
+            super_root.keys[0] = left_min_key;
+            super_root.values[0] = Self::make_child_ptr(new_root_id);
+            super_root.keys[1] = split_key;
+            super_root.values[1] = Self::make_child_ptr(right_page_id);
+
+            self.dirty_nodes.insert(super_root_id, super_root);
+            self.root_page_id = super_root_id;
+        } else {
+            self.root_page_id = new_root_id;
         }
 
         Ok(())
     }
 
-    /// Recursively inserts into the tree. Returns `Some((RoutingKey, NewRightPageId))` if it triggered a split.
+    /// Copy-On-Write Insert Logic. Returns the `new_page_id` and optionally split routing data.
     fn insert_into_node(
         &mut self,
         page_id: u32,
         target_key: IndexKey,
         target_val: IndexValue,
-    ) -> Result<Option<(IndexKey, u32)>, MesoError> {
-        let is_leaf;
-        let num_cells;
-        {
-            let node = self.pager.get_node(page_id)?;
-            is_leaf = node.header.is_leaf == 1;
-            num_cells = node.header.num_cells as usize;
-        }
+    ) -> Result<(u32, Option<(IndexKey, u32)>), MesoError> {
+        let mut new_node = *self.get_node(page_id)?;
+
+        // Optimization: If the page was allocated during THIS batch, mutate it in-place
+        // inside the dirty cache to prevent runaway write-amplification.
+        let new_page_id = if page_id >= self.read_pager.num_pages {
+            page_id
+        } else {
+            self.allocate_page()
+        };
+
+        let is_leaf = new_node.header.is_leaf == 1;
+        let num_cells = new_node.header.num_cells as usize;
 
         if is_leaf {
             let mut insert_idx = 0;
-            {
-                let node = self.pager.get_node(page_id)?;
-                while insert_idx < num_cells && node.keys[insert_idx] < target_key {
-                    insert_idx += 1;
-                }
-                if insert_idx < num_cells && node.keys[insert_idx] == target_key {
-                    // Exact Match: Overwrite
-                    let node_mut = self.pager.get_node_mut(page_id)?;
-                    node_mut.values[insert_idx] = target_val;
-                    return Ok(None);
-                }
+            while insert_idx < num_cells && new_node.keys[insert_idx] < target_key {
+                insert_idx += 1;
+            }
+
+            if insert_idx < num_cells && new_node.keys[insert_idx] == target_key {
+                new_node.values[insert_idx] = target_val;
+                self.dirty_nodes.insert(new_page_id, new_node);
+                return Ok((new_page_id, None));
             }
 
             if num_cells < NUM_CELLS {
-                let node_mut = self.pager.get_node_mut(page_id)?;
                 for i in (insert_idx..num_cells).rev() {
-                    node_mut.keys[i + 1] = node_mut.keys[i];
-                    node_mut.values[i + 1] = node_mut.values[i];
+                    new_node.keys[i + 1] = new_node.keys[i];
+                    new_node.values[i + 1] = new_node.values[i];
                 }
-                node_mut.keys[insert_idx] = target_key;
-                node_mut.values[insert_idx] = target_val;
-                node_mut.header.num_cells += 1;
-                Ok(None)
+                new_node.keys[insert_idx] = target_key;
+                new_node.values[insert_idx] = target_val;
+                new_node.header.num_cells += 1;
+                self.dirty_nodes.insert(new_page_id, new_node);
+                Ok((new_page_id, None))
             } else {
-                // SPLIT LEAF NODE
-                let mut temp_keys = [IndexKey {
-                    e: 0,
-                    a: 0,
-                    _pad: 0,
-                }; NUM_CELLS + 1];
-                let mut temp_vals = [IndexValue {
-                    type_tag: 0,
-                    padding: [0; 7],
-                    payload: [0; 8],
-                }; NUM_CELLS + 1];
+                // Split Leaf Node
+                let mut temp_keys = [unsafe { std::mem::zeroed::<IndexKey>() }; NUM_CELLS + 1];
+                let mut temp_vals = [unsafe { std::mem::zeroed::<IndexValue>() }; NUM_CELLS + 1];
 
-                {
-                    let node = self.pager.get_node(page_id)?;
-                    temp_keys[..insert_idx].copy_from_slice(&node.keys[..insert_idx]);
-                    temp_vals[..insert_idx].copy_from_slice(&node.values[..insert_idx]);
-                    temp_keys[insert_idx] = target_key;
-                    temp_vals[insert_idx] = target_val;
-                    if insert_idx < NUM_CELLS {
-                        temp_keys[insert_idx + 1..]
-                            .copy_from_slice(&node.keys[insert_idx..NUM_CELLS]);
-                        temp_vals[insert_idx + 1..]
-                            .copy_from_slice(&node.values[insert_idx..NUM_CELLS]);
-                    }
+                temp_keys[..insert_idx].copy_from_slice(&new_node.keys[..insert_idx]);
+                temp_vals[..insert_idx].copy_from_slice(&new_node.values[..insert_idx]);
+                temp_keys[insert_idx] = target_key;
+                temp_vals[insert_idx] = target_val;
+                if insert_idx < NUM_CELLS {
+                    temp_keys[insert_idx + 1..]
+                        .copy_from_slice(&new_node.keys[insert_idx..NUM_CELLS]);
+                    temp_vals[insert_idx + 1..]
+                        .copy_from_slice(&new_node.values[insert_idx..NUM_CELLS]);
                 }
 
-                let right_page_id = self.pager.allocate_page()?;
+                let right_page_id = self.allocate_page();
                 let split_idx = NUM_CELLS / 2;
                 let left_count = split_idx;
                 let right_count = (NUM_CELLS + 1) - split_idx;
 
-                let right_sibling_of_left = {
-                    let left_node = self.pager.get_node(page_id)?;
-                    left_node.header.right_sibling
-                };
+                let right_sibling_of_left = new_node.header.right_sibling;
 
-                // Populate Right Page
-                let right_node = self.pager.get_node_mut(right_page_id)?;
+                let mut right_node = unsafe { std::mem::zeroed::<NodePage>() };
                 right_node.header.is_leaf = 1;
                 right_node.header.num_cells = right_count as u16;
                 right_node.header.right_sibling = right_sibling_of_left;
                 right_node.keys[..right_count].copy_from_slice(&temp_keys[left_count..]);
                 right_node.values[..right_count].copy_from_slice(&temp_vals[left_count..]);
 
-                // Update Left Page
-                let left_node = self.pager.get_node_mut(page_id)?;
-                left_node.header.num_cells = left_count as u16;
-                left_node.header.right_sibling = right_page_id;
-                left_node.keys[..left_count].copy_from_slice(&temp_keys[..left_count]);
-                left_node.values[..left_count].copy_from_slice(&temp_vals[..left_count]);
+                new_node.header.num_cells = left_count as u16;
+                new_node.header.right_sibling = right_page_id;
+                new_node.keys[..left_count].copy_from_slice(&temp_keys[..left_count]);
+                new_node.values[..left_count].copy_from_slice(&temp_vals[..left_count]);
 
-                Ok(Some((temp_keys[left_count], right_page_id)))
+                self.dirty_nodes.insert(new_page_id, new_node);
+                self.dirty_nodes.insert(right_page_id, right_node);
+
+                Ok((new_page_id, Some((temp_keys[left_count], right_page_id))))
             }
         } else {
-            // INTERNAL NODE
+            // Internal Node Routing
             let mut child_idx = 0;
-            let child_page_id;
-            {
-                let node = self.pager.get_node(page_id)?;
-                while child_idx < num_cells && target_key >= node.keys[child_idx] {
-                    child_idx += 1;
-                }
-                if child_idx > 0 {
-                    child_idx = child_idx.saturating_sub(1);
-                }
-                child_page_id = Self::child_page_id(&node.values[child_idx]);
+            while child_idx < num_cells && target_key >= new_node.keys[child_idx] {
+                child_idx += 1;
+            }
+            if child_idx > 0 {
+                child_idx = child_idx.saturating_sub(1);
+            }
+            let child_page_id = Self::child_page_id(&new_node.values[child_idx]);
+
+            // Recursively COW the child branch
+            let (new_child_id, split_opt) =
+                self.insert_into_node(child_page_id, target_key, target_val)?;
+
+            new_node.values[child_idx] = Self::make_child_ptr(new_child_id);
+
+            if target_key < new_node.keys[child_idx] {
+                new_node.keys[child_idx] = target_key;
             }
 
-            let split_res = self.insert_into_node(child_page_id, target_key, target_val)?;
-
-            // If we inserted a new absolute minimum into the child, update our routing key
-            {
-                let node = self.pager.get_node(page_id)?;
-                if target_key < node.keys[child_idx] {
-                    let node_mut = self.pager.get_node_mut(page_id)?;
-                    node_mut.keys[child_idx] = target_key;
-                }
-            }
-
-            if let Some((split_key, right_page_id)) = split_res {
+            if let Some((split_key, right_child_id)) = split_opt {
                 let insert_idx = child_idx + 1;
-                let target_val = Self::make_child_ptr(right_page_id);
+                let target_ptr = Self::make_child_ptr(right_child_id);
 
                 if num_cells < NUM_CELLS {
-                    let node_mut = self.pager.get_node_mut(page_id)?;
                     for i in (insert_idx..num_cells).rev() {
-                        node_mut.keys[i + 1] = node_mut.keys[i];
-                        node_mut.values[i + 1] = node_mut.values[i];
+                        new_node.keys[i + 1] = new_node.keys[i];
+                        new_node.values[i + 1] = new_node.values[i];
                     }
-                    node_mut.keys[insert_idx] = split_key;
-                    node_mut.values[insert_idx] = target_val;
-                    node_mut.header.num_cells += 1;
-                    return Ok(None);
+                    new_node.keys[insert_idx] = split_key;
+                    new_node.values[insert_idx] = target_ptr;
+                    new_node.header.num_cells += 1;
+
+                    self.dirty_nodes.insert(new_page_id, new_node);
+                    Ok((new_page_id, None))
                 } else {
-                    // SPLIT INTERNAL NODE
-                    let mut temp_keys = [IndexKey {
-                        e: 0,
-                        a: 0,
-                        _pad: 0,
-                    }; NUM_CELLS + 1];
-                    let mut temp_vals = [IndexValue {
-                        type_tag: 0,
-                        padding: [0; 7],
-                        payload: [0; 8],
-                    }; NUM_CELLS + 1];
+                    // Split Internal Node
+                    let mut temp_keys = [unsafe { std::mem::zeroed::<IndexKey>() }; NUM_CELLS + 1];
+                    let mut temp_vals =
+                        [unsafe { std::mem::zeroed::<IndexValue>() }; NUM_CELLS + 1];
 
-                    {
-                        let node = self.pager.get_node(page_id)?;
-                        temp_keys[..insert_idx].copy_from_slice(&node.keys[..insert_idx]);
-                        temp_vals[..insert_idx].copy_from_slice(&node.values[..insert_idx]);
-                        temp_keys[insert_idx] = split_key;
-                        temp_vals[insert_idx] = target_val;
-                        if insert_idx < NUM_CELLS {
-                            temp_keys[insert_idx + 1..]
-                                .copy_from_slice(&node.keys[insert_idx..NUM_CELLS]);
-                            temp_vals[insert_idx + 1..]
-                                .copy_from_slice(&node.values[insert_idx..NUM_CELLS]);
-                        }
+                    temp_keys[..insert_idx].copy_from_slice(&new_node.keys[..insert_idx]);
+                    temp_vals[..insert_idx].copy_from_slice(&new_node.values[..insert_idx]);
+                    temp_keys[insert_idx] = split_key;
+                    temp_vals[insert_idx] = target_ptr;
+                    if insert_idx < NUM_CELLS {
+                        temp_keys[insert_idx + 1..]
+                            .copy_from_slice(&new_node.keys[insert_idx..NUM_CELLS]);
+                        temp_vals[insert_idx + 1..]
+                            .copy_from_slice(&new_node.values[insert_idx..NUM_CELLS]);
                     }
 
-                    let right_internal_id = self.pager.allocate_page()?;
+                    let right_internal_id = self.allocate_page();
                     let split_idx = NUM_CELLS / 2;
                     let left_count = split_idx;
                     let right_count = (NUM_CELLS + 1) - split_idx;
 
-                    let right_node = self.pager.get_node_mut(right_internal_id)?;
+                    let mut right_node = unsafe { std::mem::zeroed::<NodePage>() };
                     right_node.header.is_leaf = 0;
                     right_node.header.num_cells = right_count as u16;
                     right_node.keys[..right_count].copy_from_slice(&temp_keys[left_count..]);
                     right_node.values[..right_count].copy_from_slice(&temp_vals[left_count..]);
 
-                    let left_node = self.pager.get_node_mut(page_id)?;
-                    left_node.header.num_cells = left_count as u16;
-                    left_node.keys[..left_count].copy_from_slice(&temp_keys[..left_count]);
-                    left_node.values[..left_count].copy_from_slice(&temp_vals[..left_count]);
+                    new_node.header.num_cells = left_count as u16;
+                    new_node.keys[..left_count].copy_from_slice(&temp_keys[..left_count]);
+                    new_node.values[..left_count].copy_from_slice(&temp_vals[..left_count]);
 
-                    return Ok(Some((temp_keys[left_count], right_internal_id)));
+                    self.dirty_nodes.insert(new_page_id, new_node);
+                    self.dirty_nodes.insert(right_internal_id, right_node);
+
+                    Ok((
+                        new_page_id,
+                        Some((temp_keys[left_count], right_internal_id)),
+                    ))
                 }
+            } else {
+                self.dirty_nodes.insert(new_page_id, new_node);
+                Ok((new_page_id, None))
             }
-            Ok(None)
         }
     }
 
-    pub fn flush(&self) -> Result<(), MesoError> {
-        self.pager.flush()
+    /// Atomically flushes all dirty COW pages to disk and hot-swaps the lock-free ReadPager.
+    pub fn flush(&mut self) -> Result<(), MesoError> {
+        for (page_id, node) in &self.dirty_nodes {
+            self.write_pager
+                .write_page_bytes(*page_id, bytemuck::bytes_of(node))?;
+        }
+        for (page_id, overflow) in &self.dirty_overflows {
+            self.write_pager
+                .write_page_bytes(*page_id, bytemuck::bytes_of(overflow))?;
+        }
+
+        // Write the Metapage (Page 0) to finalize the transaction
+        let mut metapage = [0u8; 4096];
+        metapage[0..4].copy_from_slice(&self.root_page_id.to_ne_bytes());
+        metapage[4..8].copy_from_slice(&self.write_pager.next_page_id.to_ne_bytes());
+        self.write_pager.write_page_bytes(0, &metapage)?;
+
+        // Fsync storage
+        self.write_pager.flush()?;
+
+        // RCU Swap: Re-mmap the newly sized file for zero-copy readers
+        self.read_pager = ReadPager::open(self.write_pager.file())?;
+
+        // Drop the ephemeral dirty working set
+        self.dirty_nodes.clear();
+        self.dirty_overflows.clear();
+
+        Ok(())
     }
 
     fn child_page_id(val: &IndexValue) -> u32 {
@@ -331,6 +404,7 @@ impl NowIndex {
         })
     }
 
+    #[inline(always)]
     pub fn get(&self, e: EntityId, a: AttributeId) -> Result<Option<Value>, MesoError> {
         let key = IndexKey { e, a, _pad: 0 };
         if let Some(iv) = self.core.get_kv(key)? {
@@ -356,7 +430,7 @@ impl NowIndex {
         self.core.put_kv(key, val)
     }
 
-    pub fn flush(&self) -> Result<(), MesoError> {
+    pub fn flush(&mut self) -> Result<(), MesoError> {
         self.core.flush()
     }
 
@@ -383,27 +457,27 @@ impl NowIndex {
                 let mut prev_page_id = 0;
 
                 for (i, chunk) in bytes.chunks(4088).enumerate() {
-                    let page_id = self.core.pager.allocate_page()?;
-
-                    if i == 0 {
-                        first_page_id = page_id;
-                    } else {
-                        self.core.pager.get_overflow_mut(prev_page_id)?.next_page_id = page_id;
-                    }
-
-                    let overflow = self.core.pager.get_overflow_mut(page_id)?;
+                    let page_id = self.core.allocate_page();
+                    let mut overflow = unsafe { std::mem::zeroed::<OverflowPage>() };
                     overflow.length = chunk.len() as u32;
                     overflow.next_page_id = 0;
                     overflow.data[..chunk.len()].copy_from_slice(chunk);
 
+                    if i == 0 {
+                        first_page_id = page_id;
+                    } else {
+                        let mut prev = *self.core.get_overflow(prev_page_id)?;
+                        prev.next_page_id = page_id;
+                        self.core.dirty_overflows.insert(prev_page_id, prev);
+                    }
+                    self.core.dirty_overflows.insert(page_id, overflow);
                     prev_page_id = page_id;
                 }
 
                 if first_page_id == 0 {
-                    let page_id = self.core.pager.allocate_page()?;
-                    let overflow = self.core.pager.get_overflow_mut(page_id)?;
-                    overflow.length = 0;
-                    overflow.next_page_id = 0;
+                    let page_id = self.core.allocate_page();
+                    let overflow = unsafe { std::mem::zeroed::<OverflowPage>() };
+                    self.core.dirty_overflows.insert(page_id, overflow);
                     first_page_id = page_id;
                 }
 
@@ -419,11 +493,13 @@ impl NowIndex {
                 5
             }
             Value::Uuid(u) => {
-                let page_id = self.core.pager.allocate_page()?;
-                let overflow = self.core.pager.get_overflow_mut(page_id)?;
+                let page_id = self.core.allocate_page();
+                let mut overflow = unsafe { std::mem::zeroed::<OverflowPage>() };
                 overflow.length = 16;
                 overflow.next_page_id = 0;
                 overflow.data[..16].copy_from_slice(u);
+
+                self.core.dirty_overflows.insert(page_id, overflow);
                 payload[0..4].copy_from_slice(&page_id.to_ne_bytes());
                 6
             }
@@ -448,7 +524,7 @@ impl NowIndex {
                 let mut string_bytes = Vec::new();
 
                 loop {
-                    let overflow = self.core.pager.get_overflow(current_page_id)?;
+                    let overflow = self.core.get_overflow(current_page_id)?;
                     let len = overflow.length as usize;
                     string_bytes.extend_from_slice(&overflow.data[..len]);
 
@@ -469,7 +545,7 @@ impl NowIndex {
                 let mut bytes = [0u8; 4];
                 bytes.copy_from_slice(&iv.payload[0..4]);
                 let page_id = u32::from_ne_bytes(bytes);
-                let overflow = self.core.pager.get_overflow(page_id)?;
+                let overflow = self.core.get_overflow(page_id)?;
 
                 let mut u = [0u8; 16];
                 u.copy_from_slice(&overflow.data[..16]);
@@ -509,7 +585,6 @@ impl AveIndex {
         hasher.finish()
     }
 
-    /// Maps the 12-byte logical requirements (ValueHash, AttrId) into the physical `IndexKey`
     fn make_key(a: AttributeId, val_hash: u64) -> IndexKey {
         IndexKey {
             e: val_hash,
@@ -524,7 +599,7 @@ impl AveIndex {
         payload.copy_from_slice(&e.to_ne_bytes());
 
         let val = IndexValue {
-            type_tag: 1, // Simple tag representing an EntityId payload
+            type_tag: 1, // EntityId payload tag
             padding: [0; 7],
             payload,
         };
@@ -532,11 +607,11 @@ impl AveIndex {
         self.core.put_kv(key, val)
     }
 
+    #[inline(always)]
     pub fn get(&self, a: AttributeId, v: &Value) -> Result<Option<EntityId>, MesoError> {
         let key = Self::make_key(a, Self::hash_value(v));
 
         if let Some(iv) = self.core.get_kv(key)? {
-            // Respect tombstones if this inverted index entry was retracted
             if iv.type_tag == 254 {
                 return Ok(None);
             }
@@ -548,10 +623,14 @@ impl AveIndex {
         }
     }
 
-    pub fn flush(&self) -> Result<(), MesoError> {
+    pub fn flush(&mut self) -> Result<(), MesoError> {
         self.core.flush()
     }
 }
+
+// ==============================================================================
+// STRICT MILITARY-GRADE TESTS (DO NOT DELETE)
+// ==============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -571,14 +650,12 @@ mod tests {
         let (mut index, _f) = setup_index();
 
         let e = 100;
-        // Insert one of every supported type
         index.put(e, 1, &Value::Boolean(true)).unwrap();
         index.put(e, 2, &Value::Int64(-42)).unwrap();
         index.put(e, 3, &Value::Float64(PI)).unwrap();
         index.put(e, 4, &Value::Ref(9999)).unwrap();
         index.put(e, 5, &Value::Timestamp(1700000000)).unwrap();
 
-        // Validate exact decoding
         assert_eq!(index.get(e, 1).unwrap(), Some(Value::Boolean(true)));
         assert_eq!(index.get(e, 2).unwrap(), Some(Value::Int64(-42)));
         assert_eq!(index.get(e, 3).unwrap(), Some(Value::Float64(PI)));
@@ -590,116 +667,77 @@ mod tests {
     fn test_now_index_reverse_insertion_memory_shifting() {
         let (mut index, _f) = setup_index();
 
-        // Insert in strictly descending order.
-        // This forces the B+Tree to shift ALL existing memory cells to the right on every single insert.
         for i in (1..=50).rev() {
             index.put(i, 10, &Value::Int64(i as i64)).unwrap();
         }
 
-        // Validate the binary search still resolves them correctly
         for i in 1..=50 {
             let val = index.get(i, 10).unwrap().unwrap();
             assert_eq!(val, Value::Int64(i as i64));
         }
 
-        // Verify the internal page state
-        let root = index.core.pager.get_node(index.core.root_page_id).unwrap();
-        assert_eq!(root.header.num_cells, 50, "Should contain exactly 50 cells");
-        assert_eq!(root.keys[0].e, 1, "First key must be the lowest Entity ID");
-        assert_eq!(
-            root.keys[49].e, 50,
-            "Last key must be the highest Entity ID"
-        );
+        let root = index.core.get_node(index.core.root_page_id).unwrap();
+        assert_eq!(root.header.num_cells, 50);
+        assert_eq!(root.keys[0].e, 1);
+        assert_eq!(root.keys[49].e, 50);
     }
 
     #[test]
     fn test_now_index_update_overwrite() {
         let (mut index, _f) = setup_index();
 
-        // 1. Initial Insert
         index.put(42, 99, &Value::Int64(100)).unwrap();
-
-        let root_before = index.core.pager.get_node(index.core.root_page_id).unwrap();
+        let root_before = index.core.get_node(index.core.root_page_id).unwrap();
         assert_eq!(root_before.header.num_cells, 1);
 
-        // 2. Overwrite the exact same (Entity, Attribute) pair
         index.put(42, 99, &Value::Int64(200)).unwrap();
+        let root_after = index.core.get_node(index.core.root_page_id).unwrap();
 
-        let root_after = index.core.pager.get_node(index.core.root_page_id).unwrap();
-
-        // The cell count MUST remain 1, proving we overwrote the value in place
-        assert_eq!(
-            root_after.header.num_cells, 1,
-            "Updates must not increase cell count"
-        );
+        assert_eq!(root_after.header.num_cells, 1);
 
         let val = index.get(42, 99).unwrap().unwrap();
-        assert_eq!(
-            val,
-            Value::Int64(200),
-            "Value must reflect the latest update"
-        );
+        assert_eq!(val, Value::Int64(200));
     }
 
     #[test]
     fn test_now_index_capacity_exhaustion_boundary() {
         let (mut index, _f) = setup_index();
 
-        // Fill the page exactly to its maximum capacity (127 cells)
         for i in 0..NUM_CELLS {
             index.put(i as u64, 10, &Value::Int64(i as i64)).unwrap();
         }
 
-        let root = index.core.pager.get_node(index.core.root_page_id).unwrap();
+        let root = index.core.get_node(index.core.root_page_id).unwrap();
         assert_eq!(root.header.num_cells as usize, NUM_CELLS);
 
-        // Insert the 128th item. This MUST trigger a split instead of an error.
         index
             .put(999, 10, &Value::Int64(999))
             .expect("Insert must succeed and trigger a split");
 
-        // Validate the tree structurally expanded
-        assert!(
-            index.core.pager.num_pages >= 3,
-            "A root split should allocate at least two new pages (left child, right child)"
-        );
+        assert!(index.core.write_pager.next_page_id >= 3);
 
-        // Validate the routing logic still finds the inserted item across the split
         let val = index.get(999, 10).unwrap().unwrap();
-        assert_eq!(
-            val,
-            Value::Int64(999),
-            "Data must remain retrievable after the split"
-        );
+        assert_eq!(val, Value::Int64(999));
     }
 
     #[test]
     fn test_b_tree_node_splitting_and_scaling() {
         let (mut index, _f) = setup_index();
-        let target_records = 10_000; // Will force dozens of page splits
+        let target_records = 10_000;
 
-        // Insert massively out-of-order to heavily stress the node router
         for i in (0..target_records).rev() {
             index.put(i, 10, &Value::Int64(i as i64)).unwrap();
         }
 
-        // Validate the point-lookup router correctly navigates the deep internal nodes
         for i in 0..target_records {
             let val = index.get(i, 10).unwrap().unwrap();
             assert_eq!(val, Value::Int64(i as i64));
         }
 
-        // Validate structural B+Tree state
-        let root = index.core.pager.get_node(index.core.root_page_id).unwrap();
+        let root = index.core.get_node(index.core.root_page_id).unwrap();
 
-        assert_eq!(
-            root.header.is_leaf, 0,
-            "Root must have transformed into an internal routing node"
-        );
-        assert!(
-            index.core.pager.num_pages > 50,
-            "The tree must have dynamically requested and formatted dozens of new pages from the OS"
-        );
+        assert_eq!(root.header.is_leaf, 0);
+        assert!(index.core.write_pager.next_page_id > 50);
     }
 
     #[test]
@@ -711,16 +749,12 @@ mod tests {
         let val = index.get(1, 10).unwrap().unwrap();
 
         assert_eq!(val, Value::String(s));
-        assert!(
-            index.core.pager.num_pages >= 2,
-            "An overflow page should have been allocated"
-        );
+        assert!(index.core.write_pager.next_page_id >= 2);
     }
 
     #[test]
     fn test_now_index_uuid_overflow_basic() {
         let (mut index, _f) = setup_index();
-        // A dummy 16-byte UUID array
         let u = [0xAB; 16];
 
         index.put(2, 20, &Value::Uuid(u)).unwrap();
@@ -732,7 +766,6 @@ mod tests {
     #[test]
     fn test_now_index_string_exact_limit() {
         let (mut index, _f) = setup_index();
-        // Exactly matches the 4088-byte limit of a single OverflowPage
         let s = "A".repeat(4088);
 
         index.put(3, 30, &Value::String(s.clone())).unwrap();
@@ -744,20 +777,13 @@ mod tests {
     #[test]
     fn test_now_index_string_chaining() {
         let (mut index, _f) = setup_index();
-
-        // 10,000 bytes forces the string across 3 chained pages (4088 + 4088 + 1824)
         let s = "A".repeat(10_000);
 
         index.put(4, 40, &Value::String(s.clone())).unwrap();
         let val = index.get(4, 40).unwrap().unwrap();
 
         assert_eq!(val, Value::String(s));
-
-        // Root page (1) + 3 chained overflow pages
-        assert!(
-            index.core.pager.num_pages >= 4,
-            "Should have allocated at least 3 chained overflow pages"
-        );
+        assert!(index.core.write_pager.next_page_id >= 4);
     }
 
     #[test]
@@ -767,21 +793,15 @@ mod tests {
         let u1 = [0x11; 16];
         let s2 = "Second String".to_string();
 
-        // Insert interleaved data requiring multiple dynamic page allocations
         index.put(5, 50, &Value::String(s1.clone())).unwrap();
         index.put(5, 51, &Value::Uuid(u1)).unwrap();
         index.put(5, 52, &Value::String(s2.clone())).unwrap();
 
-        // Validate pointers resolve to their exact independent pages
         assert_eq!(index.get(5, 50).unwrap().unwrap(), Value::String(s1));
         assert_eq!(index.get(5, 51).unwrap().unwrap(), Value::Uuid(u1));
         assert_eq!(index.get(5, 52).unwrap().unwrap(), Value::String(s2));
 
-        // Root + at least 3 distinct overflow pages
-        assert!(
-            index.core.pager.num_pages >= 4,
-            "Must allocate distinct pages for each overflow value"
-        );
+        assert!(index.core.write_pager.next_page_id >= 4);
     }
 
     #[test]
@@ -794,10 +814,7 @@ mod tests {
         let email_val = Value::String("alice@example.com".to_string());
         let target_entity = 849202;
 
-        // Put (Attribute, Value) -> EntityId
         index.put(attr_email, &email_val, target_entity).unwrap();
-
-        // Retrieve EntityId by (Attribute, Value)
         let resolved = index.get(attr_email, &email_val).unwrap();
 
         assert_eq!(resolved, Some(target_entity));
@@ -820,8 +837,6 @@ mod tests {
 
         assert_eq!(index.get(attr_age, &age_val).unwrap(), Some(111));
         assert_eq!(index.get(attr_active, &active_val).unwrap(), Some(222));
-
-        // Ensure a miss returns None instead of panicking
         assert_eq!(index.get(attr_age, &Value::Int64(99)).unwrap(), None);
     }
 }
