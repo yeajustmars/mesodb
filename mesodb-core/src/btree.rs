@@ -628,6 +628,159 @@ impl AveIndex {
     }
 }
 
+#[derive(Clone)]
+pub struct BTreeSnapshot {
+    pub pager: ReadPager,
+    pub root_page_id: u32,
+}
+
+impl BTreeSnapshot {
+    pub fn get_kv(&self, target_key: IndexKey) -> Result<Option<IndexValue>, MesoError> {
+        let mut current_page_id = self.root_page_id;
+        loop {
+            let node = self.pager.get_node(current_page_id)?;
+            let num_cells = node.header.num_cells as usize;
+            if num_cells == 0 {
+                return Ok(None);
+            }
+
+            if node.header.is_leaf == 1 {
+                let mut left = 0;
+                let mut right = num_cells;
+                while left < right {
+                    let mid = left + (right - left) / 2;
+                    if node.keys[mid] < target_key {
+                        left = mid + 1;
+                    } else {
+                        right = mid;
+                    }
+                }
+                if left < num_cells && node.keys[left] == target_key {
+                    let iv = node.values[left];
+                    if iv.type_tag == 254 {
+                        return Ok(None);
+                    }
+                    return Ok(Some(iv));
+                }
+                return Ok(None);
+            } else {
+                let mut child_idx = 0;
+                while child_idx < num_cells && target_key >= node.keys[child_idx] {
+                    child_idx += 1;
+                }
+                if child_idx > 0 {
+                    child_idx = child_idx.saturating_sub(1);
+                }
+                let mut bytes = [0u8; 4];
+                bytes.copy_from_slice(&node.values[child_idx].payload[0..4]);
+                current_page_id = u32::from_ne_bytes(bytes);
+            }
+        }
+    }
+}
+
+impl CoreBTree {
+    pub fn snapshot(&self) -> BTreeSnapshot {
+        BTreeSnapshot {
+            pager: self.read_pager.clone(),
+            root_page_id: self.root_page_id,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct NowIndexSnapshot {
+    pub core: BTreeSnapshot,
+}
+
+impl NowIndex {
+    pub fn snapshot(&self) -> NowIndexSnapshot {
+        NowIndexSnapshot {
+            core: self.core.snapshot(),
+        }
+    }
+}
+
+impl NowIndexSnapshot {
+    pub fn get(&self, e: EntityId, a: AttributeId) -> Result<Option<Value>, MesoError> {
+        let key = IndexKey { e, a, _pad: 0 };
+        if let Some(iv) = self.core.get_kv(key)? {
+            Ok(Some(self.decode_value(&iv)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn decode_value(&self, iv: &IndexValue) -> Result<Value, MesoError> {
+        match iv.type_tag {
+            0 => Ok(Value::Boolean(iv.payload[0] != 0)),
+            1 => Ok(Value::Int64(i64::from_ne_bytes(iv.payload))),
+            2 => Ok(Value::Float64(f64::from_ne_bytes(iv.payload))),
+            3 => {
+                let mut bytes = [0u8; 4];
+                bytes.copy_from_slice(&iv.payload[0..4]);
+                let mut current_page_id = u32::from_ne_bytes(bytes);
+                let mut string_bytes = Vec::new();
+                loop {
+                    let overflow = self.core.pager.get_overflow(current_page_id)?;
+                    string_bytes.extend_from_slice(&overflow.data[..overflow.length as usize]);
+                    if overflow.next_page_id == 0 {
+                        break;
+                    }
+                    current_page_id = overflow.next_page_id;
+                }
+                Ok(Value::String(
+                    String::from_utf8(string_bytes).unwrap_or_default(),
+                ))
+            }
+            4 => Ok(Value::Ref(u64::from_ne_bytes(iv.payload))),
+            5 => Ok(Value::Timestamp(i64::from_ne_bytes(iv.payload))),
+            6 => {
+                let mut bytes = [0u8; 4];
+                bytes.copy_from_slice(&iv.payload[0..4]);
+                let overflow = self.core.pager.get_overflow(u32::from_ne_bytes(bytes))?;
+                let mut u = [0u8; 16];
+                u.copy_from_slice(&overflow.data[..16]);
+                Ok(Value::Uuid(u))
+            }
+            _ => Ok(Value::Boolean(false)),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct AveIndexSnapshot {
+    pub core: BTreeSnapshot,
+}
+
+impl AveIndex {
+    pub fn snapshot(&self) -> AveIndexSnapshot {
+        AveIndexSnapshot {
+            core: self.core.snapshot(),
+        }
+    }
+}
+
+impl AveIndexSnapshot {
+    pub fn get(&self, a: AttributeId, v: &Value) -> Result<Option<EntityId>, MesoError> {
+        let key = IndexKey {
+            e: AveIndex::hash_value(v),
+            a,
+            _pad: 0,
+        };
+        if let Some(iv) = self.core.get_kv(key)? {
+            if iv.type_tag == 254 {
+                return Ok(None);
+            }
+            let mut e_bytes = [0u8; 8];
+            e_bytes.copy_from_slice(&iv.payload);
+            Ok(Some(EntityId::from_ne_bytes(e_bytes)))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 // ==============================================================================
 // STRICT MILITARY-GRADE TESTS (DO NOT DELETE)
 // ==============================================================================

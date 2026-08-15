@@ -38,14 +38,15 @@ impl MesoDB {
         create_dir_all(&data_dir)?;
         create_dir_all(data_dir.join("parquet"))?;
 
-        // Initialize Tier 1 B+Trees
-        let now_idx_path = data_dir.join("now.idx");
-        let now_index = Arc::new(RwLock::new(crate::btree::NowIndex::open(now_idx_path)?));
+        // Initialize Tier 1 B+Trees (Owned by the background worker)
+        let mut now_index = crate::btree::NowIndex::open(data_dir.join("now.idx"))?;
+        let mut ave_index = crate::btree::AveIndex::open(data_dir.join("ave.idx"))?;
 
-        let ave_idx_path = data_dir.join("ave.idx");
-        let ave_index = Arc::new(RwLock::new(crate::btree::AveIndex::open(ave_idx_path)?));
+        // Take initial snapshots for WorldView
+        let now_snap = Arc::new(now_index.snapshot());
+        let ave_snap = Arc::new(ave_index.snapshot());
 
-        // Pass the B+Tree into the transactor
+        // Pass the B+Tree into the transactor (Though transactor no longer writes to it directly)
         let (transactor, recovered_batch) = Transactor::new(path, schema.clone(), config.clone())?;
 
         let mut initial_ram = Vec::new();
@@ -74,14 +75,22 @@ impl MesoDB {
             data_dir: data_dir.clone(),
             schema: Arc::new(schema),
             timeline: Arc::new(transactor.timeline.clone()),
-            now_index,
-            ave_index,
+            now_index: now_snap,
+            ave_index: ave_snap,
             dirty_entities: Arc::new(initial_dirty),
         })));
 
         let (flush_tx, flush_rx) = mpsc::channel(config.compactor.backpressure_threshold);
 
-        Self::spawn_background_worker(data_dir, flush_rx, world_view.clone(), config.clone());
+        // Pass mutable B-Trees to the background worker
+        Self::spawn_background_worker(
+            data_dir,
+            flush_rx,
+            world_view.clone(),
+            config.clone(),
+            now_index,
+            ave_index,
+        );
 
         Ok(Self {
             transactor: Mutex::new(transactor),
@@ -97,6 +106,8 @@ impl MesoDB {
         mut flush_rx: mpsc::Receiver<(u64, RecordBatch)>,
         world_view: Arc<RwLock<Arc<WorldView>>>,
         config: Config,
+        mut now_index: crate::btree::NowIndex,
+        mut ave_index: crate::btree::AveIndex,
     ) {
         tokio::spawn(async move {
             let compactor = BackgroundCompactor::new(data_dir);
@@ -106,19 +117,14 @@ impl MesoDB {
             const EVICT_THRESHOLD: usize = 20;
 
             while let Some((tx_id, batch)) = flush_rx.recv().await {
-                // 1. ASYNC TIER 1 INDEX UPDATE: Populate B+Trees safely off critical thread
+                // 1. UPDATE B-TREES (Writer owns them exclusively now! No RwLock needed)
+                if let Err(e) =
+                    Self::update_indexes_from_batch(&mut now_index, &mut ave_index, &batch)
                 {
-                    let view = world_view.read().clone();
-                    let mut now_idx = view.now_index.write();
-                    let mut ave_idx = view.ave_index.write();
-                    if let Err(e) =
-                        Self::update_indexes_from_batch(&mut now_idx, &mut ave_idx, &batch)
-                    {
-                        eprintln!(
-                            "Warning: Failed to update background indexes for Tx {}: {:?}",
-                            tx_id, e
-                        );
-                    }
+                    eprintln!(
+                        "Warning: Failed to update background indexes for Tx {}: {:?}",
+                        tx_id, e
+                    );
                 }
 
                 // 2. Write the batch to a Volatile Parquet file
@@ -139,6 +145,12 @@ impl MesoDB {
 
                 // 3. Safely remove from RAM and recalculate dirty_entities
                 if trigger_eviction || trigger_compaction {
+                    // Flush B-Trees to disk and take fresh lock-free snapshots
+                    let _ = now_index.flush();
+                    let _ = ave_index.flush();
+                    let new_now_snap = Arc::new(now_index.snapshot());
+                    let new_ave_snap = Arc::new(ave_index.snapshot());
+
                     {
                         let mut writer = world_view.write();
                         let world_view_mut = Arc::make_mut(&mut *writer);
@@ -146,7 +158,6 @@ impl MesoDB {
 
                         ram_vec_mut.retain(|(id, _)| !evict_queue.contains(id));
 
-                        // Rebuild dirty set from remaining RAM batches in O(RAM_rows)
                         let mut remaining_dirty = ahash::AHashSet::new();
                         for (_, b) in ram_vec_mut.iter() {
                             if let Some(e_col) = b
@@ -160,6 +171,10 @@ impl MesoDB {
                             }
                         }
                         world_view_mut.dirty_entities = Arc::new(remaining_dirty);
+
+                        // Swap in the new B-Tree snapshots
+                        world_view_mut.now_index = new_now_snap;
+                        world_view_mut.ave_index = new_ave_snap;
                     }
                     evict_queue.clear();
                 }
@@ -434,7 +449,7 @@ impl MesoDB {
             }
 
             // Direct B+Tree lookup
-            let now_index = view.now_index.read();
+            let now_index = &view.now_index;
             let mut fields = Vec::new();
             let mut arrays: Vec<Arc<dyn arrow::array::Array>> = Vec::new();
 
@@ -498,7 +513,7 @@ impl MesoDB {
                                         return Ok(None);
                                     }
 
-                                    let ave_index = view.ave_index.read();
+                                    let ave_index = &view.ave_index;
                                     if let Some(e_id) = ave_index.get(a_id, &val)? {
                                         let clean_var = find_var.replace("?", "");
                                         let field = arrow::datatypes::Field::new(
@@ -535,7 +550,7 @@ impl MesoDB {
                             return Ok(None);
                         }
 
-                        let now_index = view.now_index.read();
+                        let now_index = &view.now_index;
                         let clean_var = var.replace("?", "");
 
                         // Direct zero-copy JSON/EDN builder for constant entity pull
@@ -951,12 +966,12 @@ impl MesoDB {
 
 #[derive(Clone)]
 pub struct WorldView {
-    pub ram_batches: Arc<Vec<(u64, RecordBatch)>>, // Flat, contiguous array
+    pub ram_batches: Arc<Vec<(u64, RecordBatch)>>,
     pub data_dir: PathBuf,
     pub schema: Arc<SchemaMap>,
     pub timeline: Arc<SchemaTimeline>,
-    pub now_index: Arc<RwLock<crate::btree::NowIndex>>,
-    pub ave_index: Arc<RwLock<crate::btree::AveIndex>>,
+    pub now_index: Arc<crate::btree::NowIndexSnapshot>, // No more RwLock!
+    pub ave_index: Arc<crate::btree::AveIndexSnapshot>, // No more RwLock!
     pub dirty_entities: Arc<ahash::AHashSet<crate::types::EntityId>>,
 }
 
