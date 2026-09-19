@@ -58,6 +58,7 @@ impl BitmapSnapshot {
 /// The append-only Log-Structured Bitmap Writer.
 pub struct BitmapStore {
     file: File,
+    #[allow(dead_code)]
     path: PathBuf,
     current_offset: u64,
     pointers: Arc<AHashMap<(AttributeId, u64), (u64, u32)>>,

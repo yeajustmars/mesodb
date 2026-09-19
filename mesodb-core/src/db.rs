@@ -487,137 +487,125 @@ impl MesoDB {
 
         // --- PATTERN 3: Inverted AVE Lookup ---
         // Match [:find ?e :where [?e :attr "literal_value"]]
-        if ast.find.len() == 1 && ast.where_clauses.len() == 1 {
-            if let crate::ast::FindSpec::Variable(find_var) = &ast.find[0] {
-                if let crate::ast::WhereClause::DataPattern {
-                    e,
-                    a,
-                    v,
-                    tx: None,
-                    op: None,
-                } = &ast.where_clauses[0]
-                {
-                    if let (crate::ast::Term::Variable(e_var), crate::ast::Term::Keyword(a_ident)) =
-                        (e, a)
-                    {
-                        if e_var == find_var {
-                            let literal_val = match v {
-                                crate::ast::Term::String(s) => Some(Value::String(s.clone())),
-                                crate::ast::Term::Integer(i) => Some(Value::Int64(*i)),
-                                crate::ast::Term::Boolean(b) => Some(Value::Boolean(*b)),
-                                crate::ast::Term::Float(f) => Some(Value::Float64(*f)),
-                                _ => None,
-                            };
+        if ast.find.len() == 1
+            && ast.where_clauses.len() == 1
+            && let crate::ast::FindSpec::Variable(find_var) = &ast.find[0]
+            && let crate::ast::WhereClause::DataPattern {
+                e,
+                a,
+                v,
+                tx: None,
+                op: None,
+            } = &ast.where_clauses[0]
+            && let (crate::ast::Term::Variable(e_var), crate::ast::Term::Keyword(a_ident)) = (e, a)
+            && e_var == find_var
+        {
+            let literal_val = match v {
+                crate::ast::Term::String(s) => Some(Value::String(s.clone())),
+                crate::ast::Term::Integer(i) => Some(Value::Int64(*i)),
+                crate::ast::Term::Boolean(b) => Some(Value::Boolean(*b)),
+                crate::ast::Term::Float(f) => Some(Value::Float64(*f)),
+                _ => None,
+            };
 
-                            if let Some(val) = literal_val {
-                                if let Some(a_id) = view.schema.get_id(a_ident) {
-                                    if !view.dirty_entities.is_empty() {
-                                        return Ok(None);
-                                    }
+            if let Some(val) = literal_val
+                && let Some(a_id) = view.schema.get_id(a_ident)
+            {
+                if !view.dirty_entities.is_empty() {
+                    return Ok(None);
+                }
 
-                                    let bitmap_index = &view.bitmap_index;
-                                    if let Some(treemap) = bitmap_index.get(a_id, &val)? {
-                                        let clean_var = find_var.replace("?", "");
-                                        let field = arrow::datatypes::Field::new(
-                                            &clean_var,
-                                            arrow::datatypes::DataType::UInt64,
-                                            true,
-                                        );
+                let bitmap_index = &view.bitmap_index;
+                if let Some(treemap) = bitmap_index.get(a_id, &val)? {
+                    let clean_var = find_var.replace("?", "");
+                    let field = arrow::datatypes::Field::new(
+                        &clean_var,
+                        arrow::datatypes::DataType::UInt64,
+                        true,
+                    );
 
-                                        // Massive Upgrade: Return all matching entities at once via RoaringTreemap IntoIterator!
-                                        let entities: Vec<u64> = treemap.into_iter().collect();
+                    // Massive Upgrade: Return all matching entities at once via RoaringTreemap IntoIterator!
+                    let entities: Vec<u64> = treemap.into_iter().collect();
 
-                                        let array =
-                                            Arc::new(arrow::array::UInt64Array::from(entities));
-                                        let schema =
-                                            Arc::new(arrow::datatypes::Schema::new(vec![field]));
-                                        let batch = RecordBatch::try_new(schema, vec![array])
-                                            .map_err(MesoError::Arrow)?;
-                                        return Ok(Some(vec![batch]));
-                                    } else {
-                                        return Ok(Some(vec![]));
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    let array = Arc::new(arrow::array::UInt64Array::from(entities));
+                    let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
+                    let batch =
+                        RecordBatch::try_new(schema, vec![array]).map_err(MesoError::Arrow)?;
+
+                    return Ok(Some(vec![batch]));
+                } else {
+                    return Ok(Some(vec![]));
                 }
             }
         }
 
         // --- PATTERN 4: Constant Entity Pull ---
         // Match [:find (pull 101 [:user/name :user/age]) :where ...]
-        if ast.find.len() == 1 && ast.where_clauses.len() == 1 {
-            if let crate::ast::FindSpec::Pull(var, pattern) = &ast.find[0] {
-                if let crate::ast::WhereClause::DataPattern { e, .. } = &ast.where_clauses[0] {
-                    if let crate::ast::Term::Integer(e_id) = e {
-                        let entity_id = *e_id as u64;
-                        if view.dirty_entities.contains(&entity_id) {
-                            return Ok(None);
-                        }
+        if ast.find.len() == 1
+            && ast.where_clauses.len() == 1
+            && let crate::ast::FindSpec::Pull(var, pattern) = &ast.find[0]
+            && let crate::ast::WhereClause::DataPattern { e, .. } = &ast.where_clauses[0]
+            && let crate::ast::Term::Integer(e_id) = e
+        {
+            let entity_id = *e_id as u64;
+            if view.dirty_entities.contains(&entity_id) {
+                return Ok(None);
+            }
 
-                        let now_index = &view.now_index;
-                        let clean_var = var.replace("?", "");
+            let now_index = &view.now_index;
+            let clean_var = var.replace("?", "");
 
-                        // Direct zero-copy JSON/EDN builder for constant entity pull
-                        let mut map_pairs = Vec::new();
+            // Direct zero-copy JSON/EDN builder for constant entity pull
+            let mut map_pairs = Vec::new();
 
-                        for pull_attr in &pattern.0 {
-                            if let crate::ast::PullAttribute::Simple(a_ident) = pull_attr {
-                                if let Some(a_id) = view.schema.get_id(a_ident) {
-                                    if let Some(val) = now_index.get(entity_id, a_id)? {
-                                        let formatted_val = match options.format {
-                                            OutputFormat::Json => match val {
-                                                Value::String(s) => format!("\"{}\"", s),
-                                                Value::Int64(i) => i.to_string(),
-                                                Value::Float64(f) => f.to_string(),
-                                                Value::Boolean(b) => b.to_string(),
-                                                Value::Ref(r) => r.to_string(),
-                                                _ => "null".to_string(),
-                                            },
-                                            _ => match val {
-                                                Value::String(s) => format!("\"{}\"", s),
-                                                _ => val.to_string(),
-                                            },
-                                        };
-                                        let key_name = if options.format == OutputFormat::Edn {
-                                            a_ident.clone()
-                                        } else {
-                                            a_ident.trim_start_matches(':').to_string()
-                                        };
-                                        map_pairs.push((key_name, formatted_val));
-                                    }
-                                }
-                            }
-                        }
-
-                        let pull_json = if options.format == OutputFormat::Edn {
-                            let entry_strs: Vec<String> = map_pairs
-                                .iter()
-                                .map(|(k, v)| format!("{} {}", k, v))
-                                .collect();
-                            format!("{{{}}}", entry_strs.join(" "))
-                        } else {
-                            let entry_strs: Vec<String> = map_pairs
-                                .iter()
-                                .map(|(k, v)| format!("\"{}\":{}", k, v))
-                                .collect();
-                            format!("{{{}}}", entry_strs.join(","))
-                        };
-
-                        let field = arrow::datatypes::Field::new(
-                            &clean_var,
-                            arrow::datatypes::DataType::Utf8,
-                            true,
-                        );
-                        let array = Arc::new(arrow::array::StringArray::from(vec![pull_json]));
-                        let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
-                        let batch =
-                            RecordBatch::try_new(schema, vec![array]).map_err(MesoError::Arrow)?;
-                        return Ok(Some(vec![batch]));
-                    }
+            for pull_attr in &pattern.0 {
+                if let crate::ast::PullAttribute::Simple(a_ident) = pull_attr
+                    && let Some(a_id) = view.schema.get_id(a_ident)
+                    && let Some(val) = now_index.get(entity_id, a_id)?
+                {
+                    let formatted_val = match options.format {
+                        OutputFormat::Json => match val {
+                            Value::String(s) => format!("\"{}\"", s),
+                            Value::Int64(i) => i.to_string(),
+                            Value::Float64(f) => f.to_string(),
+                            Value::Boolean(b) => b.to_string(),
+                            Value::Ref(r) => r.to_string(),
+                            _ => "null".to_string(),
+                        },
+                        _ => match val {
+                            Value::String(s) => format!("\"{}\"", s),
+                            _ => val.to_string(),
+                        },
+                    };
+                    let key_name = if options.format == OutputFormat::Edn {
+                        a_ident.clone()
+                    } else {
+                        a_ident.trim_start_matches(':').to_string()
+                    };
+                    map_pairs.push((key_name, formatted_val));
                 }
             }
+
+            let pull_json = if options.format == OutputFormat::Edn {
+                let entry_strs: Vec<String> = map_pairs
+                    .iter()
+                    .map(|(k, v)| format!("{} {}", k, v))
+                    .collect();
+                format!("{{{}}}", entry_strs.join(" "))
+            } else {
+                let entry_strs: Vec<String> = map_pairs
+                    .iter()
+                    .map(|(k, v)| format!("\"{}\":{}", k, v))
+                    .collect();
+                format!("{{{}}}", entry_strs.join(","))
+            };
+
+            let field =
+                arrow::datatypes::Field::new(&clean_var, arrow::datatypes::DataType::Utf8, true);
+            let array = Arc::new(arrow::array::StringArray::from(vec![pull_json]));
+            let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
+            let batch = RecordBatch::try_new(schema, vec![array]).map_err(MesoError::Arrow)?;
+            return Ok(Some(vec![batch]));
         }
 
         Ok(None)
@@ -860,7 +848,7 @@ impl MesoDB {
             .map_err(MesoError::DataFusion)?;
         ctx.register_table("resolved_datoms", resolved_df.into_view())?;
 
-        let planner = crate::planner::QueryPlanner::new(
+        let planner = QueryPlanner::new(
             &ctx,
             view.timeline.as_ref(),
             "resolved_datoms",
