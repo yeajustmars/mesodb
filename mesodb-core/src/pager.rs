@@ -81,6 +81,7 @@ impl WritePager {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false) // Explicitly declare we are preserving existing data
             .open(path)
             .map_err(MesoError::Io)?;
 

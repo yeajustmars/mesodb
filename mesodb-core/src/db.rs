@@ -11,6 +11,8 @@ use std::{
 use tokio::sync::{Mutex, mpsc};
 
 use crate::{
+    bitmap::BitmapStore,
+    btree::NowIndex,
     config::Config,
     error::MesoError,
     formatter,
@@ -39,8 +41,8 @@ impl MesoDB {
         create_dir_all(data_dir.join("parquet"))?;
 
         // Initialize Tier 1 B+Trees (Owned by the background worker)
-        let now_index = crate::btree::NowIndex::open(data_dir.join("now.idx"))?;
-        let bitmap_store = crate::bitmap::BitmapStore::open(data_dir.join("bitmaps.idx"))?;
+        let now_index = NowIndex::open(data_dir.join("now.idx"))?;
+        let bitmap_store = BitmapStore::open(data_dir.join("bitmaps.idx"))?;
 
         // Take initial snapshots for WorldView
         let now_snap = Arc::new(now_index.snapshot());
@@ -850,14 +852,11 @@ impl MesoDB {
 
         let planner = QueryPlanner::new(
             &ctx,
-            view.timeline.as_ref(),
+            &view,
             "resolved_datoms",
             options.format.clone(),
             options.as_of,
             ruleset,
-            view.bitmap_index.as_ref(),
-            view.dirty_entities.clone(), // Added parameter
-            view.schema.as_ref(),
         );
 
         let final_df = planner.plan(&ast).await?;

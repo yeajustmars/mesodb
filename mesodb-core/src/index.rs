@@ -4,14 +4,16 @@ use ahash::AHashMap;
 
 use crate::types::{AttributeId, EntityId, Value};
 
+pub type Timeline<T> = Vec<(i64, Option<T>)>;
+
 #[derive(Debug, Default, Clone)]
 pub struct IndexManager {
     /// Flattened EAVT Index: (EntityId, AttributeId) -> flat timeline vector
-    pub eavt: AHashMap<(EntityId, AttributeId), Vec<(i64, Option<Value>)>>,
+    pub eavt: AHashMap<(EntityId, AttributeId), Timeline<Value>>,
 
     /// Two-Level Unique Index: AttributeId -> Value -> flat timeline vector
     /// This structure allows us to query by `&Value` without cloning!
-    pub unique_index: AHashMap<AttributeId, AHashMap<Value, Vec<(i64, Option<EntityId>)>>>,
+    pub unique_index: AHashMap<AttributeId, AHashMap<Value, Timeline<EntityId>>>,
 }
 
 impl IndexManager {
@@ -22,10 +24,10 @@ impl IndexManager {
     /// Fast-path chronological insertion. If an out-of-order time-travel fact arrives,
     /// it correctly shifts it into place, but 99.9% of the time it is a raw O(1) push.
     #[inline(always)]
-    fn insert_timeline<T>(timeline: &mut Vec<(i64, Option<T>)>, valid_time: i64, val: Option<T>) {
+    fn insert_timeline<T>(timeline: &mut Timeline<T>, valid_time: i64, val: Option<T>) {
         if timeline
             .last()
-            .map_or(true, |(last_t, _)| *last_t <= valid_time)
+            .is_none_or(|(last_t, _)| *last_t <= valid_time)
         {
             timeline.push((valid_time, val));
         } else {
@@ -69,11 +71,9 @@ impl IndexManager {
         let eavt_timeline = self.eavt.entry((e, a)).or_default();
         Self::insert_timeline(eavt_timeline, valid_time, None);
 
-        if is_unique {
-            if let Some(val_map) = self.unique_index.get_mut(&a) {
-                let unique_timeline = val_map.entry(v.clone()).or_default();
-                Self::insert_timeline(unique_timeline, valid_time, None);
-            }
+        if is_unique && let Some(val_map) = self.unique_index.get_mut(&a) {
+            let unique_timeline = val_map.entry(v.clone()).or_default();
+            Self::insert_timeline(unique_timeline, valid_time, None);
         }
     }
 
@@ -111,12 +111,11 @@ impl IndexManager {
     ) -> Option<EntityId> {
         if let Some(timeline) = self.unique_index.get(&a).and_then(|m| m.get(v)) {
             for (t, opt_owner) in timeline.iter() {
-                if *t >= valid_time {
-                    if let Some(owner) = opt_owner {
-                        if *owner != requester {
-                            return Some(*owner);
-                        }
-                    }
+                if *t >= valid_time
+                    && let Some(owner) = opt_owner
+                    && *owner != requester
+                {
+                    return Some(*owner);
                 }
             }
         }
