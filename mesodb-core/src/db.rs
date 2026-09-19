@@ -914,6 +914,17 @@ impl MesoDB {
         Ok(formatter::to_edn_string(&batches, &ast.find))
     }
 
+    pub async fn query_edn_with_options(
+        &self,
+        query_str: &str,
+        mut options: QueryOptions,
+    ) -> Result<String> {
+        let ast = parser::parse_query(query_str)?;
+        options.format = OutputFormat::Edn; // Enforce EDN for this pipeline
+        let batches = self.query_with_options(query_str, options).await?;
+        Ok(formatter::to_edn_string(&batches, &ast.find))
+    }
+
     // =====================================================================
     // HISTORY API PIPELINE
     // =====================================================================
