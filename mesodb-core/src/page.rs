@@ -42,7 +42,7 @@ pub struct PageHeader {
 /// - Values: 127 * 16 = 2032 bytes
 /// - Padding: 24 bytes
 /// - Total: 4096 bytes
-#[repr(C)]
+#[repr(C, align(64))]
 #[derive(Copy, Clone)]
 pub struct NodePage {
     pub header: PageHeader,
@@ -55,7 +55,7 @@ pub struct NodePage {
 unsafe impl bytemuck::Zeroable for NodePage {}
 unsafe impl bytemuck::Pod for NodePage {}
 
-#[repr(C)]
+#[repr(C, align(64))]
 #[derive(Copy, Clone)]
 pub struct OverflowPage {
     pub next_page_id: u32,

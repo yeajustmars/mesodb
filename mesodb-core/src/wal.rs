@@ -1,9 +1,12 @@
+// mesodb-core/src/wal.rs
+
 use rkyv::{Archive, Deserialize, Serialize};
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
+use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     config::WalSyncMode, datom::Datom, error::MesoError, schema::SchemaMutation, types::Result,
@@ -15,9 +18,16 @@ pub enum WalEntry {
     SchemaMutation(SchemaMutation),
 }
 
+pub enum WalMessage {
+    Sync(oneshot::Sender<()>),
+    UpdateFile(File),
+}
+
 pub struct Wal {
     file: File,
     path: PathBuf,
+    sync_tx: Option<mpsc::UnboundedSender<WalMessage>>,
+    last_sync_rx: Option<oneshot::Receiver<()>>,
 }
 
 impl Wal {
@@ -32,7 +42,63 @@ impl Wal {
             // Do NOT remove suspicious_open_options above and follow Clippy's advise.
             .open(&p)?;
 
-        Ok(Self { file, path: p })
+        // Setup the Group Commit Background Flusher
+        let (sync_tx, mut sync_rx) = mpsc::unbounded_channel::<WalMessage>();
+        let mut sync_file = file.try_clone().map_err(MesoError::Io)?;
+
+        tokio::spawn(async move {
+            let mut pending = Vec::with_capacity(1000);
+            loop {
+                match sync_rx.recv().await {
+                    Some(WalMessage::UpdateFile(new_file)) => {
+                        sync_file = new_file;
+                    }
+                    Some(WalMessage::Sync(req)) => {
+                        pending.push(req);
+                        // Micro-batching window: Collect concurrent writes for 2ms
+                        let sleep = tokio::time::sleep(tokio::time::Duration::from_millis(2));
+                        tokio::pin!(sleep);
+
+                        loop {
+                            tokio::select! {
+                                _ = &mut sleep => break,
+                                msg_opt = sync_rx.recv() => {
+                                    match msg_opt {
+                                        Some(WalMessage::Sync(r)) => {
+                                            pending.push(r);
+                                            if pending.len() >= 1000 { break; } // Max batch size
+                                        }
+                                        Some(WalMessage::UpdateFile(new_file)) => {
+                                            sync_file = new_file;
+                                        }
+                                        None => return, // Channel closed
+                                    }
+                                }
+                            }
+                        }
+
+                        // Execute a single physical fsync for the entire group!
+                        if let Ok(file_clone) = sync_file.try_clone() {
+                            let _ =
+                                tokio::task::spawn_blocking(move || file_clone.sync_all()).await;
+                        }
+
+                        // Notify all waiting callers simultaneously
+                        for tx in pending.drain(..) {
+                            let _ = tx.send(());
+                        }
+                    }
+                    None => break, // Channel closed
+                }
+            }
+        });
+
+        Ok(Self {
+            file,
+            path: p,
+            sync_tx: Some(sync_tx),
+            last_sync_rx: None,
+        })
     }
 
     pub fn append_entry(&mut self, entry: &WalEntry, sync_mode: &WalSyncMode) -> Result<()> {
@@ -51,11 +117,22 @@ impl Wal {
         self.file.write_all(&len.to_ne_bytes())?;
         self.file.write_all(&bytes)?;
 
+        // Queue the sync request instead of blocking the thread
         if *sync_mode == WalSyncMode::Strict {
-            self.file.sync_all()?;
+            if let Some(tx) = &self.sync_tx {
+                let (req_tx, req_rx) = oneshot::channel();
+                let _ = tx.send(WalMessage::Sync(req_tx));
+                self.last_sync_rx = Some(req_rx);
+            }
+        } else {
+            self.last_sync_rx = None;
         }
 
         Ok(())
+    }
+
+    pub fn take_last_sync_rx(&mut self) -> Option<oneshot::Receiver<()>> {
+        self.last_sync_rx.take()
     }
 
     pub fn recover(&mut self) -> Result<Vec<WalEntry>> {
@@ -152,6 +229,12 @@ impl Wal {
             .open(&self.path)?;
         self.file.seek(SeekFrom::End(0))?;
 
+        // Update the background flusher with the fresh file descriptor
+        if let Some(tx) = &self.sync_tx {
+            let new_fd = self.file.try_clone().map_err(MesoError::Io)?;
+            let _ = tx.send(WalMessage::UpdateFile(new_fd));
+        }
+
         Ok(())
     }
 
@@ -169,8 +252,9 @@ mod tests {
     use crate::types::Value;
     use tempfile::NamedTempFile;
 
-    #[test]
-    fn test_wal_append_and_recover() {
+    // Upgraded to tokio::test to support the background WalFlusher task
+    #[tokio::test]
+    async fn test_wal_append_and_recover() {
         let temp_file = NamedTempFile::new().unwrap();
         let mut wal = Wal::open(temp_file.path()).unwrap();
 
@@ -180,8 +264,15 @@ mod tests {
         // Wrap the raw datoms in the new WalEntry enum
         wal.append_entry(&WalEntry::DataBatch(batch1), &WalSyncMode::Strict)
             .unwrap();
+        if let Some(rx) = wal.take_last_sync_rx() {
+            rx.await.unwrap();
+        }
+
         wal.append_entry(&WalEntry::DataBatch(batch2), &WalSyncMode::Strict)
             .unwrap();
+        if let Some(rx) = wal.take_last_sync_rx() {
+            rx.await.unwrap();
+        }
 
         let mut recovering_wal = Wal::open(temp_file.path()).unwrap();
         let recovered = recovering_wal.recover().unwrap();
@@ -204,8 +295,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_wal_corruption_resistance() {
+    #[tokio::test]
+    async fn test_wal_corruption_resistance() {
         let temp_file = NamedTempFile::new().unwrap();
         let mut wal = Wal::open(temp_file.path()).unwrap();
 
@@ -214,6 +305,9 @@ mod tests {
         // Wrap the raw datoms
         wal.append_entry(&WalEntry::DataBatch(valid_batch), &WalSyncMode::Strict)
             .unwrap();
+        if let Some(rx) = wal.take_last_sync_rx() {
+            rx.await.unwrap();
+        }
 
         // Simulate disk corruption by writing garbage
         let mut file = std::fs::OpenOptions::new()
@@ -230,8 +324,8 @@ mod tests {
         assert_eq!(recovered.len(), 1);
     }
 
-    #[test]
-    fn test_wal_checkpoint_pruning() {
+    #[tokio::test]
+    async fn test_wal_checkpoint_pruning() {
         let temp_file = NamedTempFile::new().unwrap();
         let mut wal = Wal::open(temp_file.path()).unwrap();
 
@@ -272,6 +366,11 @@ mod tests {
         )
         .unwrap();
 
+        // Await final append sync to ensure it's written before checkpoint
+        if let Some(rx) = wal.take_last_sync_rx() {
+            rx.await.unwrap();
+        }
+
         // EXECUTE CHECKPOINT: Declare everything up to Tx 2 is safely in Parquet.
         wal.checkpoint(2).unwrap();
 
@@ -296,6 +395,86 @@ mod tests {
         match &recovered[1] {
             WalEntry::DataBatch(datoms) => assert_eq!(datoms[0].t, 3),
             _ => panic!("Expected second retained entry to be the newer DataBatch"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_wal_group_commit_batching() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut wal = Wal::open(temp_file.path()).unwrap();
+        let mut receivers = Vec::new();
+
+        // Simulate 5 extremely fast concurrent transactions pushing to the WAL
+        for i in 1..=5 {
+            // Cast the valid_from timestamp to i64
+            let batch = vec![Datom::assert(
+                i,
+                10,
+                Value::Int64(i as i64),
+                i,
+                1000 + i as i64,
+            )];
+            wal.append_entry(&WalEntry::DataBatch(batch), &WalSyncMode::Strict)
+                .unwrap();
+
+            // Collect the oneshot receivers to wait for the group commit
+            receivers.push(wal.take_last_sync_rx().unwrap());
+        }
+
+        // All 5 receivers should be notified simultaneously after the 2ms micro-batch window
+        for rx in receivers {
+            assert!(
+                rx.await.is_ok(),
+                "The background flusher should successfully notify the waiting transaction"
+            );
+        }
+
+        // Validate recovery
+        let mut recovering_wal = Wal::open(temp_file.path()).unwrap();
+        let recovered = recovering_wal.recover().unwrap();
+        assert_eq!(
+            recovered.len(),
+            5,
+            "All 5 concurrent transactions must be safely persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wal_flusher_file_rotation() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut wal = Wal::open(temp_file.path()).unwrap();
+
+        // Append initial data
+        let batch1 = vec![Datom::assert(1, 10, Value::Int64(100), 1, 1000)];
+        wal.append_entry(&WalEntry::DataBatch(batch1), &WalSyncMode::Strict)
+            .unwrap();
+        wal.take_last_sync_rx().unwrap().await.unwrap();
+
+        // Checkpoint completely swaps the underlying file descriptor
+        wal.checkpoint(1).unwrap();
+
+        // Append new data to the rotated file
+        let batch2 = vec![Datom::assert(2, 10, Value::Int64(200), 2, 2000)];
+        wal.append_entry(&WalEntry::DataBatch(batch2), &WalSyncMode::Strict)
+            .unwrap();
+
+        // This MUST resolve! If the flusher task didn't receive the new file descriptor,
+        // it would crash or hang trying to sync a closed file.
+        let sync_result = wal.take_last_sync_rx().unwrap().await;
+        assert!(
+            sync_result.is_ok(),
+            "The background flusher must successfully sync against the rotated file descriptor"
+        );
+
+        let mut recovering_wal = Wal::open(temp_file.path()).unwrap();
+        let recovered = recovering_wal.recover().unwrap();
+
+        // Because batch1 was pruned by the checkpoint, we should only see batch2
+        assert_eq!(recovered.len(), 1);
+        if let WalEntry::DataBatch(datoms) = &recovered[0] {
+            assert_eq!(datoms[0].e, 2);
+        } else {
+            panic!("Expected DataBatch");
         }
     }
 }

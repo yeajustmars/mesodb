@@ -359,6 +359,10 @@ impl Transactor {
             batch,
         })
     }
+
+    pub fn take_sync_rx(&mut self) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        self.wal.take_last_sync_rx()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -384,7 +388,7 @@ pub struct TxReport {
 mod tests {
     use super::*;
 
-    fn setup_transactor() -> (Transactor, tempfile::TempDir) {
+    async fn setup_transactor() -> (Transactor, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("wal");
 
@@ -398,9 +402,9 @@ mod tests {
         (transactor, dir)
     }
 
-    #[test]
-    fn test_tx_bitemporal_interval_closing() {
-        let (mut t, _f) = setup_transactor();
+    #[tokio::test]
+    async fn test_tx_bitemporal_interval_closing() {
+        let (mut t, _f) = setup_transactor().await;
         // 1. Assert Alice
         let _ = t
             .transact_at(
@@ -436,9 +440,9 @@ mod tests {
         assert_eq!(report.batch.num_rows(), 2);
     }
 
-    #[test]
-    fn test_tx_unique_constraint_enforcement() {
-        let (mut t, _f) = setup_transactor();
+    #[tokio::test]
+    async fn test_tx_unique_constraint_enforcement() {
+        let (mut t, _f) = setup_transactor().await;
         t.transact(vec![Fact {
             e: 1,
             ident: ":user/email".into(),
@@ -461,10 +465,10 @@ mod tests {
         assert!(err.is_err());
     }
 
-    #[test]
-    fn test_engine_raw_bitemporal_arrow_output() {
+    #[tokio::test]
+    async fn test_engine_raw_bitemporal_arrow_output() {
         use arrow::array::{BooleanArray, StringArray, TimestampMicrosecondArray};
-        let (mut t, _f) = setup_transactor();
+        let (mut t, _f) = setup_transactor().await;
 
         // 1. Assert Alice at T=100
         t.transact_at(
@@ -537,8 +541,8 @@ mod tests {
         assert_eq!(to_col.value(1), i64::MAX); // New assertion is valid until the end of time
     }
 
-    #[test]
-    fn test_jit_schema_durability_and_recovery() {
+    #[tokio::test]
+    async fn test_jit_schema_durability_and_recovery() {
         let dir = tempfile::tempdir().unwrap();
         let wal_path = dir.path().join("wal");
         let config = Config::default();
@@ -559,6 +563,11 @@ mod tests {
 
             // Verify the engine inferred it in RAM
             assert!(t.schema.contains_ident(":new/jit_attr"));
+
+            // NEW: Await the background group commit sync before dropping!
+            if let Some(rx) = t.take_sync_rx() {
+                let _ = rx.await;
+            }
         } // `t` is dropped here. Server "crashes".
 
         // 2. Re-open from the exact same WAL file
@@ -573,9 +582,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_atomic_compare_and_swap() {
-        let (mut t, _f) = setup_transactor();
+    #[tokio::test]
+    async fn test_atomic_compare_and_swap() {
+        let (mut t, _f) = setup_transactor().await;
 
         // 1. Initial State: Alice is 29
         t.transact(vec![Fact {
@@ -615,9 +624,9 @@ mod tests {
         assert!(good_cas.is_ok());
     }
 
-    #[test]
-    fn test_cas_transaction_atomicity() {
-        let (mut t, _f) = setup_transactor();
+    #[tokio::test]
+    async fn test_cas_transaction_atomicity() {
+        let (mut t, _f) = setup_transactor().await;
 
         // 1. Setup Initial Bank Balances
         t.transact(vec![
@@ -676,9 +685,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_cas_retractions_and_missing_values() {
-        let (mut t, _f) = setup_transactor();
+    #[tokio::test]
+    async fn test_cas_retractions_and_missing_values() {
+        let (mut t, _f) = setup_transactor().await;
 
         t.transact(vec![Fact {
             e: 1,
@@ -721,10 +730,10 @@ mod tests {
         assert!(t.indices.get_current_value(1, attr_id).is_none());
     }
 
-    #[test]
-    fn test_explicit_valid_time_ingestion() {
+    #[tokio::test]
+    async fn test_explicit_valid_time_ingestion() {
         use arrow::array::TimestampMicrosecondArray;
-        let (mut t, _f) = setup_transactor();
+        let (mut t, _f) = setup_transactor().await;
 
         let historical_time = 5000; // Deep in the past
 
@@ -751,10 +760,10 @@ mod tests {
         assert_eq!(from_col.value(0), historical_time);
     }
 
-    #[test]
-    fn test_bitemporal_past_valid_time() {
+    #[tokio::test]
+    async fn test_bitemporal_past_valid_time() {
         use arrow::array::TimestampMicrosecondArray;
-        let (mut t, _f) = setup_transactor();
+        let (mut t, _f) = setup_transactor().await;
 
         let past_time = 1500000000000; // Explicit past timestamp
 
@@ -783,10 +792,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_bitemporal_future_valid_time() {
+    #[tokio::test]
+    async fn test_bitemporal_future_valid_time() {
         use arrow::array::TimestampMicrosecondArray;
-        let (mut t, _f) = setup_transactor();
+        let (mut t, _f) = setup_transactor().await;
 
         let future_time = 2500000000000; // Explicit future timestamp
 
@@ -815,10 +824,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_bitemporal_mixed_valid_times_batch() {
+    #[tokio::test]
+    async fn test_bitemporal_mixed_valid_times_batch() {
         use arrow::array::TimestampMicrosecondArray;
-        let (mut t, _f) = setup_transactor();
+        let (mut t, _f) = setup_transactor().await;
 
         let past_1 = 1000;
         let future_1 = 8_000_000_000_000_000; // Far future (Year ~2223)
@@ -897,9 +906,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_bitemporal_contextual_uniqueness() {
-        let (mut t, _f) = setup_transactor();
+    #[tokio::test]
+    async fn test_bitemporal_contextual_uniqueness() {
+        let (mut t, _f) = setup_transactor().await;
 
         // 1. Alice claims an email starting at T=100
         t.transact(vec![Fact {

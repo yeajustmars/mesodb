@@ -1,5 +1,9 @@
 // mesodb-server/src/main.rs
 
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 use arrow_flight::flight_service_server::FlightServiceServer;
 use axum::{Router, routing::post};
 use std::net::SocketAddr;

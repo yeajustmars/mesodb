@@ -299,26 +299,32 @@ impl MesoDB {
     }
 
     /// Exposes explicit schema definition to the outside world.
-    /// Batches multiple attribute creations into a single locked transaction.
     pub async fn transact_schema(
         &self,
         attributes: Vec<AttributeDefinition>,
     ) -> Result<Vec<Arc<Attribute>>> {
-        let mut tx = self.transactor.lock().await;
-        let mut added_attrs = Vec::with_capacity(attributes.len());
+        let (added_attrs, sync_rx) = {
+            let mut tx = self.transactor.lock().await;
+            let mut added_attrs = Vec::with_capacity(attributes.len());
 
-        for attr in attributes {
-            let added = tx.transact_schema(&attr.ident, attr.value_type, attr.is_unique)?;
-            added_attrs.push(added);
-        }
+            for attr in attributes {
+                let added = tx.transact_schema(&attr.ident, attr.value_type, attr.is_unique)?;
+                added_attrs.push(added);
+            }
 
-        // If we actually added anything, we must publish the new schema to RAM
-        // so that read-queries can instantly recognize the new attributes.
-        if !added_attrs.is_empty() {
-            let mut writer = self.world_view.write();
-            let world_view_mut = Arc::make_mut(&mut *writer);
-            world_view_mut.schema = Arc::new(tx.schema.clone());
-            world_view_mut.timeline = Arc::new(tx.timeline.clone());
+            if !added_attrs.is_empty() {
+                let mut writer = self.world_view.write();
+                let world_view_mut = Arc::make_mut(&mut *writer);
+                world_view_mut.schema = Arc::new(tx.schema.clone());
+                world_view_mut.timeline = Arc::new(tx.timeline.clone());
+            }
+
+            (added_attrs, tx.take_sync_rx())
+        };
+
+        // Await the physical disk sync entirely outside the Transactor lock!
+        if let Some(rx) = sync_rx {
+            let _ = rx.await;
         }
 
         Ok(added_attrs)
@@ -326,18 +332,18 @@ impl MesoDB {
 
     /// DRY helper that handles the lock, the transaction, and the lock-free WorldView pointer swap.
     async fn execute(&self, facts: Vec<Fact>, custom_now: Option<i64>) -> Result<TxReport> {
-        let mut tx = self.transactor.lock().await;
-        let report = match custom_now {
-            Some(t) => tx.transact_at(facts, t)?,
-            None => tx.transact(facts)?,
-        };
+        let (report, sync_rx, trigger_flush) = {
+            let mut tx = self.transactor.lock().await;
+            let report = match custom_now {
+                Some(t) => tx.transact_at(facts, t)?,
+                None => tx.transact(facts)?,
+            };
 
-        if report.datoms_written > 0 {
-            let batch_clone = report.batch.clone();
-            let new_schema = Arc::new(tx.schema.clone());
-            let new_timeline = Arc::new(tx.timeline.clone());
+            if report.datoms_written > 0 {
+                let batch_clone = report.batch.clone();
+                let new_schema = Arc::new(tx.schema.clone());
+                let new_timeline = Arc::new(tx.timeline.clone());
 
-            {
                 let mut writer = self.world_view.write();
 
                 let world_view_mut = Arc::make_mut(&mut *writer);
@@ -360,15 +366,26 @@ impl MesoDB {
                 }
             }
 
-            if report.batch.num_rows() >= tx.config.storage.memtable_max_rows
-                && self
-                    .flush_tx
-                    .send((report.tx_id, report.batch.clone()))
-                    .await
-                    .is_err()
-            {
-                eprintln!("Warning: Background flusher disconnected.");
-            }
+            let trigger_flush = report.datoms_written > 0
+                && report.batch.num_rows() >= tx.config.storage.memtable_max_rows;
+
+            (report, tx.take_sync_rx(), trigger_flush)
+        };
+
+        // 1. Await the physical disk sync outside the Transactor lock
+        if let Some(rx) = sync_rx {
+            let _ = rx.await;
+        }
+
+        // 2. Dispatch to the background compactor outside the lock
+        if trigger_flush
+            && self
+                .flush_tx
+                .send((report.tx_id, report.batch.clone()))
+                .await
+                .is_err()
+        {
+            eprintln!("Warning: Background flusher disconnected.");
         }
 
         Ok(report)
