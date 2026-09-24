@@ -627,6 +627,78 @@ impl MesoDB {
             return Ok(Some(vec![batch]));
         }
 
+        // --- PATTERN 5: Bitmap Intersection (Simple Relational Join) ---
+        // Match [:find ?v2 :where [?e :attr1 "literal"] [?e :attr2 ?v2]]
+        if ast.find.len() == 1
+            && ast.where_clauses.len() == 2
+            && let crate::ast::FindSpec::Variable(find_var) = &ast.find[0]
+        {
+            let mut literal_clause = None;
+            let mut proj_clause = None;
+
+            for clause in &ast.where_clauses {
+                if let crate::ast::WhereClause::DataPattern {
+                    e,
+                    a,
+                    v,
+                    tx: None,
+                    op: None,
+                } = clause
+                    && let (crate::ast::Term::Variable(e_var), crate::ast::Term::Keyword(a_kw)) =
+                        (e, a)
+                {
+                    match v {
+                        crate::ast::Term::Variable(v_var) => {
+                            proj_clause = Some((e_var, a_kw, v_var))
+                        }
+                        _ => literal_clause = Some((e_var, a_kw, v)),
+                    }
+                }
+            }
+
+            if let (Some((e_var1, a_kw1, v_lit)), Some((e_var2, a_kw2, v_var))) =
+                (literal_clause, proj_clause)
+                && e_var1 == e_var2
+                && v_var == find_var
+            {
+                let literal_val = match v_lit {
+                    crate::ast::Term::String(s) => Some(Value::String(s.clone())),
+                    crate::ast::Term::Integer(i) => Some(Value::Int64(*i)),
+                    crate::ast::Term::Boolean(b) => Some(Value::Boolean(*b)),
+                    crate::ast::Term::Float(f) => Some(Value::Float64(*f)),
+                    _ => None,
+                };
+
+                if let Some(val) = literal_val
+                    && let Some(a_id1) = view.schema.get_id(a_kw1)
+                    && let Some(a_id2) = view.schema.get_id(a_kw2)
+                    && view.dirty_entities.is_empty()
+                    && let Some(treemap) = view.bitmap_index.get(a_id1, &val)?
+                {
+                    let mut results = Vec::new();
+                    for e_id in treemap {
+                        if let Some(proj_val) = view.now_index.get(e_id, a_id2)? {
+                            results.push(proj_val);
+                        }
+                    }
+
+                    if results.is_empty() {
+                        return Ok(Some(vec![]));
+                    }
+
+                    let clean_var = find_var.replace("?", "");
+                    let (field, array) = Self::vals_to_arrow_column(&clean_var, &results);
+                    let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
+                    let batch =
+                        RecordBatch::try_new(schema, vec![array]).map_err(MesoError::Arrow)?;
+
+                    return Ok(Some(vec![batch]));
+                } else {
+                    return Ok(Some(vec![]));
+                }
+            }
+        }
+
         Ok(None)
     }
 
@@ -689,6 +761,100 @@ impl MesoDB {
                 (
                     arrow::datatypes::Field::new(name, arrow::datatypes::DataType::Utf8, true),
                     Arc::new(arrow::array::StringArray::from(vec![uuid_str])),
+                )
+            }
+        }
+    }
+
+    fn vals_to_arrow_column(
+        name: &str,
+        vals: &[Value],
+    ) -> (arrow::datatypes::Field, Arc<dyn arrow::array::Array>) {
+        if vals.is_empty() {
+            return (
+                arrow::datatypes::Field::new(name, arrow::datatypes::DataType::Utf8, true),
+                Arc::new(arrow::array::StringArray::from(Vec::<String>::new())),
+            );
+        }
+        match &vals[0] {
+            Value::String(_) => {
+                let vec: Vec<String> = vals
+                    .iter()
+                    .map(|v| {
+                        if let Value::String(s) = v {
+                            s.clone()
+                        } else {
+                            "".to_string()
+                        }
+                    })
+                    .collect();
+                (
+                    arrow::datatypes::Field::new(name, arrow::datatypes::DataType::Utf8, true),
+                    Arc::new(arrow::array::StringArray::from(vec)),
+                )
+            }
+            Value::Int64(_) => {
+                let vec: Vec<i64> = vals
+                    .iter()
+                    .map(|v| if let Value::Int64(i) = v { *i } else { 0 })
+                    .collect();
+                (
+                    arrow::datatypes::Field::new(name, arrow::datatypes::DataType::Int64, true),
+                    Arc::new(arrow::array::Int64Array::from(vec)),
+                )
+            }
+            Value::Float64(_) => {
+                let vec: Vec<f64> = vals
+                    .iter()
+                    .map(|v| if let Value::Float64(f) = v { *f } else { 0.0 })
+                    .collect();
+                (
+                    arrow::datatypes::Field::new(name, arrow::datatypes::DataType::Float64, true),
+                    Arc::new(arrow::array::Float64Array::from(vec)),
+                )
+            }
+            Value::Boolean(_) => {
+                let vec: Vec<bool> = vals
+                    .iter()
+                    .map(|v| if let Value::Boolean(b) = v { *b } else { false })
+                    .collect();
+                (
+                    arrow::datatypes::Field::new(name, arrow::datatypes::DataType::Boolean, true),
+                    Arc::new(arrow::array::BooleanArray::from(vec)),
+                )
+            }
+            Value::Ref(_) => {
+                let vec: Vec<u64> = vals
+                    .iter()
+                    .map(|v| if let Value::Ref(r) = v { *r } else { 0 })
+                    .collect();
+                (
+                    arrow::datatypes::Field::new(name, arrow::datatypes::DataType::UInt64, true),
+                    Arc::new(arrow::array::UInt64Array::from(vec)),
+                )
+            }
+            Value::Timestamp(_) => {
+                let vec: Vec<i64> = vals
+                    .iter()
+                    .map(|v| if let Value::Timestamp(t) = v { *t } else { 0 })
+                    .collect();
+                (
+                    arrow::datatypes::Field::new(
+                        name,
+                        arrow::datatypes::DataType::Timestamp(
+                            arrow::datatypes::TimeUnit::Microsecond,
+                            None,
+                        ),
+                        true,
+                    ),
+                    Arc::new(arrow::array::TimestampMicrosecondArray::from(vec)),
+                )
+            }
+            Value::Uuid(_) => {
+                let vec: Vec<String> = vals.iter().map(|v| if let Value::Uuid(u) = v { format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}", u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]) } else { "".to_string() }).collect();
+                (
+                    arrow::datatypes::Field::new(name, arrow::datatypes::DataType::Utf8, true),
+                    Arc::new(arrow::array::StringArray::from(vec)),
                 )
             }
         }
@@ -3298,5 +3464,74 @@ mod tests {
         let results_disk = db.query(query).await.unwrap();
         let total_rows_disk: usize = results_disk.iter().map(|b| b.num_rows()).sum();
         assert_eq!(total_rows_disk, 1);
+    }
+
+    #[tokio::test]
+    async fn test_fast_path_bitmap_intersection_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/status", ValueType::String, false);
+        schema.add_attribute(":user/name", ValueType::String, false);
+
+        let db = MesoDB::open(dir.path().join("fp_join.db"), schema, Config::default()).unwrap();
+
+        db.transact(vec![
+            Fact {
+                e: 200,
+                ident: ":user/status".into(),
+                v: Value::String("active".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 200,
+                ident: ":user/name".into(),
+                v: Value::String("ActiveAlice".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 201,
+                ident: ":user/status".into(),
+                v: Value::String("inactive".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 201,
+                ident: ":user/name".into(),
+                v: Value::String("InactiveBob".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+        ])
+        .await
+        .unwrap();
+
+        // Wait for background worker to flush RAM to the B-Tree / Bitmap indices
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let query = r#"[:find ?name :where [?e :user/status "active"] [?e :user/name ?name]]"#;
+        let results = db.query(query).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        let batch = &results[0];
+        assert_eq!(
+            batch.num_rows(),
+            1,
+            "Should bypass DataFusion and return exactly one row natively"
+        );
+
+        let name_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+
+        assert_eq!(name_col.value(0), "ActiveAlice");
     }
 }
