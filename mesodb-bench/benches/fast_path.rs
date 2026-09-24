@@ -63,7 +63,7 @@ fn setup_fast_path_db(dir: &TempDir, num_entities: usize) -> Arc<MesoDB> {
         }
 
         // Wait for the background worker to finish compaction and RAM eviction
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
     });
 
     db
@@ -124,6 +124,36 @@ fn bench_fast_path(c: &mut Criterion) {
                 .unwrap()
                 .unwrap();
             black_box(treemap);
+        });
+    });
+
+    // 5. Pattern 5: Bitmap Intersection Join (Zero-Copy Relational Join)
+    group.bench_function(
+        "Tier 1+2/Fast-Path Relational Join (Bitmap Intersection)",
+        |b| {
+            let query = r#"[:find ?n :where [?e :user/status "active"] [?e :user/name ?n]]"#;
+            b.to_async(&rt).iter(|| async {
+                let res = db.query(black_box(query)).await.unwrap();
+                black_box(res);
+            });
+        },
+    );
+
+    // 6. Pattern 6: Entity ID Range Scan
+    group.bench_function("Tier 1/Fast-Path Entity Range Scan", |b| {
+        let query = r#"[:find ?n :where [?e :user/name ?n] [(>= ?e 1000)] [(<= ?e 2000)]]"#;
+        b.to_async(&rt).iter(|| async {
+            let res = db.query(black_box(query)).await.unwrap();
+            black_box(res);
+        });
+    });
+
+    // 7. Pattern 7: Value Range Scan (AvtIndex)
+    group.bench_function("Tier 3/Fast-Path Value Range Scan", |b| {
+        let query = r#"[:find ?e :where [?e :user/age ?age] [(>= ?age 30)] [(<= ?age 40)]]"#;
+        b.to_async(&rt).iter(|| async {
+            let res = db.query(black_box(query)).await.unwrap();
+            black_box(res);
         });
     });
 
