@@ -43,12 +43,13 @@ impl MesoDB {
         // Initialize Tier 1 B+Trees (Owned by the background worker)
         let now_index = NowIndex::open(data_dir.join("now.idx"))?;
         let bitmap_store = BitmapStore::open(data_dir.join("bitmaps.idx"))?;
+        let avt_index = crate::btree::AvtIndex::open(data_dir.join("avt.idx"))?; // NEW
 
         // Take initial snapshots for WorldView
         let now_snap = Arc::new(now_index.snapshot());
         let bitmap_snap = Arc::new(bitmap_store.snapshot());
+        let avt_snap = Arc::new(avt_index.snapshot()); // NEW
 
-        // Pass the B+Tree into the transactor (Though transactor no longer writes to it directly)
         let (transactor, recovered_batch) = Transactor::new(path, schema.clone(), config.clone())?;
 
         let mut initial_ram = Vec::new();
@@ -79,6 +80,7 @@ impl MesoDB {
             timeline: Arc::new(transactor.timeline.clone()),
             now_index: now_snap,
             bitmap_index: bitmap_snap,
+            avt_index: avt_snap, // NEW
             dirty_entities: Arc::new(initial_dirty),
         })));
 
@@ -92,6 +94,7 @@ impl MesoDB {
             config.clone(),
             now_index,
             bitmap_store,
+            avt_index, // NEW
         );
 
         Ok(Self {
@@ -101,8 +104,6 @@ impl MesoDB {
         })
     }
 
-    /// The Background Worker: Listens for RAM batches, updates background indexes,
-    /// writes to disk, drops them from RAM, and dispatches detached compaction tasks.
     fn spawn_background_worker(
         data_dir: PathBuf,
         mut flush_rx: mpsc::Receiver<(u64, RecordBatch)>,
@@ -110,26 +111,27 @@ impl MesoDB {
         config: Config,
         mut now_index: crate::btree::NowIndex,
         mut bitmap_store: crate::bitmap::BitmapStore,
+        mut avt_index: crate::btree::AvtIndex, // NEW
     ) {
         tokio::spawn(async move {
             let compactor = BackgroundCompactor::new(data_dir);
             let mut uncompacted_files = Vec::new();
-
             let mut evict_queue = Vec::with_capacity(20);
             const EVICT_THRESHOLD: usize = 20;
 
             while let Some((tx_id, batch)) = flush_rx.recv().await {
-                // 1. UPDATE B-TREES (Writer owns them exclusively now! No RwLock needed)
-                if let Err(e) =
-                    Self::update_indexes_from_batch(&mut now_index, &mut bitmap_store, &batch)
-                {
+                if let Err(e) = Self::update_indexes_from_batch(
+                    &mut now_index,
+                    &mut bitmap_store,
+                    &mut avt_index,
+                    &batch,
+                ) {
                     eprintln!(
                         "Warning: Failed to update background indexes for Tx {}: {:?}",
                         tx_id, e
                     );
                 }
 
-                // 2. Write the batch to a Volatile Parquet file
                 let file_path = match compactor.flush_to_parquet(batch, tx_id) {
                     Ok(path) => path,
                     Err(e) => {
@@ -138,20 +140,20 @@ impl MesoDB {
                     }
                 };
                 uncompacted_files.push(file_path);
-
                 evict_queue.push(tx_id);
 
                 let trigger_compaction =
                     uncompacted_files.len() >= config.compactor.backpressure_threshold;
                 let trigger_eviction = evict_queue.len() >= EVICT_THRESHOLD;
 
-                // 3. Safely remove from RAM and recalculate dirty_entities
                 if trigger_eviction || trigger_compaction {
-                    // Flush B-Trees to disk and take fresh lock-free snapshots
                     let _ = now_index.flush();
                     let _ = bitmap_store.flush();
+                    let _ = avt_index.flush(); // NEW
+
                     let new_now_snap = Arc::new(now_index.snapshot());
                     let new_bitmap_snap = Arc::new(bitmap_store.snapshot());
+                    let new_avt_snap = Arc::new(avt_index.snapshot()); // NEW
 
                     {
                         let mut writer = world_view.write();
@@ -173,15 +175,13 @@ impl MesoDB {
                             }
                         }
                         world_view_mut.dirty_entities = Arc::new(remaining_dirty);
-
-                        // Swap in the new B-Tree snapshots
                         world_view_mut.now_index = new_now_snap;
                         world_view_mut.bitmap_index = new_bitmap_snap;
+                        world_view_mut.avt_index = new_avt_snap; // NEW
                     }
                     evict_queue.clear();
                 }
 
-                // 4. Trigger Compaction
                 if trigger_compaction {
                     let files_to_compact = std::mem::take(&mut uncompacted_files);
                     let compactor_clone = compactor.clone();
@@ -196,68 +196,63 @@ impl MesoDB {
         });
     }
 
-    /// Helper to populate NowIndex B+Tree from an Arrow RecordBatch in the background thread.
-    /// Extracts specific datoms directly from the Arrow arrays safely without panicking.
     fn update_indexes_from_batch(
         now_index: &mut crate::btree::NowIndex,
         bitmap_store: &mut crate::bitmap::BitmapStore,
+        avt_index: &mut crate::btree::AvtIndex, // NEW
         batch: &RecordBatch,
     ) -> Result<()> {
         let e_col = batch
             .column(0)
             .as_any()
             .downcast_ref::<arrow::array::UInt64Array>()
-            .ok_or_else(|| MesoError::Serialization("Missing e column (UInt64)".into()))?;
-
+            .ok_or_else(|| MesoError::Serialization("Missing e column".into()))?;
         let a_col = batch
             .column(1)
             .as_any()
             .downcast_ref::<arrow::array::UInt32Array>()
-            .ok_or_else(|| MesoError::Serialization("Missing a column (UInt32)".into()))?;
-
+            .ok_or_else(|| MesoError::Serialization("Missing a column".into()))?;
         let v_bool = batch
             .column(2)
             .as_any()
             .downcast_ref::<arrow::array::BooleanArray>()
-            .ok_or_else(|| MesoError::Serialization("Missing v_bool column".into()))?;
+            .ok_or_else(|| MesoError::Serialization("Missing v_bool".into()))?;
         let v_int = batch
             .column(3)
             .as_any()
             .downcast_ref::<arrow::array::Int64Array>()
-            .ok_or_else(|| MesoError::Serialization("Missing v_int column".into()))?;
+            .ok_or_else(|| MesoError::Serialization("Missing v_int".into()))?;
         let v_float = batch
             .column(4)
             .as_any()
             .downcast_ref::<arrow::array::Float64Array>()
-            .ok_or_else(|| MesoError::Serialization("Missing v_float column".into()))?;
+            .ok_or_else(|| MesoError::Serialization("Missing v_float".into()))?;
         let v_str = batch
             .column(5)
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .ok_or_else(|| MesoError::Serialization("Missing v_str column".into()))?;
+            .ok_or_else(|| MesoError::Serialization("Missing v_str".into()))?;
         let v_ref = batch
             .column(6)
             .as_any()
             .downcast_ref::<arrow::array::UInt64Array>()
-            .ok_or_else(|| MesoError::Serialization("Missing v_ref column".into()))?;
+            .ok_or_else(|| MesoError::Serialization("Missing v_ref".into()))?;
         let v_time = batch
             .column(7)
             .as_any()
             .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
-            .ok_or_else(|| MesoError::Serialization("Missing v_time column".into()))?;
-
+            .ok_or_else(|| MesoError::Serialization("Missing v_time".into()))?;
         let op_col = batch
             .column(10)
             .as_any()
             .downcast_ref::<arrow::array::BooleanArray>()
-            .ok_or_else(|| MesoError::Serialization("Missing op column".into()))?;
+            .ok_or_else(|| MesoError::Serialization("Missing op".into()))?;
 
         for i in 0..batch.num_rows() {
             let e = e_col.value(i);
             let a = a_col.value(i);
             let op = op_col.value(i);
 
-            // Extract val BEFORE the op check
             let val = if v_bool.is_valid(i) {
                 Value::Boolean(v_bool.value(i))
             } else if v_int.is_valid(i) {
@@ -277,12 +272,13 @@ impl MesoDB {
             if op {
                 let _ = now_index.put(e, a, &val);
                 let _ = bitmap_store.put(a, &val, e, true);
+                let _ = avt_index.put(a, &val, e, true); // NEW
             } else {
                 let _ = now_index.delete(e, a);
                 let _ = bitmap_store.put(a, &val, e, false);
+                let _ = avt_index.put(a, &val, e, false); // NEW
             }
         }
-
         Ok(())
     }
 
@@ -804,6 +800,125 @@ impl MesoDB {
             }
         }
 
+        // --- PATTERN 7: Value Range Scan (AvtIndex) ---
+        // Match [:find ?e :where [?e :attr ?v] [(>= ?v 100)] [(<= ?v 200)]]
+        if ast.find.len() == 1
+            && !ast.where_clauses.is_empty()
+            && let crate::ast::FindSpec::Variable(find_var) = &ast.find[0]
+        {
+            let mut dp_clause = None;
+            let mut funcs = Vec::new();
+            let mut is_valid = true;
+
+            for clause in &ast.where_clauses {
+                match clause {
+                    crate::ast::WhereClause::DataPattern {
+                        e,
+                        a,
+                        v,
+                        tx: None,
+                        op: None,
+                    } => {
+                        if dp_clause.is_none() {
+                            dp_clause = Some((e, a, v));
+                        } else {
+                            is_valid = false;
+                        }
+                    }
+                    crate::ast::WhereClause::Function {
+                        fn_name,
+                        args,
+                        binding: None,
+                    } => {
+                        funcs.push((fn_name, args));
+                    }
+                    _ => is_valid = false,
+                }
+            }
+
+            if is_valid
+                && !funcs.is_empty()
+                && let Some((
+                    crate::ast::Term::Variable(e_var),
+                    crate::ast::Term::Keyword(a_ident),
+                    crate::ast::Term::Variable(v_var),
+                )) = dp_clause
+                && (find_var == v_var || find_var == e_var)
+            {
+                let mut v_min = 0u64;
+                let mut v_max = u64::MAX;
+                let mut bounds_applied = false;
+
+                for (fn_name, args) in funcs {
+                    if args.len() == 2
+                        && let crate::ast::Term::Variable(arg_var) = &args[0]
+                        && arg_var == v_var
+                    {
+                        let enc_val = match &args[1] {
+                            crate::ast::Term::Integer(i) => Some(crate::page::encode_i64(*i)),
+                            crate::ast::Term::Float(f) => Some(crate::page::encode_f64(*f)),
+                            _ => None,
+                        };
+
+                        if let Some(lim) = enc_val {
+                            match fn_name.as_str() {
+                                ">" => v_min = v_min.max(lim.saturating_add(1)),
+                                ">=" => v_min = v_min.max(lim),
+                                "<" => v_max = v_max.min(lim.saturating_sub(1)),
+                                "<=" => v_max = v_max.min(lim),
+                                _ => is_valid = false,
+                            }
+                            bounds_applied = true;
+                        } else {
+                            is_valid = false;
+                        }
+                    } else {
+                        is_valid = false;
+                    }
+                }
+
+                if is_valid
+                    && bounds_applied
+                    && view.dirty_entities.is_empty()
+                    && let Some(a_id) = view.schema.get_id(a_ident)
+                {
+                    // Execute the scan against the 24-byte B-Tree keys!
+                    let e_ids = view.avt_index.range_scan(a_id, v_min, v_max)?;
+                    if e_ids.is_empty() {
+                        return Ok(Some(vec![]));
+                    }
+
+                    let clean_var = find_var.replace("?", "");
+
+                    let (field, array) = if find_var == e_var {
+                        (
+                            arrow::datatypes::Field::new(
+                                &clean_var,
+                                arrow::datatypes::DataType::UInt64,
+                                true,
+                            ),
+                            Arc::new(arrow::array::UInt64Array::from(e_ids))
+                                as Arc<dyn arrow::array::Array>,
+                        )
+                    } else {
+                        // If they asked for the value instead of the entity, fetch it via O(1) point lookups
+                        let mut v_vec = Vec::with_capacity(e_ids.len());
+                        for e_id in e_ids {
+                            if let Some(val) = view.now_index.get(e_id, a_id)? {
+                                v_vec.push(val);
+                            }
+                        }
+                        Self::vals_to_arrow_column(&clean_var, &v_vec)
+                    };
+
+                    let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
+                    let batch =
+                        RecordBatch::try_new(schema, vec![array]).map_err(MesoError::Arrow)?;
+                    return Ok(Some(vec![batch]));
+                }
+            }
+        }
+
         Ok(None)
     }
 
@@ -1266,6 +1381,7 @@ pub struct WorldView {
     pub schema: Arc<SchemaMap>,
     pub timeline: Arc<SchemaTimeline>,
     pub now_index: Arc<crate::btree::NowIndexSnapshot>,
+    pub avt_index: Arc<crate::btree::AvtIndexSnapshot>,
     pub bitmap_index: Arc<crate::bitmap::BitmapSnapshot>, // Swapped out AveIndex
     pub dirty_entities: Arc<ahash::AHashSet<crate::types::EntityId>>,
 }
@@ -2964,6 +3080,7 @@ mod tests {
                 schema: current_view.schema.clone(),
                 timeline: current_view.timeline.clone(),
                 now_index: current_view.now_index.clone(),
+                avt_index: current_view.avt_index.clone(),
                 bitmap_index: current_view.bitmap_index.clone(),
                 dirty_entities: current_view.dirty_entities.clone(),
             });
@@ -3155,6 +3272,7 @@ mod tests {
                 schema: current_view.schema.clone(),
                 timeline: current_view.timeline.clone(),
                 now_index: current_view.now_index.clone(),
+                avt_index: current_view.avt_index.clone(),
                 bitmap_index: current_view.bitmap_index.clone(),
                 dirty_entities: current_view.dirty_entities.clone(),
             });
@@ -3693,5 +3811,59 @@ mod tests {
             .unwrap();
         assert_eq!(val_col.value(0), "Log 102");
         assert_eq!(val_col.value(2), "Log 104");
+    }
+
+    #[tokio::test]
+    async fn test_fast_path_value_range_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":item/price", ValueType::Int64, false);
+
+        // Force background syncs immediately
+        let mut config = Config::default();
+        config.storage.memtable_max_rows = 1;
+        config.compactor.backpressure_threshold = 1;
+
+        let db = MesoDB::open(dir.path().join("fp_val_range.db"), schema, config).unwrap();
+
+        let mut facts = Vec::new();
+        for i in 1..=5 {
+            facts.push(Fact {
+                e: i,
+                ident: ":item/price".into(),
+                v: Value::Int64(i as i64 * 10), // Prices: 10, 20, 30, 40, 50
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            });
+        }
+        db.transact(facts).await.unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let query =
+            r#"[:find ?e :where [?e :item/price ?price] [(>= ?price 20)] [(<= ?price 40)]]"#;
+        let results = db.query(query).await.unwrap();
+
+        assert_eq!(results.len(), 1, "Should bypass DataFusion natively");
+        let batch = &results[0];
+
+        // Excludes 10 and 50
+        assert_eq!(
+            batch.num_rows(),
+            3,
+            "Range scan should fetch 20, 30, and 40"
+        );
+
+        let e_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .unwrap();
+
+        let mut e_ids = vec![e_col.value(0), e_col.value(1), e_col.value(2)];
+        e_ids.sort();
+        // Since price = e * 10, target entities are 2, 3, and 4
+        assert_eq!(e_ids, vec![2, 3, 4]);
     }
 }
