@@ -23,12 +23,14 @@ arrow = "58.2.0"
 arrow-flight = "58.2.0"
 ahash = "0.8.12"
 axum = { version = "0.8.9", features = ["json", "macros"] }
+bytemuck = { version = "1.25.1", features = [ "derive" ] }
 chrono = "0.4.44"
 clap = { version = "4.6.1", features = ["derive"] }
 color-eyre = "0.6.5"
 comfy-table = "7.2.2"
 datafusion = "53.1.0"
 futures = "0.3.32"
+memmap2 = "0.9.11"
 ordered-float = "5.3.0"
 parking_lot = "0.12.5"
 parquet = "58.2.0"
@@ -38,6 +40,7 @@ prost = "0.14.4"
 reedline = "0.38.0"
 reqwest = { version = "0.13.3", features = ["json"] }
 rkyv = "0.8.16"
+roaring = "0.11.5"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 thiserror = "2.0.18"
@@ -57,3 +60,8 @@ syntect = "5.3.0"
 
 # Testing, dev, misc.
 tempfile = "3.27.0"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3

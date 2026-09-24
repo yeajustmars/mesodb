@@ -5,6 +5,18 @@ use std::{fs, path::Path};
 
 use crate::error::MesoError;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Profile {
+    /// Strict low-memory profile (<50MB heap target) for embedded, IoT, or resource-constrained sidecars.
+    Embedded,
+    /// Balanced default profile suitable for standard cloud services (64MB MemTable buffer).
+    #[default]
+    Balanced,
+    /// High-throughput profile for dedicated database servers with abundant RAM (512MB MemTable, multi-threaded workers).
+    Server,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
@@ -16,8 +28,7 @@ pub struct Config {
 #[serde(rename_all = "lowercase")]
 pub enum WalSyncMode {
     /// Forces an OS-level fsync after every single transaction.
-    /// Maximum ACID compliance (zero data loss on power failure), but severely limits write throughput.
-    // TODO: Make Background the default for speed, let user decide on durability guarantees.
+    /// Maximum ACID compliance (zero data loss on power failure), but limits write throughput.
     #[default]
     Strict,
     /// Writes to the WAL but lets the OS determine when to actually sync to disk.
@@ -56,25 +67,84 @@ pub struct CompactorConfig {
 
 impl Default for StorageConfig {
     fn default() -> Self {
-        Self {
-            memtable_max_rows: 50_000,
-            memtable_max_bytes: 64 * 1024 * 1024, // 64 MB
-            wal_sync_mode: WalSyncMode::Strict,
-            allow_jit_schema: true,
-        }
+        Self::for_profile(Profile::Balanced)
     }
 }
 
 impl Default for CompactorConfig {
     fn default() -> Self {
-        Self {
-            worker_threads: 2,
-            backpressure_threshold: 10,
+        Self::for_profile(Profile::Balanced)
+    }
+}
+
+impl StorageConfig {
+    pub fn for_profile(profile: Profile) -> Self {
+        match profile {
+            Profile::Embedded => Self {
+                memtable_max_rows: 10_000,
+                memtable_max_bytes: 16 * 1024 * 1024, // 16 MB (Leaves ample margin for <50MB total heap budget)
+                wal_sync_mode: WalSyncMode::Strict,
+                allow_jit_schema: true,
+            },
+            Profile::Balanced => Self {
+                memtable_max_rows: 50_000,
+                memtable_max_bytes: 64 * 1024 * 1024, // 64 MB
+                wal_sync_mode: WalSyncMode::Strict,
+                allow_jit_schema: true,
+            },
+            Profile::Server => Self {
+                memtable_max_rows: 500_000,
+                memtable_max_bytes: 512 * 1024 * 1024, // 512 MB
+                wal_sync_mode: WalSyncMode::Background,
+                allow_jit_schema: true,
+            },
+        }
+    }
+}
+
+impl CompactorConfig {
+    pub fn for_profile(profile: Profile) -> Self {
+        match profile {
+            Profile::Embedded => Self {
+                worker_threads: 1,
+                backpressure_threshold: 2, // Low tolerance for un-compacted tables in RAM
+            },
+            Profile::Balanced => Self {
+                worker_threads: 2,
+                backpressure_threshold: 10,
+            },
+            Profile::Server => Self {
+                worker_threads: 8,
+                backpressure_threshold: 32, // Can buffer bursty writes in RAM during peak traffic
+            },
         }
     }
 }
 
 impl Config {
+    /// Generates a configuration preset for a specific operational target profile.
+    pub fn for_profile(profile: Profile) -> Self {
+        Self {
+            storage: StorageConfig::for_profile(profile),
+            compactor: CompactorConfig::for_profile(profile),
+        }
+    }
+
+    /// Convenience shortcut for embedded/low-memory environments (<50MB heap target).
+    pub fn embedded() -> Self {
+        Self::for_profile(Profile::Embedded)
+    }
+
+    /// Convenience shortcut for balanced default cloud deployments.
+    pub fn balanced() -> Self {
+        Self::for_profile(Profile::Balanced)
+    }
+
+    /// Convenience shortcut for high-throughput server deployments with abundant RAM.
+    pub fn server() -> Self {
+        Self::for_profile(Profile::Server)
+    }
+
     /// Loads a configuration from a TOML file path.
     /// If the file does not exist, it falls back to the Default configuration.
     pub fn load_or_default<P: AsRef<Path>>(path: P) -> Result<Self, MesoError> {
@@ -96,6 +166,22 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_embedded_profile_limits() {
+        let config = Config::embedded();
+        assert_eq!(config.storage.memtable_max_bytes, 16 * 1024 * 1024);
+        assert_eq!(config.compactor.worker_threads, 1);
+        assert_eq!(config.compactor.backpressure_threshold, 2);
+    }
+
+    #[test]
+    fn test_server_profile_limits() {
+        let config = Config::server();
+        assert_eq!(config.storage.memtable_max_bytes, 512 * 1024 * 1024);
+        assert_eq!(config.storage.wal_sync_mode, WalSyncMode::Background);
+        assert_eq!(config.compactor.worker_threads, 8);
+    }
 
     #[test]
     fn test_parse_toml_config() {
@@ -131,7 +217,7 @@ mod tests {
 
         let config = Config::from_toml(toml_str).unwrap();
 
-        // Should use defaults for everything missing
+        // Should use defaults (Balanced) for everything missing
         assert_eq!(config.storage.memtable_max_rows, 50_000);
         assert_eq!(config.storage.wal_sync_mode, WalSyncMode::Strict);
 

@@ -1,10 +1,9 @@
 // mesodb-core/src/db.rs
 
-use arrow::record_batch::RecordBatch;
+use arrow::{array::Array, record_batch::RecordBatch};
 use datafusion::prelude::*;
 use parking_lot::RwLock;
 use std::{
-    collections::BTreeMap,
     fs::create_dir_all,
     path::{Path, PathBuf},
     sync::Arc,
@@ -12,6 +11,8 @@ use std::{
 use tokio::sync::{Mutex, mpsc};
 
 use crate::{
+    bitmap::BitmapStore,
+    btree::NowIndex,
     config::Config,
     error::MesoError,
     formatter,
@@ -39,20 +40,37 @@ impl MesoDB {
         create_dir_all(&data_dir)?;
         create_dir_all(data_dir.join("parquet"))?;
 
-        // Destructure the tuple to grab the recovered RAM batch
+        // Initialize Tier 1 B+Trees (Owned by the background worker)
+        let now_index = NowIndex::open(data_dir.join("now.idx"))?;
+        let bitmap_store = BitmapStore::open(data_dir.join("bitmaps.idx"))?;
+        let avt_index = crate::btree::AvtIndex::open(data_dir.join("avt.idx"))?; // NEW
+
+        // Take initial snapshots for WorldView
+        let now_snap = Arc::new(now_index.snapshot());
+        let bitmap_snap = Arc::new(bitmap_store.snapshot());
+        let avt_snap = Arc::new(avt_index.snapshot()); // NEW
+
         let (transactor, recovered_batch) = Transactor::new(path, schema.clone(), config.clone())?;
 
-        let mut initial_ram = BTreeMap::new();
+        let mut initial_ram = Vec::new();
+        let mut initial_dirty = ahash::AHashSet::new();
         let empty_batch = MemTable::new(0).finish()?;
-        initial_ram.insert(0, empty_batch);
 
-        // If we recovered uncompacted data, mount it. Otherwise, mount an empty schema batch.
         if recovered_batch.num_rows() > 0 {
-            // Use the current_tx_id as the key so the background flusher can eventually process it
-            initial_ram.insert(transactor.current_tx_id, recovered_batch);
+            initial_ram.push((0, empty_batch.clone()));
+            initial_ram.push((transactor.current_tx_id, recovered_batch.clone()));
+
+            if let Some(e_col) = recovered_batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+            {
+                for i in 0..recovered_batch.num_rows() {
+                    initial_dirty.insert(e_col.value(i));
+                }
+            }
         } else {
-            let empty_batch = MemTable::new(0).finish()?;
-            initial_ram.insert(0, empty_batch);
+            initial_ram.push((0, empty_batch));
         }
 
         let world_view = Arc::new(RwLock::new(Arc::new(WorldView {
@@ -60,10 +78,24 @@ impl MesoDB {
             data_dir: data_dir.clone(),
             schema: Arc::new(schema),
             timeline: Arc::new(transactor.timeline.clone()),
+            now_index: now_snap,
+            bitmap_index: bitmap_snap,
+            avt_index: avt_snap, // NEW
+            dirty_entities: Arc::new(initial_dirty),
         })));
 
         let (flush_tx, flush_rx) = mpsc::channel(config.compactor.backpressure_threshold);
-        Self::spawn_background_worker(data_dir, flush_rx, world_view.clone());
+
+        // Pass mutable B-Trees to the background worker
+        Self::spawn_background_worker(
+            data_dir,
+            flush_rx,
+            world_view.clone(),
+            config.clone(),
+            now_index,
+            bitmap_store,
+            avt_index, // NEW
+        );
 
         Ok(Self {
             transactor: Mutex::new(transactor),
@@ -72,39 +104,182 @@ impl MesoDB {
         })
     }
 
-    /// The Background Worker: Listens for RAM batches, writes to disk, and drops them from RAM.
     fn spawn_background_worker(
         data_dir: PathBuf,
         mut flush_rx: mpsc::Receiver<(u64, RecordBatch)>,
         world_view: Arc<RwLock<Arc<WorldView>>>,
+        config: Config,
+        mut now_index: crate::btree::NowIndex,
+        mut bitmap_store: crate::bitmap::BitmapStore,
+        mut avt_index: crate::btree::AvtIndex, // NEW
     ) {
         tokio::spawn(async move {
             let compactor = BackgroundCompactor::new(data_dir);
+            let mut uncompacted_files = Vec::new();
+            let mut evict_queue = Vec::with_capacity(20);
+            const EVICT_THRESHOLD: usize = 20;
 
             while let Some((tx_id, batch)) = flush_rx.recv().await {
-                // Write the batch to a Parquet file
-                if let Err(e) = compactor.flush_to_parquet(batch, tx_id) {
-                    eprintln!("Failed to flush Tx {} to Parquet: {:?}", tx_id, e);
-                    continue; // Keep it in RAM if disk fails
+                if let Err(e) = Self::update_indexes_from_batch(
+                    &mut now_index,
+                    &mut bitmap_store,
+                    &mut avt_index,
+                    &batch,
+                ) {
+                    eprintln!(
+                        "Warning: Failed to update background indexes for Tx {}: {:?}",
+                        tx_id, e
+                    );
                 }
 
-                // OPTION 1: IN-LOCK MUTATION (Fixes the split-lock bug)
-                let mut writer = world_view.write();
+                let file_path = match compactor.flush_to_parquet(batch, tx_id) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        eprintln!("Failed to flush Tx {} to Parquet: {:?}", tx_id, e);
+                        continue;
+                    }
+                };
+                uncompacted_files.push(file_path);
+                evict_queue.push(tx_id);
 
-                let current_view = writer.as_ref().clone();
-                let mut new_ram = current_view.ram_batches.as_ref().clone();
-                new_ram.remove(&tx_id);
+                let trigger_compaction =
+                    uncompacted_files.len() >= config.compactor.backpressure_threshold;
+                let trigger_eviction = evict_queue.len() >= EVICT_THRESHOLD;
 
-                let new_view = Arc::new(WorldView {
-                    ram_batches: Arc::new(new_ram),
-                    data_dir: current_view.data_dir.clone(),
-                    schema: current_view.schema.clone(),
-                    timeline: current_view.timeline.clone(),
-                });
+                if trigger_eviction || trigger_compaction {
+                    let _ = now_index.flush();
+                    let _ = bitmap_store.flush();
+                    let _ = avt_index.flush(); // NEW
 
-                *writer = new_view;
+                    let new_now_snap = Arc::new(now_index.snapshot());
+                    let new_bitmap_snap = Arc::new(bitmap_store.snapshot());
+                    let new_avt_snap = Arc::new(avt_index.snapshot()); // NEW
+
+                    {
+                        let mut writer = world_view.write();
+                        let world_view_mut = Arc::make_mut(&mut *writer);
+                        let ram_vec_mut = Arc::make_mut(&mut world_view_mut.ram_batches);
+
+                        ram_vec_mut.retain(|(id, _)| !evict_queue.contains(id));
+
+                        let mut remaining_dirty = ahash::AHashSet::new();
+                        for (_, b) in ram_vec_mut.iter() {
+                            if let Some(e_col) = b
+                                .column(0)
+                                .as_any()
+                                .downcast_ref::<arrow::array::UInt64Array>()
+                            {
+                                for i in 0..b.num_rows() {
+                                    remaining_dirty.insert(e_col.value(i));
+                                }
+                            }
+                        }
+                        world_view_mut.dirty_entities = Arc::new(remaining_dirty);
+                        world_view_mut.now_index = new_now_snap;
+                        world_view_mut.bitmap_index = new_bitmap_snap;
+                        world_view_mut.avt_index = new_avt_snap; // NEW
+                    }
+                    evict_queue.clear();
+                }
+
+                if trigger_compaction {
+                    let files_to_compact = std::mem::take(&mut uncompacted_files);
+                    let compactor_clone = compactor.clone();
+
+                    tokio::spawn(async move {
+                        if let Err(e) = compactor_clone.compact(&files_to_compact, tx_id).await {
+                            eprintln!("Background compaction failed for Tx {}: {:?}", tx_id, e);
+                        }
+                    });
+                }
             }
         });
+    }
+
+    fn update_indexes_from_batch(
+        now_index: &mut crate::btree::NowIndex,
+        bitmap_store: &mut crate::bitmap::BitmapStore,
+        avt_index: &mut crate::btree::AvtIndex, // NEW
+        batch: &RecordBatch,
+    ) -> Result<()> {
+        let e_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .ok_or_else(|| MesoError::Serialization("Missing e column".into()))?;
+        let a_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt32Array>()
+            .ok_or_else(|| MesoError::Serialization("Missing a column".into()))?;
+        let v_bool = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .ok_or_else(|| MesoError::Serialization("Missing v_bool".into()))?;
+        let v_int = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .ok_or_else(|| MesoError::Serialization("Missing v_int".into()))?;
+        let v_float = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<arrow::array::Float64Array>()
+            .ok_or_else(|| MesoError::Serialization("Missing v_float".into()))?;
+        let v_str = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .ok_or_else(|| MesoError::Serialization("Missing v_str".into()))?;
+        let v_ref = batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .ok_or_else(|| MesoError::Serialization("Missing v_ref".into()))?;
+        let v_time = batch
+            .column(7)
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+            .ok_or_else(|| MesoError::Serialization("Missing v_time".into()))?;
+        let op_col = batch
+            .column(10)
+            .as_any()
+            .downcast_ref::<arrow::array::BooleanArray>()
+            .ok_or_else(|| MesoError::Serialization("Missing op".into()))?;
+
+        for i in 0..batch.num_rows() {
+            let e = e_col.value(i);
+            let a = a_col.value(i);
+            let op = op_col.value(i);
+
+            let val = if v_bool.is_valid(i) {
+                Value::Boolean(v_bool.value(i))
+            } else if v_int.is_valid(i) {
+                Value::Int64(v_int.value(i))
+            } else if v_float.is_valid(i) {
+                Value::Float64(v_float.value(i))
+            } else if v_str.is_valid(i) {
+                Value::String(v_str.value(i).to_string())
+            } else if v_ref.is_valid(i) {
+                Value::Ref(v_ref.value(i))
+            } else if v_time.is_valid(i) {
+                Value::Timestamp(v_time.value(i))
+            } else {
+                continue;
+            };
+
+            if op {
+                let _ = now_index.put(e, a, &val);
+                let _ = bitmap_store.put(a, &val, e, true);
+                let _ = avt_index.put(a, &val, e, true); // NEW
+            } else {
+                let _ = now_index.delete(e, a);
+                let _ = bitmap_store.put(a, &val, e, false);
+                let _ = avt_index.put(a, &val, e, false); // NEW
+            }
+        }
+        Ok(())
     }
 
     /// Takes an IMMUTABLE reference (&self).
@@ -120,33 +295,32 @@ impl MesoDB {
     }
 
     /// Exposes explicit schema definition to the outside world.
-    /// Batches multiple attribute creations into a single locked transaction.
     pub async fn transact_schema(
         &self,
         attributes: Vec<AttributeDefinition>,
     ) -> Result<Vec<Arc<Attribute>>> {
-        let mut tx = self.transactor.lock().await;
-        let mut added_attrs = Vec::with_capacity(attributes.len());
+        let (added_attrs, sync_rx) = {
+            let mut tx = self.transactor.lock().await;
+            let mut added_attrs = Vec::with_capacity(attributes.len());
 
-        for attr in attributes {
-            let added = tx.transact_schema(&attr.ident, attr.value_type, attr.is_unique)?;
-            added_attrs.push(added);
-        }
+            for attr in attributes {
+                let added = tx.transact_schema(&attr.ident, attr.value_type, attr.is_unique)?;
+                added_attrs.push(added);
+            }
 
-        // If we actually added anything, we must publish the new schema to RAM
-        // so that read-queries can instantly recognize the new attributes.
-        if !added_attrs.is_empty() {
-            let mut writer = self.world_view.write();
-            let current_view = writer.as_ref().clone();
+            if !added_attrs.is_empty() {
+                let mut writer = self.world_view.write();
+                let world_view_mut = Arc::make_mut(&mut *writer);
+                world_view_mut.schema = Arc::new(tx.schema.clone());
+                world_view_mut.timeline = Arc::new(tx.timeline.clone());
+            }
 
-            let new_view = Arc::new(WorldView {
-                ram_batches: current_view.ram_batches.clone(), // Data is unchanged
-                data_dir: current_view.data_dir.clone(),
-                schema: Arc::new(tx.schema.clone()),
-                timeline: Arc::new(tx.timeline.clone()),
-            });
+            (added_attrs, tx.take_sync_rx())
+        };
 
-            *writer = new_view;
+        // Await the physical disk sync entirely outside the Transactor lock!
+        if let Some(rx) = sync_rx {
+            let _ = rx.await;
         }
 
         Ok(added_attrs)
@@ -154,45 +328,60 @@ impl MesoDB {
 
     /// DRY helper that handles the lock, the transaction, and the lock-free WorldView pointer swap.
     async fn execute(&self, facts: Vec<Fact>, custom_now: Option<i64>) -> Result<TxReport> {
-        let mut tx = self.transactor.lock().await;
-        let report = match custom_now {
-            Some(t) => tx.transact_at(facts, t)?,
-            None => tx.transact(facts)?,
+        let (report, sync_rx, trigger_flush) = {
+            let mut tx = self.transactor.lock().await;
+            let report = match custom_now {
+                Some(t) => tx.transact_at(facts, t)?,
+                None => tx.transact(facts)?,
+            };
+
+            if report.datoms_written > 0 {
+                let batch_clone = report.batch.clone();
+                let new_schema = Arc::new(tx.schema.clone());
+                let new_timeline = Arc::new(tx.timeline.clone());
+
+                let mut writer = self.world_view.write();
+
+                let world_view_mut = Arc::make_mut(&mut *writer);
+                world_view_mut.schema = new_schema;
+                world_view_mut.timeline = new_timeline;
+
+                let ram_vec_mut = Arc::make_mut(&mut world_view_mut.ram_batches);
+                ram_vec_mut.push((report.tx_id, batch_clone.clone()));
+
+                // Insert dirty entities into WorldView
+                let dirty_mut = Arc::make_mut(&mut world_view_mut.dirty_entities);
+                if let Some(e_col) = batch_clone
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::UInt64Array>()
+                {
+                    for i in 0..batch_clone.num_rows() {
+                        dirty_mut.insert(e_col.value(i));
+                    }
+                }
+            }
+
+            let trigger_flush = report.datoms_written > 0
+                && report.batch.num_rows() >= tx.config.storage.memtable_max_rows;
+
+            (report, tx.take_sync_rx(), trigger_flush)
         };
 
-        if report.datoms_written > 0 {
-            let batch_clone = report.batch.clone();
-            let new_schema = Arc::new(tx.schema.clone());
-            let new_timeline = Arc::new(tx.timeline.clone());
+        // 1. Await the physical disk sync outside the Transactor lock
+        if let Some(rx) = sync_rx {
+            let _ = rx.await;
+        }
 
-            // OPTION 1: IN-LOCK MUTATION
-            {
-                let mut writer = self.world_view.write();
-                let current_view = writer.as_ref().clone();
-
-                let mut new_ram = current_view.ram_batches.as_ref().clone();
-                new_ram.insert(report.tx_id, batch_clone);
-
-                let new_view = Arc::new(WorldView {
-                    ram_batches: Arc::new(new_ram),
-                    data_dir: current_view.data_dir.clone(),
-                    schema: new_schema,
-                    timeline: new_timeline,
-                });
-
-                *writer = new_view;
-            } // Write lock releases instantly here!
-
-            // --- THE COMPACTION COMPLIANCE THRESHOLD ---
-            if report.batch.num_rows() >= tx.config.storage.memtable_max_rows
-                && self
-                    .flush_tx
-                    .send((report.tx_id, report.batch.clone()))
-                    .await
-                    .is_err()
-            {
-                eprintln!("Warning: Background flusher disconnected.");
-            }
+        // 2. Dispatch to the background compactor outside the lock
+        if trigger_flush
+            && self
+                .flush_tx
+                .send((report.tx_id, report.batch.clone()))
+                .await
+                .is_err()
+        {
+            eprintln!("Warning: Background flusher disconnected.");
         }
 
         Ok(report)
@@ -201,6 +390,695 @@ impl MesoDB {
     // =====================================================================
     // STANDARD QUERY API PIPELINE
     // =====================================================================
+
+    /// Evaluates if an AST qualifies for the Tier 1 zero-copy Fast-Path.
+    /// If it does, it queries the memory-mapped B+Tree and short-circuits DataFusion entirely.
+    fn try_fast_path(
+        &self,
+        ast: &crate::ast::Query,
+        options: &QueryOptions,
+        view: &WorldView,
+    ) -> Result<Option<Vec<RecordBatch>>> {
+        // Must be a "Now" query
+        if options.history || options.as_of.is_some() || options.rules.is_some() {
+            return Ok(None);
+        }
+
+        // --- PATTERN 1 & 2: Single or Multi-Attribute EAV Point Lookup ---
+        // Match [:find ?v1 ... :where [101 :attr1 ?v1] [101 :attr2 ?v2]]
+        let is_eav_candidate = !ast.find.is_empty()
+            && ast
+                .find
+                .iter()
+                .all(|f| matches!(f, crate::ast::FindSpec::Variable(_)))
+            && !ast.where_clauses.is_empty()
+            && ast.where_clauses.iter().all(|w| {
+                matches!(
+                    w,
+                    crate::ast::WhereClause::DataPattern {
+                        tx: None,
+                        op: None,
+                        ..
+                    }
+                )
+            });
+
+        if is_eav_candidate {
+            let mut target_entity = None;
+            let mut clause_bindings = Vec::new();
+
+            for clause in &ast.where_clauses {
+                if let crate::ast::WhereClause::DataPattern { e, a, v, .. } = clause {
+                    let e_id = match e {
+                        crate::ast::Term::Integer(id) => *id as u64,
+                        _ => return Ok(None), // Must be a constant Entity ID
+                    };
+
+                    if let Some(existing_e) = target_entity {
+                        if existing_e != e_id {
+                            return Ok(None); // All clauses in fast-path must target the same entity
+                        }
+                    } else {
+                        target_entity = Some(e_id);
+                    }
+
+                    let a_ident = match a {
+                        crate::ast::Term::Keyword(kw) => kw,
+                        _ => return Ok(None),
+                    };
+
+                    let v_var = match v {
+                        crate::ast::Term::Variable(var) => var,
+                        _ => return Ok(None),
+                    };
+
+                    clause_bindings.push((a_ident, v_var));
+                }
+            }
+
+            let e_id = match target_entity {
+                Some(id) => id,
+                None => return Ok(None),
+            };
+
+            // Fast O(1) dirty check!
+            if view.dirty_entities.contains(&e_id) {
+                return Ok(None); // Let DataFusion resolve pending RAM state
+            }
+
+            // Direct B+Tree lookup
+            let now_index = &view.now_index;
+            let mut fields = Vec::new();
+            let mut arrays: Vec<Arc<dyn arrow::array::Array>> = Vec::new();
+
+            for find_spec in &ast.find {
+                if let crate::ast::FindSpec::Variable(find_var) = find_spec {
+                    let binding = clause_bindings.iter().find(|(_, v_var)| *v_var == find_var);
+                    let a_ident = match binding {
+                        Some((a_kw, _)) => a_kw,
+                        None => return Ok(None),
+                    };
+
+                    let a_id = match view.schema.get_id(a_ident) {
+                        Some(id) => id,
+                        None => return Ok(Some(vec![])), // Attribute doesn't exist
+                    };
+
+                    let clean_var = find_var.replace("?", "");
+                    if let Some(val) = now_index.get(e_id, a_id)? {
+                        let (field, array) = Self::val_to_arrow_column(&clean_var, &val);
+                        fields.push(field);
+                        arrays.push(array);
+                    } else {
+                        return Ok(Some(vec![])); // Value missing for entity
+                    }
+                }
+            }
+
+            let schema = Arc::new(arrow::datatypes::Schema::new(fields));
+            let batch = RecordBatch::try_new(schema, arrays).map_err(MesoError::Arrow)?;
+            return Ok(Some(vec![batch]));
+        }
+
+        // --- PATTERN 3: Inverted AVE Lookup ---
+        // Match [:find ?e :where [?e :attr "literal_value"]]
+        if ast.find.len() == 1
+            && ast.where_clauses.len() == 1
+            && let crate::ast::FindSpec::Variable(find_var) = &ast.find[0]
+            && let crate::ast::WhereClause::DataPattern {
+                e,
+                a,
+                v,
+                tx: None,
+                op: None,
+            } = &ast.where_clauses[0]
+            && let (crate::ast::Term::Variable(e_var), crate::ast::Term::Keyword(a_ident)) = (e, a)
+            && e_var == find_var
+        {
+            let literal_val = match v {
+                crate::ast::Term::String(s) => Some(Value::String(s.clone())),
+                crate::ast::Term::Integer(i) => Some(Value::Int64(*i)),
+                crate::ast::Term::Boolean(b) => Some(Value::Boolean(*b)),
+                crate::ast::Term::Float(f) => Some(Value::Float64(*f)),
+                _ => None,
+            };
+
+            if let Some(val) = literal_val
+                && let Some(a_id) = view.schema.get_id(a_ident)
+            {
+                if !view.dirty_entities.is_empty() {
+                    return Ok(None);
+                }
+
+                let bitmap_index = &view.bitmap_index;
+                if let Some(treemap) = bitmap_index.get(a_id, &val)? {
+                    let clean_var = find_var.replace("?", "");
+                    let field = arrow::datatypes::Field::new(
+                        &clean_var,
+                        arrow::datatypes::DataType::UInt64,
+                        true,
+                    );
+
+                    // Massive Upgrade: Return all matching entities at once via RoaringTreemap IntoIterator!
+                    let entities: Vec<u64> = treemap.into_iter().collect();
+
+                    let array = Arc::new(arrow::array::UInt64Array::from(entities));
+                    let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
+                    let batch =
+                        RecordBatch::try_new(schema, vec![array]).map_err(MesoError::Arrow)?;
+
+                    return Ok(Some(vec![batch]));
+                } else {
+                    return Ok(Some(vec![]));
+                }
+            }
+        }
+
+        // --- PATTERN 4: Constant Entity Pull ---
+        // Match [:find (pull 101 [:user/name :user/age]) :where ...]
+        if ast.find.len() == 1
+            && ast.where_clauses.len() == 1
+            && let crate::ast::FindSpec::Pull(var, pattern) = &ast.find[0]
+            && let crate::ast::WhereClause::DataPattern { e, .. } = &ast.where_clauses[0]
+            && let crate::ast::Term::Integer(e_id) = e
+        {
+            let entity_id = *e_id as u64;
+            if view.dirty_entities.contains(&entity_id) {
+                return Ok(None);
+            }
+
+            let now_index = &view.now_index;
+            let clean_var = var.replace("?", "");
+
+            // Direct zero-copy JSON/EDN builder for constant entity pull
+            let mut map_pairs = Vec::new();
+
+            for pull_attr in &pattern.0 {
+                if let crate::ast::PullAttribute::Simple(a_ident) = pull_attr
+                    && let Some(a_id) = view.schema.get_id(a_ident)
+                    && let Some(val) = now_index.get(entity_id, a_id)?
+                {
+                    let formatted_val = match options.format {
+                        OutputFormat::Json => match val {
+                            Value::String(s) => format!("\"{}\"", s),
+                            Value::Int64(i) => i.to_string(),
+                            Value::Float64(f) => f.to_string(),
+                            Value::Boolean(b) => b.to_string(),
+                            Value::Ref(r) => r.to_string(),
+                            _ => "null".to_string(),
+                        },
+                        _ => match val {
+                            Value::String(s) => format!("\"{}\"", s),
+                            _ => val.to_string(),
+                        },
+                    };
+                    let key_name = if options.format == OutputFormat::Edn {
+                        a_ident.clone()
+                    } else {
+                        a_ident.trim_start_matches(':').to_string()
+                    };
+                    map_pairs.push((key_name, formatted_val));
+                }
+            }
+
+            let pull_json = if options.format == OutputFormat::Edn {
+                let entry_strs: Vec<String> = map_pairs
+                    .iter()
+                    .map(|(k, v)| format!("{} {}", k, v))
+                    .collect();
+                format!("{{{}}}", entry_strs.join(" "))
+            } else {
+                let entry_strs: Vec<String> = map_pairs
+                    .iter()
+                    .map(|(k, v)| format!("\"{}\":{}", k, v))
+                    .collect();
+                format!("{{{}}}", entry_strs.join(","))
+            };
+
+            let field =
+                arrow::datatypes::Field::new(&clean_var, arrow::datatypes::DataType::Utf8, true);
+            let array = Arc::new(arrow::array::StringArray::from(vec![pull_json]));
+            let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
+            let batch = RecordBatch::try_new(schema, vec![array]).map_err(MesoError::Arrow)?;
+            return Ok(Some(vec![batch]));
+        }
+
+        // --- PATTERN 5: Bitmap Intersection (Simple Relational Join) ---
+        // Match [:find ?v2 :where [?e :attr1 "literal"] [?e :attr2 ?v2]]
+        if ast.find.len() == 1
+            && ast.where_clauses.len() == 2
+            && let crate::ast::FindSpec::Variable(find_var) = &ast.find[0]
+        {
+            let mut literal_clause = None;
+            let mut proj_clause = None;
+
+            for clause in &ast.where_clauses {
+                if let crate::ast::WhereClause::DataPattern {
+                    e,
+                    a,
+                    v,
+                    tx: None,
+                    op: None,
+                } = clause
+                    && let (crate::ast::Term::Variable(e_var), crate::ast::Term::Keyword(a_kw)) =
+                        (e, a)
+                {
+                    match v {
+                        crate::ast::Term::Variable(v_var) => {
+                            proj_clause = Some((e_var, a_kw, v_var))
+                        }
+                        _ => literal_clause = Some((e_var, a_kw, v)),
+                    }
+                }
+            }
+
+            if let (Some((e_var1, a_kw1, v_lit)), Some((e_var2, a_kw2, v_var))) =
+                (literal_clause, proj_clause)
+                && e_var1 == e_var2
+                && v_var == find_var
+            {
+                let literal_val = match v_lit {
+                    crate::ast::Term::String(s) => Some(Value::String(s.clone())),
+                    crate::ast::Term::Integer(i) => Some(Value::Int64(*i)),
+                    crate::ast::Term::Boolean(b) => Some(Value::Boolean(*b)),
+                    crate::ast::Term::Float(f) => Some(Value::Float64(*f)),
+                    _ => None,
+                };
+
+                if let Some(val) = literal_val
+                    && let Some(a_id1) = view.schema.get_id(a_kw1)
+                    && let Some(a_id2) = view.schema.get_id(a_kw2)
+                    && view.dirty_entities.is_empty()
+                    && let Some(treemap) = view.bitmap_index.get(a_id1, &val)?
+                {
+                    let mut results = Vec::new();
+                    for e_id in treemap {
+                        if let Some(proj_val) = view.now_index.get(e_id, a_id2)? {
+                            results.push(proj_val);
+                        }
+                    }
+
+                    if results.is_empty() {
+                        return Ok(Some(vec![]));
+                    }
+
+                    let clean_var = find_var.replace("?", "");
+                    let (field, array) = Self::vals_to_arrow_column(&clean_var, &results);
+                    let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
+                    let batch =
+                        RecordBatch::try_new(schema, vec![array]).map_err(MesoError::Arrow)?;
+
+                    return Ok(Some(vec![batch]));
+                } else {
+                    return Ok(Some(vec![]));
+                }
+            }
+        }
+
+        // --- PATTERN 6: Entity ID Range Scan ---
+        // Match [:find ?v :where [?e :attr ?v] [(>= ?e 100)] [(<= ?e 200)]]
+        if ast.find.len() == 1
+            && !ast.where_clauses.is_empty()
+            && let crate::ast::FindSpec::Variable(find_var) = &ast.find[0]
+        {
+            let mut dp_clause = None;
+            let mut funcs = Vec::new();
+            let mut is_valid = true;
+
+            for clause in &ast.where_clauses {
+                match clause {
+                    crate::ast::WhereClause::DataPattern {
+                        e,
+                        a,
+                        v,
+                        tx: None,
+                        op: None,
+                    } => {
+                        if dp_clause.is_none() {
+                            dp_clause = Some((e, a, v));
+                        } else {
+                            is_valid = false;
+                        }
+                    }
+                    crate::ast::WhereClause::Function {
+                        fn_name,
+                        args,
+                        binding: None,
+                    } => {
+                        funcs.push((fn_name, args));
+                    }
+                    _ => is_valid = false,
+                }
+            }
+
+            if is_valid
+                && !funcs.is_empty()
+                && let Some((
+                    crate::ast::Term::Variable(e_var),
+                    crate::ast::Term::Keyword(a_ident),
+                    crate::ast::Term::Variable(v_var),
+                )) = dp_clause
+                && (find_var == v_var || find_var == e_var)
+            {
+                let mut e_min = 0u64;
+                let mut e_max = u64::MAX;
+                let mut bounds_applied = false;
+
+                for (fn_name, args) in funcs {
+                    if args.len() == 2
+                        && let crate::ast::Term::Variable(arg_var) = &args[0]
+                        && arg_var == e_var
+                        && let crate::ast::Term::Integer(limit) = &args[1]
+                    {
+                        let lim = *limit as u64;
+                        match fn_name.as_str() {
+                            ">" => e_min = e_min.max(lim.saturating_add(1)),
+                            ">=" => e_min = e_min.max(lim),
+                            "<" => e_max = e_max.min(lim.saturating_sub(1)),
+                            "<=" => e_max = e_max.min(lim),
+                            _ => is_valid = false,
+                        }
+                        bounds_applied = true;
+                    } else {
+                        is_valid = false;
+                    }
+                }
+
+                if is_valid
+                    && bounds_applied
+                    && view.dirty_entities.is_empty()
+                    && let Some(a_id) = view.schema.get_id(a_ident)
+                {
+                    let kvs = view.now_index.range_scan(e_min, e_max, a_id)?;
+                    if kvs.is_empty() {
+                        return Ok(Some(vec![]));
+                    }
+
+                    let clean_var = find_var.replace("?", "");
+
+                    let (field, array) = if find_var == e_var {
+                        let e_vec: Vec<u64> = kvs.into_iter().map(|(e, _)| e).collect();
+                        (
+                            arrow::datatypes::Field::new(
+                                &clean_var,
+                                arrow::datatypes::DataType::UInt64,
+                                true,
+                            ),
+                            Arc::new(arrow::array::UInt64Array::from(e_vec))
+                                as Arc<dyn arrow::array::Array>,
+                        )
+                    } else {
+                        let v_vec: Vec<Value> = kvs.into_iter().map(|(_, v)| v).collect();
+                        Self::vals_to_arrow_column(&clean_var, &v_vec)
+                    };
+
+                    let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
+                    let batch =
+                        RecordBatch::try_new(schema, vec![array]).map_err(MesoError::Arrow)?;
+                    return Ok(Some(vec![batch]));
+                }
+            }
+        }
+
+        // --- PATTERN 7: Value Range Scan (AvtIndex) ---
+        // Match [:find ?e :where [?e :attr ?v] [(>= ?v 100)] [(<= ?v 200)]]
+        if ast.find.len() == 1
+            && !ast.where_clauses.is_empty()
+            && let crate::ast::FindSpec::Variable(find_var) = &ast.find[0]
+        {
+            let mut dp_clause = None;
+            let mut funcs = Vec::new();
+            let mut is_valid = true;
+
+            for clause in &ast.where_clauses {
+                match clause {
+                    crate::ast::WhereClause::DataPattern {
+                        e,
+                        a,
+                        v,
+                        tx: None,
+                        op: None,
+                    } => {
+                        if dp_clause.is_none() {
+                            dp_clause = Some((e, a, v));
+                        } else {
+                            is_valid = false;
+                        }
+                    }
+                    crate::ast::WhereClause::Function {
+                        fn_name,
+                        args,
+                        binding: None,
+                    } => {
+                        funcs.push((fn_name, args));
+                    }
+                    _ => is_valid = false,
+                }
+            }
+
+            if is_valid
+                && !funcs.is_empty()
+                && let Some((
+                    crate::ast::Term::Variable(e_var),
+                    crate::ast::Term::Keyword(a_ident),
+                    crate::ast::Term::Variable(v_var),
+                )) = dp_clause
+                && (find_var == v_var || find_var == e_var)
+            {
+                let mut v_min = 0u64;
+                let mut v_max = u64::MAX;
+                let mut bounds_applied = false;
+
+                for (fn_name, args) in funcs {
+                    if args.len() == 2
+                        && let crate::ast::Term::Variable(arg_var) = &args[0]
+                        && arg_var == v_var
+                    {
+                        let enc_val = match &args[1] {
+                            crate::ast::Term::Integer(i) => Some(crate::page::encode_i64(*i)),
+                            crate::ast::Term::Float(f) => Some(crate::page::encode_f64(*f)),
+                            _ => None,
+                        };
+
+                        if let Some(lim) = enc_val {
+                            match fn_name.as_str() {
+                                ">" => v_min = v_min.max(lim.saturating_add(1)),
+                                ">=" => v_min = v_min.max(lim),
+                                "<" => v_max = v_max.min(lim.saturating_sub(1)),
+                                "<=" => v_max = v_max.min(lim),
+                                _ => is_valid = false,
+                            }
+                            bounds_applied = true;
+                        } else {
+                            is_valid = false;
+                        }
+                    } else {
+                        is_valid = false;
+                    }
+                }
+
+                if is_valid
+                    && bounds_applied
+                    && view.dirty_entities.is_empty()
+                    && let Some(a_id) = view.schema.get_id(a_ident)
+                {
+                    // Execute the scan against the 24-byte B-Tree keys!
+                    let e_ids = view.avt_index.range_scan(a_id, v_min, v_max)?;
+                    if e_ids.is_empty() {
+                        return Ok(Some(vec![]));
+                    }
+
+                    let clean_var = find_var.replace("?", "");
+
+                    let (field, array) = if find_var == e_var {
+                        (
+                            arrow::datatypes::Field::new(
+                                &clean_var,
+                                arrow::datatypes::DataType::UInt64,
+                                true,
+                            ),
+                            Arc::new(arrow::array::UInt64Array::from(e_ids))
+                                as Arc<dyn arrow::array::Array>,
+                        )
+                    } else {
+                        // If they asked for the value instead of the entity, fetch it via O(1) point lookups
+                        let mut v_vec = Vec::with_capacity(e_ids.len());
+                        for e_id in e_ids {
+                            if let Some(val) = view.now_index.get(e_id, a_id)? {
+                                v_vec.push(val);
+                            }
+                        }
+                        Self::vals_to_arrow_column(&clean_var, &v_vec)
+                    };
+
+                    let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
+                    let batch =
+                        RecordBatch::try_new(schema, vec![array]).map_err(MesoError::Arrow)?;
+                    return Ok(Some(vec![batch]));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn val_to_arrow_column(
+        name: &str,
+        val: &Value,
+    ) -> (arrow::datatypes::Field, Arc<dyn arrow::array::Array>) {
+        match val {
+            Value::String(s) => (
+                arrow::datatypes::Field::new(name, arrow::datatypes::DataType::Utf8, true),
+                Arc::new(arrow::array::StringArray::from(vec![s.clone()])),
+            ),
+            Value::Int64(i) => (
+                arrow::datatypes::Field::new(name, arrow::datatypes::DataType::Int64, true),
+                Arc::new(arrow::array::Int64Array::from(vec![*i])),
+            ),
+            Value::Float64(f) => (
+                arrow::datatypes::Field::new(name, arrow::datatypes::DataType::Float64, true),
+                Arc::new(arrow::array::Float64Array::from(vec![*f])),
+            ),
+            Value::Boolean(b) => (
+                arrow::datatypes::Field::new(name, arrow::datatypes::DataType::Boolean, true),
+                Arc::new(arrow::array::BooleanArray::from(vec![*b])),
+            ),
+            Value::Ref(r) => (
+                arrow::datatypes::Field::new(name, arrow::datatypes::DataType::UInt64, true),
+                Arc::new(arrow::array::UInt64Array::from(vec![*r])),
+            ),
+            Value::Timestamp(t) => (
+                arrow::datatypes::Field::new(
+                    name,
+                    arrow::datatypes::DataType::Timestamp(
+                        arrow::datatypes::TimeUnit::Microsecond,
+                        None,
+                    ),
+                    true,
+                ),
+                Arc::new(arrow::array::TimestampMicrosecondArray::from(vec![*t])),
+            ),
+            Value::Uuid(u) => {
+                let uuid_str = format!(
+                    "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                    u[0],
+                    u[1],
+                    u[2],
+                    u[3],
+                    u[4],
+                    u[5],
+                    u[6],
+                    u[7],
+                    u[8],
+                    u[9],
+                    u[10],
+                    u[11],
+                    u[12],
+                    u[13],
+                    u[14],
+                    u[15]
+                );
+                (
+                    arrow::datatypes::Field::new(name, arrow::datatypes::DataType::Utf8, true),
+                    Arc::new(arrow::array::StringArray::from(vec![uuid_str])),
+                )
+            }
+        }
+    }
+
+    fn vals_to_arrow_column(
+        name: &str,
+        vals: &[Value],
+    ) -> (arrow::datatypes::Field, Arc<dyn arrow::array::Array>) {
+        if vals.is_empty() {
+            return (
+                arrow::datatypes::Field::new(name, arrow::datatypes::DataType::Utf8, true),
+                Arc::new(arrow::array::StringArray::from(Vec::<String>::new())),
+            );
+        }
+        match &vals[0] {
+            Value::String(_) => {
+                let vec: Vec<String> = vals
+                    .iter()
+                    .map(|v| {
+                        if let Value::String(s) = v {
+                            s.clone()
+                        } else {
+                            "".to_string()
+                        }
+                    })
+                    .collect();
+                (
+                    arrow::datatypes::Field::new(name, arrow::datatypes::DataType::Utf8, true),
+                    Arc::new(arrow::array::StringArray::from(vec)),
+                )
+            }
+            Value::Int64(_) => {
+                let vec: Vec<i64> = vals
+                    .iter()
+                    .map(|v| if let Value::Int64(i) = v { *i } else { 0 })
+                    .collect();
+                (
+                    arrow::datatypes::Field::new(name, arrow::datatypes::DataType::Int64, true),
+                    Arc::new(arrow::array::Int64Array::from(vec)),
+                )
+            }
+            Value::Float64(_) => {
+                let vec: Vec<f64> = vals
+                    .iter()
+                    .map(|v| if let Value::Float64(f) = v { *f } else { 0.0 })
+                    .collect();
+                (
+                    arrow::datatypes::Field::new(name, arrow::datatypes::DataType::Float64, true),
+                    Arc::new(arrow::array::Float64Array::from(vec)),
+                )
+            }
+            Value::Boolean(_) => {
+                let vec: Vec<bool> = vals
+                    .iter()
+                    .map(|v| if let Value::Boolean(b) = v { *b } else { false })
+                    .collect();
+                (
+                    arrow::datatypes::Field::new(name, arrow::datatypes::DataType::Boolean, true),
+                    Arc::new(arrow::array::BooleanArray::from(vec)),
+                )
+            }
+            Value::Ref(_) => {
+                let vec: Vec<u64> = vals
+                    .iter()
+                    .map(|v| if let Value::Ref(r) = v { *r } else { 0 })
+                    .collect();
+                (
+                    arrow::datatypes::Field::new(name, arrow::datatypes::DataType::UInt64, true),
+                    Arc::new(arrow::array::UInt64Array::from(vec)),
+                )
+            }
+            Value::Timestamp(_) => {
+                let vec: Vec<i64> = vals
+                    .iter()
+                    .map(|v| if let Value::Timestamp(t) = v { *t } else { 0 })
+                    .collect();
+                (
+                    arrow::datatypes::Field::new(
+                        name,
+                        arrow::datatypes::DataType::Timestamp(
+                            arrow::datatypes::TimeUnit::Microsecond,
+                            None,
+                        ),
+                        true,
+                    ),
+                    Arc::new(arrow::array::TimestampMicrosecondArray::from(vec)),
+                )
+            }
+            Value::Uuid(_) => {
+                let vec: Vec<String> = vals.iter().map(|v| if let Value::Uuid(u) = v { format!("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}", u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]) } else { "".to_string() }).collect();
+                (
+                    arrow::datatypes::Field::new(name, arrow::datatypes::DataType::Utf8, true),
+                    Arc::new(arrow::array::StringArray::from(vec)),
+                )
+            }
+        }
+    }
 
     pub async fn query(&self, query_str: &str) -> Result<Vec<RecordBatch>> {
         self.query_with_options(query_str, QueryOptions::default())
@@ -214,6 +1092,12 @@ impl MesoDB {
     ) -> Result<Vec<RecordBatch>> {
         let ast = parser::parse_query(query_str)?;
         let view = { self.world_view.read().clone() };
+
+        // --- FAST PATH ROUTER ---
+        if let Some(fast_result) = self.try_fast_path(&ast, &options, &view)? {
+            return Ok(fast_result);
+        }
+
         let ctx = SessionContext::new();
         let ruleset = if let Some(r) = &options.rules {
             Some(parser::parse_ruleset(r)?)
@@ -221,7 +1105,7 @@ impl MesoDB {
             None
         };
 
-        let arrow_schema = view.ram_batches.get(&0).unwrap().schema();
+        let arrow_schema = view.ram_batches.first().unwrap().1.schema();
         let pq_options =
             datafusion::prelude::ParquetReadOptions::default().schema(arrow_schema.as_ref());
 
@@ -274,23 +1158,27 @@ impl MesoDB {
 
         let mut ram_vec: Vec<RecordBatch> = view
             .ram_batches
-            .values()
+            .iter()
+            .map(|(_, b)| b.clone())
             .filter(|b| b.num_rows() > 0)
-            .cloned()
             .collect();
+
         if ram_vec.is_empty() {
             ram_vec.push(arrow::record_batch::RecordBatch::new_empty(
                 arrow_schema.clone(),
             ));
         }
+
         let ram_provider =
             datafusion::datasource::memory::MemTable::try_new(arrow_schema.clone(), vec![ram_vec])
                 .unwrap();
+
         ctx.register_table("ram_datoms", Arc::new(ram_provider))?;
 
         let df_vol = ctx
             .sql("SELECT * FROM volatile_parquet UNION ALL SELECT * FROM ram_datoms")
             .await?;
+
         ctx.register_table("volatile_datoms", df_vol.into_view())?;
 
         // 2. The Vectorized Option A SQL Router
@@ -367,7 +1255,7 @@ impl MesoDB {
 
         let planner = QueryPlanner::new(
             &ctx,
-            view.timeline.as_ref(),
+            &view,
             "resolved_datoms",
             options.format.clone(),
             options.as_of,
@@ -429,6 +1317,17 @@ impl MesoDB {
         Ok(formatter::to_edn_string(&batches, &ast.find))
     }
 
+    pub async fn query_edn_with_options(
+        &self,
+        query_str: &str,
+        mut options: QueryOptions,
+    ) -> Result<String> {
+        let ast = parser::parse_query(query_str)?;
+        options.format = OutputFormat::Edn; // Enforce EDN for this pipeline
+        let batches = self.query_with_options(query_str, options).await?;
+        Ok(formatter::to_edn_string(&batches, &ast.find))
+    }
+
     // =====================================================================
     // HISTORY API PIPELINE
     // =====================================================================
@@ -477,10 +1376,14 @@ impl MesoDB {
 
 #[derive(Clone)]
 pub struct WorldView {
-    pub ram_batches: Arc<BTreeMap<u64, RecordBatch>>,
+    pub ram_batches: Arc<Vec<(u64, RecordBatch)>>,
     pub data_dir: PathBuf,
     pub schema: Arc<SchemaMap>,
     pub timeline: Arc<SchemaTimeline>,
+    pub now_index: Arc<crate::btree::NowIndexSnapshot>,
+    pub avt_index: Arc<crate::btree::AvtIndexSnapshot>,
+    pub bitmap_index: Arc<crate::bitmap::BitmapSnapshot>, // Swapped out AveIndex
+    pub dirty_entities: Arc<ahash::AHashSet<crate::types::EntityId>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -506,6 +1409,8 @@ pub struct AttributeDefinition {
     pub value_type: ValueType,
     pub is_unique: bool,
 }
+
+// Ensure you retain the existing `mod tests { ... }` block entirely here!
 
 // --- TESTS ---
 #[cfg(test)]
@@ -2167,13 +3072,17 @@ mod tests {
 
             let current_view = writer.as_ref().clone();
             let mut new_ram = current_view.ram_batches.as_ref().clone();
-            new_ram.remove(&initial_tx_id);
+            new_ram.retain(|(id, _)| *id != initial_tx_id);
 
             *writer = Arc::new(WorldView {
                 ram_batches: Arc::new(new_ram),
                 data_dir: current_view.data_dir.clone(),
                 schema: current_view.schema.clone(),
                 timeline: current_view.timeline.clone(),
+                now_index: current_view.now_index.clone(),
+                avt_index: current_view.avt_index.clone(),
+                bitmap_index: current_view.bitmap_index.clone(),
+                dirty_entities: current_view.dirty_entities.clone(),
             });
         });
 
@@ -2196,11 +3105,17 @@ mod tests {
 
         // VALIDATION: The split-lock bug is dead! The compactor removal succeeded, AND the new transaction exists.
         assert!(
-            !final_view.ram_batches.contains_key(&initial_tx_id),
+            !final_view
+                .ram_batches
+                .iter()
+                .any(|(id, _)| id == &initial_tx_id),
             "Background removal should succeed"
         );
         assert!(
-            final_view.ram_batches.keys().any(|&k| k > initial_tx_id),
+            final_view
+                .ram_batches
+                .iter()
+                .any(|(k, _)| *k > initial_tx_id),
             "Concurrent transaction insertion should succeed"
         );
     }
@@ -2349,13 +3264,17 @@ mod tests {
 
             let current_view = writer.as_ref().clone();
             let mut new_ram = current_view.ram_batches.as_ref().clone();
-            new_ram.remove(&tx_id);
+            new_ram.retain(|(id, _)| *id != tx_id);
 
             *writer = Arc::new(WorldView {
                 ram_batches: Arc::new(new_ram),
                 data_dir: current_view.data_dir.clone(),
                 schema: current_view.schema.clone(),
                 timeline: current_view.timeline.clone(),
+                now_index: current_view.now_index.clone(),
+                avt_index: current_view.avt_index.clone(),
+                bitmap_index: current_view.bitmap_index.clone(),
+                dirty_entities: current_view.dirty_entities.clone(),
             });
         });
 
@@ -2372,7 +3291,7 @@ mod tests {
 
         let final_view = db.world_view.read().clone();
         assert!(
-            !final_view.ram_batches.contains_key(&tx_id),
+            !final_view.ram_batches.iter().any(|(id, _)| id == &tx_id),
             "The compactor must successfully remove the batch"
         );
         assert!(
@@ -2395,9 +3314,10 @@ mod tests {
         {
             let writer = db.world_view.write();
             let current_view = writer.as_ref().clone();
-            let mut new_ram = current_view.ram_batches.as_ref().clone();
+            let new_ram = current_view.ram_batches.as_ref().clone();
 
-            if new_ram.remove(&9999).is_none() {
+            let pos = new_ram.iter().position(|(id, _)| *id == 9999);
+            if pos.is_none() {
                 // Do nothing. Drop the lock. The pointer remains entirely unmodified.
             } else {
                 panic!("Should not execute");
@@ -2517,5 +3437,433 @@ mod tests {
         assert_eq!(pin_1.ram_batches.len(), 1);
         assert_eq!(pin_2.ram_batches.len(), 2);
         assert_eq!(db.world_view.read().ram_batches.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_background_compaction_trigger_and_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("compaction_test.db");
+
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/score", ValueType::Int64, false);
+
+        // Custom config to force fast flushes and compactions
+        let mut config = Config::embedded();
+        config.compactor.backpressure_threshold = 2; // Compact after 2 files
+        config.storage.memtable_max_rows = 1; // Flush every single datom immediately
+
+        let db = MesoDB::open(db_path, schema, config).unwrap();
+
+        // 1. First transaction -> Fills the 1-row MemTable, flushes to part-000000000001.parquet
+        db.transact(vec![Fact {
+            e: 1,
+            ident: ":user/score".into(),
+            v: Value::Int64(100),
+            op: true,
+            cas_old_v: None,
+            valid_time: None,
+        }])
+        .await
+        .unwrap();
+
+        // Give the async worker a moment to write the first file and clear RAM
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+        // 2. Second transaction -> Fills MemTable, flushes to part-000000000002.parquet
+        // Since our threshold is 2, this TRIGGERS the detached compaction task!
+        db.transact(vec![Fact {
+            e: 2,
+            ident: ":user/score".into(),
+            v: Value::Int64(200),
+            op: true,
+            cas_old_v: None,
+            valid_time: None,
+        }])
+        .await
+        .unwrap();
+
+        // Wait for the heavy background compaction task to finish merging and cleaning up
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+
+        // 3. Query the data - DataFusion should seamlessly route the query to the new compacted file
+        let query = r#"[:find ?score :where [?e :user/score ?score]]"#;
+        let results = db.query_native(query).await.unwrap();
+
+        assert_eq!(results.len(), 2, "Should find both scores seamlessly");
+
+        // 4. Verify the filesystem state physically matches our architecture
+        let pq_dir = dir.path().join("parquet");
+        let entries = std::fs::read_dir(pq_dir).unwrap();
+        let mut compacted_count = 0;
+        let mut volatile_count = 0;
+
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("compacted-") {
+                compacted_count += 1;
+            } else if name.starts_with("part-") {
+                volatile_count += 1;
+            }
+        }
+
+        assert_eq!(
+            volatile_count, 0,
+            "Volatile parts should have been deleted by the compactor"
+        );
+        assert_eq!(
+            compacted_count, 1,
+            "There should be exactly one compacted file containing all data"
+        );
+    }
+
+    // =====================================================================
+    // PHASE 1: EXPANDED FAST-PATH ROUTER TESTS
+    // =====================================================================
+
+    #[tokio::test]
+    async fn test_fast_path_multi_attribute_eav_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/name", ValueType::String, false);
+        schema.add_attribute(":user/age", ValueType::Int64, false);
+
+        let db = MesoDB::open(dir.path().join("fp_multi.db"), schema, Config::default()).unwrap();
+
+        db.transact(vec![
+            Fact {
+                e: 101,
+                ident: ":user/name".into(),
+                v: Value::String("Alice".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 101,
+                ident: ":user/age".into(),
+                v: Value::Int64(30),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+        ])
+        .await
+        .unwrap();
+
+        // Wait for background worker to flush to index
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let query = r#"[:find ?n ?a :where [101 :user/name ?n] [101 :user/age ?a]]"#;
+        let results = db.query(query).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        let batch = &results[0];
+        assert_eq!(batch.num_rows(), 1);
+
+        let n_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        let a_col = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+
+        assert_eq!(n_col.value(0), "Alice");
+        assert_eq!(a_col.value(0), 30);
+    }
+
+    #[tokio::test]
+    async fn test_fast_path_ave_inverted_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/email", ValueType::String, true);
+
+        let db = MesoDB::open(dir.path().join("fp_ave.db"), schema, Config::default()).unwrap();
+
+        db.transact(vec![Fact {
+            e: 88,
+            ident: ":user/email".into(),
+            v: Value::String("target@example.com".into()),
+            op: true,
+            cas_old_v: None,
+            valid_time: None,
+        }])
+        .await
+        .unwrap();
+
+        // Wait for background worker to update AveIndex
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let query = r#"[:find ?e :where [?e :user/email "target@example.com"]]"#;
+        let results = db.query(query).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        let batch = &results[0];
+        assert_eq!(batch.num_rows(), 1);
+
+        let e_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .unwrap();
+        assert_eq!(e_col.value(0), 88);
+    }
+
+    #[tokio::test]
+    async fn test_fast_path_constant_entity_pull() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/name", ValueType::String, false);
+        schema.add_attribute(":user/age", ValueType::Int64, false);
+
+        let mut config = Config::default();
+        config.storage.memtable_max_rows = 1;
+        config.compactor.backpressure_threshold = 1;
+
+        let db = MesoDB::open(dir.path().join("fp_pull.db"), schema, config).unwrap();
+
+        db.transact(vec![
+            Fact {
+                e: 42,
+                ident: ":user/name".into(),
+                v: Value::String("Bob".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 42,
+                ident: ":user/age".into(),
+                v: Value::Int64(45),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+        ])
+        .await
+        .unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let query = r#"[:find (pull ?e [:user/name :user/age]) :where [42 :user/name _]]"#;
+        let json_res = db.query_json(query).await.unwrap();
+
+        assert!(json_res.contains(r#""user/name":"Bob""#));
+        assert!(json_res.contains(r#""user/age":45"#));
+    }
+
+    #[tokio::test]
+    async fn test_fast_path_ram_dirty_set_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/score", ValueType::Int64, false);
+
+        let db = MesoDB::open(dir.path().join("fp_dirty.db"), schema, Config::default()).unwrap();
+
+        // Fact in RAM (Not yet flushed to index)
+        db.transact(vec![Fact {
+            e: 777,
+            ident: ":user/score".into(),
+            v: Value::Int64(9000),
+            op: true,
+            cas_old_v: None,
+            valid_time: None,
+        }])
+        .await
+        .unwrap();
+
+        // 1. Immediate query when entity is in dirty set -> Must fall back to DataFusion safely and find result
+        let query = r#"[:find ?s :where [777 :user/score ?s]]"#;
+        let results_ram = db.query(query).await.unwrap();
+        let total_rows_ram: usize = results_ram.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows_ram, 1);
+
+        // 2. Wait for flush -> Dirty set clears, fast-path executes from B+Tree directly
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let results_disk = db.query(query).await.unwrap();
+        let total_rows_disk: usize = results_disk.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total_rows_disk, 1);
+    }
+
+    #[tokio::test]
+    async fn test_fast_path_bitmap_intersection_join() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/status", ValueType::String, false);
+        schema.add_attribute(":user/name", ValueType::String, false);
+
+        let db = MesoDB::open(dir.path().join("fp_join.db"), schema, Config::default()).unwrap();
+
+        db.transact(vec![
+            Fact {
+                e: 200,
+                ident: ":user/status".into(),
+                v: Value::String("active".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 200,
+                ident: ":user/name".into(),
+                v: Value::String("ActiveAlice".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 201,
+                ident: ":user/status".into(),
+                v: Value::String("inactive".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 201,
+                ident: ":user/name".into(),
+                v: Value::String("InactiveBob".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+        ])
+        .await
+        .unwrap();
+
+        // Wait for background worker to flush RAM to the B-Tree / Bitmap indices
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let query = r#"[:find ?name :where [?e :user/status "active"] [?e :user/name ?name]]"#;
+        let results = db.query(query).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        let batch = &results[0];
+        assert_eq!(
+            batch.num_rows(),
+            1,
+            "Should bypass DataFusion and return exactly one row natively"
+        );
+
+        let name_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+
+        assert_eq!(name_col.value(0), "ActiveAlice");
+    }
+
+    #[tokio::test]
+    async fn test_fast_path_entity_range_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":sys/log", ValueType::String, false);
+
+        // FIX: Force immediate background flushes to clear RAM and enable the Fast-Path
+        let mut config = Config::default();
+        config.storage.memtable_max_rows = 1;
+        config.compactor.backpressure_threshold = 1;
+
+        let db = MesoDB::open(dir.path().join("fp_range.db"), schema, config).unwrap();
+
+        let mut facts = Vec::new();
+        for i in 100..=105 {
+            facts.push(Fact {
+                e: i,
+                ident: ":sys/log".into(),
+                v: Value::String(format!("Log {}", i)),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            });
+        }
+        db.transact(facts).await.unwrap();
+
+        // Flush RAM state to the native B-Tree index
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let query = r#"[:find ?v :where [?e :sys/log ?v] [(>= ?e 102)] [(< ?e 105)]]"#;
+        let results = db.query(query).await.unwrap();
+
+        assert_eq!(
+            results.len(),
+            1,
+            "Should bypass DataFusion and return exactly one row natively"
+        );
+        let batch = &results[0];
+
+        // Excludes 100, 101, and 105
+        assert_eq!(
+            batch.num_rows(),
+            3,
+            "Range scan should cleanly fetch 102, 103, and 104 natively"
+        );
+
+        let val_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(val_col.value(0), "Log 102");
+        assert_eq!(val_col.value(2), "Log 104");
+    }
+
+    #[tokio::test]
+    async fn test_fast_path_value_range_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":item/price", ValueType::Int64, false);
+
+        // Force background syncs immediately
+        let mut config = Config::default();
+        config.storage.memtable_max_rows = 1;
+        config.compactor.backpressure_threshold = 1;
+
+        let db = MesoDB::open(dir.path().join("fp_val_range.db"), schema, config).unwrap();
+
+        let mut facts = Vec::new();
+        for i in 1..=5 {
+            facts.push(Fact {
+                e: i,
+                ident: ":item/price".into(),
+                v: Value::Int64(i as i64 * 10), // Prices: 10, 20, 30, 40, 50
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            });
+        }
+        db.transact(facts).await.unwrap();
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let query =
+            r#"[:find ?e :where [?e :item/price ?price] [(>= ?price 20)] [(<= ?price 40)]]"#;
+        let results = db.query(query).await.unwrap();
+
+        assert_eq!(results.len(), 1, "Should bypass DataFusion natively");
+        let batch = &results[0];
+
+        // Excludes 10 and 50
+        assert_eq!(
+            batch.num_rows(),
+            3,
+            "Range scan should fetch 20, 30, and 40"
+        );
+
+        let e_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .unwrap();
+
+        let mut e_ids = vec![e_col.value(0), e_col.value(1), e_col.value(2)];
+        e_ids.sort();
+        // Since price = e * 10, target entities are 2, 3, and 4
+        assert_eq!(e_ids, vec![2, 3, 4]);
     }
 }

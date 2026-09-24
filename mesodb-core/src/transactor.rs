@@ -42,7 +42,7 @@ impl Transactor {
 
         timeline.append_version(0, 0, schema.clone());
 
-        // NEW: Initialize a MemTable to rebuild uncompacted RAM state
+        // Initialize a MemTable to rebuild uncompacted RAM state
         let mut recovery_memtable = MemTable::new(10_000);
 
         let recovered_entries = wal.recover()?;
@@ -72,7 +72,7 @@ impl Transactor {
                                 );
                             }
                         }
-                        // NEW: Push the recovered datom into RAM
+                        // Push the recovered datom into RAM
                         recovery_memtable.append(datom);
                     }
                 }
@@ -107,6 +107,7 @@ impl Transactor {
             recovered_batch,
         ))
     }
+
     pub fn transact_schema(
         &mut self,
         ident: &str,
@@ -169,8 +170,7 @@ impl Transactor {
         for mut fact in facts {
             let resolved_valid_time = fact.valid_time.unwrap_or(now);
 
-            // --- REIFIED TRANSACTIONS ---
-            // Entity ID 0 is a reserved pointer to the current transaction.
+            // Reified Transactions: Entity ID 0 points to current transaction
             if fact.e == 0 {
                 fact.e = tx_id;
             }
@@ -188,7 +188,6 @@ impl Transactor {
                     _ => ValueType::String,
                 };
 
-                // Make JIT schema durable!
                 let new_attr = self.schema.add_attribute(&fact.ident, inferred_type, false);
 
                 let mutation = SchemaMutation::AddAttribute {
@@ -212,9 +211,7 @@ impl Transactor {
                 )));
             };
 
-            // --- JIT TYPE COERCION ---
-            // JSON numbers parse as Int64 by default. If the schema demands a Ref,
-            // we safely cast it here before validation fails.
+            // JIT Type Coercion
             if let Some(attr) = self.schema.get_by_id(attr_id)
                 && attr.value_type == ValueType::Ref
                 && let Value::Int64(i) = fact.v
@@ -232,7 +229,7 @@ impl Transactor {
                     .get_value_at(fact.e, attr_id, resolved_valid_time);
                 let current_matches = match current_v {
                     Some(v) => v == expected_v,
-                    None => false, // Standard CAS requires the old value to exist
+                    None => false,
                 };
 
                 if !current_matches {
@@ -244,7 +241,7 @@ impl Transactor {
             }
 
             if fact.op {
-                // Assertions
+                // --- UNIQUE CONSTRAINT VALIDATION ---
                 if is_unique {
                     let key = (attr_id, fact.v.clone());
 
@@ -280,7 +277,7 @@ impl Transactor {
                     }
                 }
 
-                // Retract existing value if it differs
+                // Automatic Retraction Check (RESTORED unconditionally)
                 if let Some(existing_v) =
                     self.indices
                         .get_value_at(fact.e, attr_id, resolved_valid_time)
@@ -294,7 +291,7 @@ impl Transactor {
                             resolved_valid_time,
                         ));
                     } else {
-                        continue; // No-op: value is already exactly this
+                        continue; // No-op: value already set
                     }
                 }
 
@@ -306,7 +303,7 @@ impl Transactor {
                     resolved_valid_time,
                 ));
             } else {
-                // Retractions
+                // Retraction (RESTORED verification)
                 if let Some(existing_v) =
                     self.indices
                         .get_value_at(fact.e, attr_id, resolved_valid_time)
@@ -323,17 +320,19 @@ impl Transactor {
             }
         }
 
-        // --- PHASE 2: WAL Persistence (Crash Safety) ---
+        // --- PHASE 2: WAL Persistence ---
         self.wal.append_entry(
             &WalEntry::DataBatch(pending_datoms.clone()),
             &self.config.storage.wal_sync_mode,
         )?;
 
-        // --- PHASE 3: Update RAM Indices & Build Arrow Batch ---
+        // --- PHASE 3: Build Arrow Batch & Maintain Validation Index ---
         let mut tx_memtable = MemTable::new(pending_datoms.len());
 
         for datom in &pending_datoms {
             let is_unique = self.schema.get_by_id(datom.a).unwrap().is_unique;
+
+            // RESTORED unconditionally to maintain EAVT for history and CAS
             if datom.op {
                 self.indices.insert(
                     datom.e,
@@ -346,6 +345,7 @@ impl Transactor {
                 self.indices
                     .remove(datom.e, datom.a, &datom.v, is_unique, datom.valid_from);
             }
+
             tx_memtable.append(datom.clone());
         }
 
@@ -356,8 +356,12 @@ impl Transactor {
             tx_id,
             timestamp: now,
             datoms_written: pending_datoms.len(),
-            batch, // Ready to be consumed lock-free by readers!
+            batch,
         })
+    }
+
+    pub fn take_sync_rx(&mut self) -> Option<tokio::sync::oneshot::Receiver<()>> {
+        self.wal.take_last_sync_rx()
     }
 }
 
@@ -383,21 +387,24 @@ pub struct TxReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
 
-    fn setup_transactor() -> (Transactor, NamedTempFile) {
-        let temp_file = NamedTempFile::new().unwrap();
+    async fn setup_transactor() -> (Transactor, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("wal");
+
         let mut schema = SchemaMap::new();
         schema.add_attribute(":user/name", ValueType::String, false);
         schema.add_attribute(":user/email", ValueType::String, true);
+
         let config = Config::default();
-        let (transactor, _) = Transactor::new(temp_file.path(), schema, config).unwrap();
-        (transactor, temp_file)
+        let (transactor, _) = Transactor::new(wal_path, schema, config).unwrap();
+
+        (transactor, dir)
     }
 
-    #[test]
-    fn test_tx_bitemporal_interval_closing() {
-        let (mut t, _f) = setup_transactor();
+    #[tokio::test]
+    async fn test_tx_bitemporal_interval_closing() {
+        let (mut t, _f) = setup_transactor().await;
         // 1. Assert Alice
         let _ = t
             .transact_at(
@@ -433,9 +440,9 @@ mod tests {
         assert_eq!(report.batch.num_rows(), 2);
     }
 
-    #[test]
-    fn test_tx_unique_constraint_enforcement() {
-        let (mut t, _f) = setup_transactor();
+    #[tokio::test]
+    async fn test_tx_unique_constraint_enforcement() {
+        let (mut t, _f) = setup_transactor().await;
         t.transact(vec![Fact {
             e: 1,
             ident: ":user/email".into(),
@@ -458,10 +465,10 @@ mod tests {
         assert!(err.is_err());
     }
 
-    #[test]
-    fn test_engine_raw_bitemporal_arrow_output() {
+    #[tokio::test]
+    async fn test_engine_raw_bitemporal_arrow_output() {
         use arrow::array::{BooleanArray, StringArray, TimestampMicrosecondArray};
-        let (mut t, _f) = setup_transactor();
+        let (mut t, _f) = setup_transactor().await;
 
         // 1. Assert Alice at T=100
         t.transact_at(
@@ -534,15 +541,16 @@ mod tests {
         assert_eq!(to_col.value(1), i64::MAX); // New assertion is valid until the end of time
     }
 
-    #[test]
-    fn test_jit_schema_durability_and_recovery() {
-        let temp_file = NamedTempFile::new().unwrap();
+    #[tokio::test]
+    async fn test_jit_schema_durability_and_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("wal");
         let config = Config::default();
 
         // 1. Boot fresh transactor and transact a totally unknown attribute
         {
-            let (mut t, _) =
-                Transactor::new(temp_file.path(), SchemaMap::new(), config.clone()).unwrap();
+            let (mut t, _) = Transactor::new(&wal_path, SchemaMap::new(), config.clone()).unwrap();
+
             t.transact(vec![Fact {
                 e: 1,
                 ident: ":new/jit_attr".into(), // Does not exist in the initial SchemaMap!
@@ -555,12 +563,16 @@ mod tests {
 
             // Verify the engine inferred it in RAM
             assert!(t.schema.contains_ident(":new/jit_attr"));
+
+            // NEW: Await the background group commit sync before dropping!
+            if let Some(rx) = t.take_sync_rx() {
+                let _ = rx.await;
+            }
         } // `t` is dropped here. Server "crashes".
 
         // 2. Re-open from the exact same WAL file
         {
-            let (t_recovered, _) =
-                Transactor::new(temp_file.path(), SchemaMap::new(), config).unwrap();
+            let (t_recovered, _) = Transactor::new(&wal_path, SchemaMap::new(), config).unwrap();
 
             // If the SchemaMutation wasn't durable, this would fail!
             assert!(t_recovered.schema.contains_ident(":new/jit_attr"));
@@ -570,9 +582,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_atomic_compare_and_swap() {
-        let (mut t, _f) = setup_transactor();
+    #[tokio::test]
+    async fn test_atomic_compare_and_swap() {
+        let (mut t, _f) = setup_transactor().await;
 
         // 1. Initial State: Alice is 29
         t.transact(vec![Fact {
@@ -612,9 +624,9 @@ mod tests {
         assert!(good_cas.is_ok());
     }
 
-    #[test]
-    fn test_cas_transaction_atomicity() {
-        let (mut t, _f) = setup_transactor();
+    #[tokio::test]
+    async fn test_cas_transaction_atomicity() {
+        let (mut t, _f) = setup_transactor().await;
 
         // 1. Setup Initial Bank Balances
         t.transact(vec![
@@ -673,9 +685,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_cas_retractions_and_missing_values() {
-        let (mut t, _f) = setup_transactor();
+    #[tokio::test]
+    async fn test_cas_retractions_and_missing_values() {
+        let (mut t, _f) = setup_transactor().await;
 
         t.transact(vec![Fact {
             e: 1,
@@ -718,10 +730,10 @@ mod tests {
         assert!(t.indices.get_current_value(1, attr_id).is_none());
     }
 
-    #[test]
-    fn test_explicit_valid_time_ingestion() {
+    #[tokio::test]
+    async fn test_explicit_valid_time_ingestion() {
         use arrow::array::TimestampMicrosecondArray;
-        let (mut t, _f) = setup_transactor();
+        let (mut t, _f) = setup_transactor().await;
 
         let historical_time = 5000; // Deep in the past
 
@@ -748,10 +760,10 @@ mod tests {
         assert_eq!(from_col.value(0), historical_time);
     }
 
-    #[test]
-    fn test_bitemporal_past_valid_time() {
+    #[tokio::test]
+    async fn test_bitemporal_past_valid_time() {
         use arrow::array::TimestampMicrosecondArray;
-        let (mut t, _f) = setup_transactor();
+        let (mut t, _f) = setup_transactor().await;
 
         let past_time = 1500000000000; // Explicit past timestamp
 
@@ -780,10 +792,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_bitemporal_future_valid_time() {
+    #[tokio::test]
+    async fn test_bitemporal_future_valid_time() {
         use arrow::array::TimestampMicrosecondArray;
-        let (mut t, _f) = setup_transactor();
+        let (mut t, _f) = setup_transactor().await;
 
         let future_time = 2500000000000; // Explicit future timestamp
 
@@ -812,10 +824,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_bitemporal_mixed_valid_times_batch() {
+    #[tokio::test]
+    async fn test_bitemporal_mixed_valid_times_batch() {
         use arrow::array::TimestampMicrosecondArray;
-        let (mut t, _f) = setup_transactor();
+        let (mut t, _f) = setup_transactor().await;
 
         let past_1 = 1000;
         let future_1 = 8_000_000_000_000_000; // Far future (Year ~2223)
@@ -894,9 +906,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_bitemporal_contextual_uniqueness() {
-        let (mut t, _f) = setup_transactor();
+    #[tokio::test]
+    async fn test_bitemporal_contextual_uniqueness() {
+        let (mut t, _f) = setup_transactor().await;
 
         // 1. Alice claims an email starting at T=100
         t.transact(vec![Fact {

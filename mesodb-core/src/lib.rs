@@ -1,4 +1,6 @@
 pub mod ast;
+pub mod bitmap;
+pub mod btree;
 pub mod config;
 pub mod datom;
 pub mod db;
@@ -7,6 +9,8 @@ pub mod error;
 pub mod formatter;
 pub mod index;
 pub mod memtable;
+pub mod page;
+pub mod pager;
 pub mod parser;
 pub mod planner;
 pub mod pull;
@@ -14,6 +18,6 @@ pub mod schema;
 pub mod storage;
 pub mod transactor;
 pub mod types;
+pub mod udf;
 pub mod wal;
 pub mod wire;
-

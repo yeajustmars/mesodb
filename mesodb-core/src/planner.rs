@@ -10,15 +10,18 @@ use std::{collections::HashMap, sync::Arc, time::SystemTime};
 
 use crate::{
     ast::{Binding, FindSpec, Query, RuleDef, RuleSet, Term, WhereClause},
-    db::OutputFormat,
+    bitmap,
+    db::{OutputFormat, WorldView},
     error::MesoError,
     pull::PullEngine,
-    schema::{SchemaTimeline, ValueType},
+    schema::ValueType,
+    types::Value,
+    udf,
 };
 
 pub struct QueryPlanner<'a> {
     ctx: &'a SessionContext,
-    timeline: &'a SchemaTimeline,
+    view: &'a WorldView,
     table_name: &'a str,
     format: OutputFormat,
     as_of: Option<i64>,
@@ -33,7 +36,7 @@ type PlanParts = (PlanPartFroms, PlanPartWheres, PlanPartVars);
 impl<'a> QueryPlanner<'a> {
     pub fn new(
         ctx: &'a SessionContext,
-        timeline: &'a SchemaTimeline,
+        view: &'a WorldView,
         table_name: &'a str,
         format: OutputFormat,
         as_of: Option<i64>,
@@ -41,7 +44,7 @@ impl<'a> QueryPlanner<'a> {
     ) -> Self {
         Self {
             ctx,
-            timeline,
+            view,
             table_name,
             format,
             as_of,
@@ -51,11 +54,11 @@ impl<'a> QueryPlanner<'a> {
 
     fn build_logical_plan(&self, clauses: &[WhereClause]) -> Result<PlanParts, MesoError> {
         let target_tx = if let Some(t) = self.as_of {
-            self.timeline.tx_for_timestamp(t)
+            self.view.timeline.tx_for_timestamp(t)
         } else {
-            self.timeline.latest_tx()
+            self.view.timeline.latest_tx()
         };
-        let active_schema = self.timeline.get_schema_at(target_tx);
+        let active_schema = self.view.timeline.get_schema_at(target_tx);
 
         let mut from_tables = Vec::new();
         let mut where_conditions = Vec::new();
@@ -152,8 +155,38 @@ impl<'a> QueryPlanner<'a> {
                         Term::Boolean(b) => {
                             where_conditions.push(format!("{}.v_bool = {}", alias, b))
                         }
+                        Term::Float(f) => {
+                            where_conditions.push(format!("{}.v_float = {}", alias, f))
+                        }
                         _ => {}
                     }
+
+                    // --- PHASE 3: VECTORIZED BITMAP PUSHDOWN ---
+                    // Dynamically map literal value terms into their underlying struct representation
+                    let val_literal = match v {
+                        Term::String(s) => Some(Value::String(s.clone())),
+                        Term::Integer(i) => Some(Value::Int64(*i)),
+                        Term::Boolean(b) => Some(Value::Boolean(*b)),
+                        Term::Float(f) => Some(Value::Float64(*f)),
+                        _ => None,
+                    };
+
+                    if let (Term::Keyword(kw), Some(lit)) = (a, val_literal)
+                        && let Some(a_id) = self.view.schema.get_id(kw)
+                        && let Ok(Some(treemap)) = self.view.bitmap_index.get(a_id, &lit)
+                    {
+                        let udf_name = format!("in_bitmap_{}_{}", a_id, bitmap::hash_value(&lit));
+
+                        let udf = datafusion::logical_expr::ScalarUDF::from(udf::InBitmapUDF::new(
+                            treemap,
+                            udf_name.clone(),
+                            self.view.dirty_entities.clone(), // Passed here
+                        ));
+                        self.ctx.register_udf(udf);
+
+                        where_conditions.push(format!("{}({}.e)", udf_name, alias));
+                    }
+
                     if let Some(tx_term) = tx {
                         match tx_term {
                             Term::Variable(var_name) => {
@@ -519,11 +552,11 @@ impl<'a> QueryPlanner<'a> {
                                 (0..e_col.len()).map(|idx| e_col.value(idx)).collect();
 
                             let target_tx = if let Some(t) = self.as_of {
-                                self.timeline.tx_for_timestamp(t)
+                                self.view.timeline.tx_for_timestamp(t)
                             } else {
-                                self.timeline.latest_tx()
+                                self.view.timeline.latest_tx()
                             };
-                            let active_schema = self.timeline.get_schema_at(target_tx);
+                            let active_schema = self.view.timeline.get_schema_at(target_tx);
 
                             let pull_engine =
                                 PullEngine::new(self.ctx, &active_schema, &self.format, self.as_of);

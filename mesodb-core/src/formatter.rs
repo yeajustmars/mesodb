@@ -34,8 +34,9 @@ pub fn to_json_string(batches: &[RecordBatch], finds: &[FindSpec]) -> String {
             out.push('{');
             let mut first_col = true;
 
-            for col in 0..batch.num_columns() {
-                let column = batch.column(col);
+            for (col, (column, &is_pull)) in
+                batch.columns().iter().zip(pull_cols.iter()).enumerate()
+            {
                 if column.is_null(row) {
                     continue;
                 }
@@ -51,7 +52,7 @@ pub fn to_json_string(batches: &[RecordBatch], finds: &[FindSpec]) -> String {
                 out.push_str("\":");
 
                 // Write the JSON value directly from Arrow
-                if pull_cols[col] {
+                if is_pull {
                     // ZERO-COPY PULL: It is already formatted JSON, just blast it into the buffer!
                     let str_array = column.as_any().downcast_ref::<StringArray>().unwrap();
                     out.push_str(str_array.value(row));
@@ -117,8 +118,9 @@ pub fn to_edn_string(batches: &[RecordBatch], finds: &[FindSpec]) -> String {
             out.push('{');
             let mut first_col = true;
 
-            for col in 0..batch.num_columns() {
-                let column = batch.column(col);
+            for (col, (column, &is_pull)) in
+                batch.columns().iter().zip(pull_cols.iter()).enumerate()
+            {
                 if column.is_null(row) {
                     continue;
                 }
@@ -134,7 +136,7 @@ pub fn to_edn_string(batches: &[RecordBatch], finds: &[FindSpec]) -> String {
                 out.push_str(field_name);
                 out.push(' ');
 
-                if pull_cols[col] {
+                if is_pull {
                     let str_array = column.as_any().downcast_ref::<StringArray>().unwrap();
                     out.push_str(str_array.value(row));
                 } else {
@@ -181,8 +183,7 @@ pub fn to_native(batches: &[RecordBatch]) -> Result<Vec<HashMap<String, Value>>>
         for row in 0..batch.num_rows() {
             let mut map = HashMap::new();
 
-            for col in 0..batch.num_columns() {
-                let column = batch.column(col);
+            for (col, column) in batch.columns().iter().enumerate() {
                 if column.is_null(row) {
                     continue;
                 }

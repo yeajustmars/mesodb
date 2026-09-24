@@ -20,9 +20,6 @@ tonic.workspace = true
 mesodb-core.workspace = true
 mesodb-server.workspace = true
 
-# mesodb-core = { path = "../mesodb-core" }
-# mesodb-server = { path = "../mesodb-server" }
-
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["async_tokio"] }
 proptest = "1.11.0"
@@ -45,4 +42,8 @@ harness = false
 
 [[bench]]
 name = "flight"
+harness = false
+
+[[bench]]
+name = "fast_path"
 harness = false
