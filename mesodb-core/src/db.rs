@@ -699,6 +699,111 @@ impl MesoDB {
             }
         }
 
+        // --- PATTERN 6: Entity ID Range Scan ---
+        // Match [:find ?v :where [?e :attr ?v] [(>= ?e 100)] [(<= ?e 200)]]
+        if ast.find.len() == 1
+            && !ast.where_clauses.is_empty()
+            && let crate::ast::FindSpec::Variable(find_var) = &ast.find[0]
+        {
+            let mut dp_clause = None;
+            let mut funcs = Vec::new();
+            let mut is_valid = true;
+
+            for clause in &ast.where_clauses {
+                match clause {
+                    crate::ast::WhereClause::DataPattern {
+                        e,
+                        a,
+                        v,
+                        tx: None,
+                        op: None,
+                    } => {
+                        if dp_clause.is_none() {
+                            dp_clause = Some((e, a, v));
+                        } else {
+                            is_valid = false;
+                        }
+                    }
+                    crate::ast::WhereClause::Function {
+                        fn_name,
+                        args,
+                        binding: None,
+                    } => {
+                        funcs.push((fn_name, args));
+                    }
+                    _ => is_valid = false,
+                }
+            }
+
+            if is_valid
+                && !funcs.is_empty()
+                && let Some((
+                    crate::ast::Term::Variable(e_var),
+                    crate::ast::Term::Keyword(a_ident),
+                    crate::ast::Term::Variable(v_var),
+                )) = dp_clause
+                && (find_var == v_var || find_var == e_var)
+            {
+                let mut e_min = 0u64;
+                let mut e_max = u64::MAX;
+                let mut bounds_applied = false;
+
+                for (fn_name, args) in funcs {
+                    if args.len() == 2
+                        && let crate::ast::Term::Variable(arg_var) = &args[0]
+                        && arg_var == e_var
+                        && let crate::ast::Term::Integer(limit) = &args[1]
+                    {
+                        let lim = *limit as u64;
+                        match fn_name.as_str() {
+                            ">" => e_min = e_min.max(lim.saturating_add(1)),
+                            ">=" => e_min = e_min.max(lim),
+                            "<" => e_max = e_max.min(lim.saturating_sub(1)),
+                            "<=" => e_max = e_max.min(lim),
+                            _ => is_valid = false,
+                        }
+                        bounds_applied = true;
+                    } else {
+                        is_valid = false;
+                    }
+                }
+
+                if is_valid
+                    && bounds_applied
+                    && view.dirty_entities.is_empty()
+                    && let Some(a_id) = view.schema.get_id(a_ident)
+                {
+                    let kvs = view.now_index.range_scan(e_min, e_max, a_id)?;
+                    if kvs.is_empty() {
+                        return Ok(Some(vec![]));
+                    }
+
+                    let clean_var = find_var.replace("?", "");
+
+                    let (field, array) = if find_var == e_var {
+                        let e_vec: Vec<u64> = kvs.into_iter().map(|(e, _)| e).collect();
+                        (
+                            arrow::datatypes::Field::new(
+                                &clean_var,
+                                arrow::datatypes::DataType::UInt64,
+                                true,
+                            ),
+                            Arc::new(arrow::array::UInt64Array::from(e_vec))
+                                as Arc<dyn arrow::array::Array>,
+                        )
+                    } else {
+                        let v_vec: Vec<Value> = kvs.into_iter().map(|(_, v)| v).collect();
+                        Self::vals_to_arrow_column(&clean_var, &v_vec)
+                    };
+
+                    let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
+                    let batch =
+                        RecordBatch::try_new(schema, vec![array]).map_err(MesoError::Arrow)?;
+                    return Ok(Some(vec![batch]));
+                }
+            }
+        }
+
         Ok(None)
     }
 
@@ -3533,5 +3638,60 @@ mod tests {
             .unwrap();
 
         assert_eq!(name_col.value(0), "ActiveAlice");
+    }
+
+    #[tokio::test]
+    async fn test_fast_path_entity_range_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":sys/log", ValueType::String, false);
+
+        // FIX: Force immediate background flushes to clear RAM and enable the Fast-Path
+        let mut config = Config::default();
+        config.storage.memtable_max_rows = 1;
+        config.compactor.backpressure_threshold = 1;
+
+        let db = MesoDB::open(dir.path().join("fp_range.db"), schema, config).unwrap();
+
+        let mut facts = Vec::new();
+        for i in 100..=105 {
+            facts.push(Fact {
+                e: i,
+                ident: ":sys/log".into(),
+                v: Value::String(format!("Log {}", i)),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            });
+        }
+        db.transact(facts).await.unwrap();
+
+        // Flush RAM state to the native B-Tree index
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let query = r#"[:find ?v :where [?e :sys/log ?v] [(>= ?e 102)] [(< ?e 105)]]"#;
+        let results = db.query(query).await.unwrap();
+
+        assert_eq!(
+            results.len(),
+            1,
+            "Should bypass DataFusion and return exactly one row natively"
+        );
+        let batch = &results[0];
+
+        // Excludes 100, 101, and 105
+        assert_eq!(
+            batch.num_rows(),
+            3,
+            "Range scan should cleanly fetch 102, 103, and 104 natively"
+        );
+
+        let val_col = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(val_col.value(0), "Log 102");
+        assert_eq!(val_col.value(2), "Log 104");
     }
 }

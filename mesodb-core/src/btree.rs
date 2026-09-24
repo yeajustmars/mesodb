@@ -677,6 +677,67 @@ impl BTreeSnapshot {
             }
         }
     }
+
+    /// O(log N + K) Sequential Leaf-Chain Scan
+    pub fn range_scan(
+        &self,
+        start_key: IndexKey,
+        end_key: IndexKey,
+    ) -> Result<Vec<(IndexKey, IndexValue)>, MesoError> {
+        let mut current_page_id = self.root_page_id;
+
+        // 1. Traverse down to the first leaf node containing start_key (or the next highest)
+        loop {
+            let node = self.pager.get_node(current_page_id)?;
+            let num_cells = node.header.num_cells as usize;
+            if num_cells == 0 {
+                return Ok(Vec::new());
+            }
+
+            if node.header.is_leaf == 1 {
+                break;
+            } else {
+                let mut child_idx = 0;
+                while child_idx < num_cells && start_key >= node.keys[child_idx] {
+                    child_idx += 1;
+                }
+                if child_idx > 0 {
+                    child_idx = child_idx.saturating_sub(1);
+                }
+                let mut bytes = [0u8; 4];
+                bytes.copy_from_slice(&node.values[child_idx].payload[0..4]);
+                current_page_id = u32::from_ne_bytes(bytes);
+            }
+        }
+
+        // 2. Walk the right_sibling leaf chain horizontally
+        let mut results = Vec::new();
+        loop {
+            let node = self.pager.get_node(current_page_id)?;
+            let num_cells = node.header.num_cells as usize;
+
+            for i in 0..num_cells {
+                let key = node.keys[i];
+                if key > end_key {
+                    return Ok(results); // Safely exit once we breach the upper bound
+                }
+                if key >= start_key {
+                    let iv = node.values[i];
+                    if iv.type_tag != 254 {
+                        // Ignore tombstones
+                        results.push((key, iv));
+                    }
+                }
+            }
+
+            if node.header.right_sibling == 0 {
+                break;
+            }
+            current_page_id = node.header.right_sibling;
+        }
+
+        Ok(results)
+    }
 }
 
 impl CoreBTree {
@@ -709,6 +770,36 @@ impl NowIndexSnapshot {
         } else {
             Ok(None)
         }
+    }
+
+    pub fn range_scan(
+        &self,
+        start_e: EntityId,
+        end_e: EntityId,
+        a: AttributeId,
+    ) -> Result<Vec<(EntityId, Value)>, MesoError> {
+        let start_key = IndexKey {
+            e: start_e,
+            a,
+            _pad: 0,
+        };
+        let end_key = IndexKey {
+            e: end_e,
+            a,
+            _pad: 0,
+        };
+
+        let raw_kvs = self.core.range_scan(start_key, end_key)?;
+        let mut results = Vec::with_capacity(raw_kvs.len());
+
+        for (k, iv) in raw_kvs {
+            // Filter strictly by the target attribute, as the raw scan will pick up
+            // secondary attributes belonging to entities within the e-range.
+            if k.a == a {
+                results.push((k.e, self.decode_value(&iv)?));
+            }
+        }
+        Ok(results)
     }
 
     fn decode_value(&self, iv: &IndexValue) -> Result<Value, MesoError> {
