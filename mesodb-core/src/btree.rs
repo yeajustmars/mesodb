@@ -873,6 +873,382 @@ impl AveIndexSnapshot {
 }
 
 // ==============================================================================
+// AVT INDEX (Value-Based Range Scans)
+// ==============================================================================
+
+use crate::page::{AV_NUM_CELLS, AvIndexKey, AvNodePage};
+
+pub struct AvtCoreBTree {
+    pub read_pager: ReadPager,
+    pub write_pager: WritePager,
+    pub root_page_id: u32,
+    pub dirty_nodes: HashMap<u32, AvNodePage>,
+}
+
+impl AvtCoreBTree {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, MesoError> {
+        let mut write_pager = WritePager::open(path)?;
+        let root_page_id;
+        if write_pager.file().metadata().map_err(MesoError::Io)?.len() == 0 {
+            let mut empty_root = unsafe { std::mem::zeroed::<AvNodePage>() };
+            empty_root.header.is_leaf = 1;
+            write_pager.write_page_bytes(1, bytemuck::bytes_of(&empty_root))?;
+            let mut metapage = [0u8; 4096];
+            metapage[0..4].copy_from_slice(&1u32.to_ne_bytes());
+            metapage[4..8].copy_from_slice(&2u32.to_ne_bytes());
+            write_pager.write_page_bytes(0, &metapage)?;
+            write_pager.flush()?;
+            root_page_id = 1;
+            write_pager.next_page_id = 2;
+        } else {
+            let mut metapage = [0u8; 4096];
+            write_pager
+                .file
+                .seek(SeekFrom::Start(0))
+                .map_err(MesoError::Io)?;
+            write_pager
+                .file
+                .read_exact(&mut metapage)
+                .map_err(MesoError::Io)?;
+            let mut r_bytes = [0u8; 4];
+            r_bytes.copy_from_slice(&metapage[0..4]);
+            root_page_id = u32::from_ne_bytes(r_bytes);
+            let mut n_bytes = [0u8; 4];
+            n_bytes.copy_from_slice(&metapage[4..8]);
+            write_pager.next_page_id = u32::from_ne_bytes(n_bytes);
+        }
+        let read_pager = ReadPager::open(write_pager.file())?;
+        Ok(Self {
+            read_pager,
+            write_pager,
+            root_page_id,
+            dirty_nodes: HashMap::new(),
+        })
+    }
+
+    #[inline(always)]
+    pub fn get_node(&self, page_id: u32) -> Result<&AvNodePage, MesoError> {
+        if let Some(node) = self.dirty_nodes.get(&page_id) {
+            Ok(node)
+        } else {
+            self.read_pager.get_av_node(page_id)
+        }
+    }
+
+    pub fn put_kv(&mut self, key: AvIndexKey, val: IndexValue) -> Result<(), MesoError> {
+        let (new_root_id, split_opt) = self.insert_into_node(self.root_page_id, key, val)?;
+        if let Some((split_key, right_page_id)) = split_opt {
+            let super_root_id = {
+                let id = self.write_pager.next_page_id;
+                self.write_pager.next_page_id += 1;
+                id
+            };
+            let mut super_root = unsafe { std::mem::zeroed::<AvNodePage>() };
+            super_root.header.num_cells = 2;
+            super_root.keys[0] = self.get_node(new_root_id)?.keys[0];
+            super_root.values[0] = Self::make_child_ptr(new_root_id);
+            super_root.keys[1] = split_key;
+            super_root.values[1] = Self::make_child_ptr(right_page_id);
+            self.dirty_nodes.insert(super_root_id, super_root);
+            self.root_page_id = super_root_id;
+        } else {
+            self.root_page_id = new_root_id;
+        }
+        Ok(())
+    }
+
+    fn insert_into_node(
+        &mut self,
+        page_id: u32,
+        target_key: AvIndexKey,
+        target_val: IndexValue,
+    ) -> Result<(u32, Option<(AvIndexKey, u32)>), MesoError> {
+        let mut new_node = *self.get_node(page_id)?;
+        let new_page_id = if page_id >= self.read_pager.num_pages {
+            page_id
+        } else {
+            let id = self.write_pager.next_page_id;
+            self.write_pager.next_page_id += 1;
+            id
+        };
+        let num_cells = new_node.header.num_cells as usize;
+
+        if new_node.header.is_leaf == 1 {
+            let mut insert_idx = 0;
+            while insert_idx < num_cells && new_node.keys[insert_idx] < target_key {
+                insert_idx += 1;
+            }
+            if insert_idx < num_cells && new_node.keys[insert_idx] == target_key {
+                new_node.values[insert_idx] = target_val;
+                self.dirty_nodes.insert(new_page_id, new_node);
+                return Ok((new_page_id, None));
+            }
+            if num_cells < AV_NUM_CELLS {
+                for i in (insert_idx..num_cells).rev() {
+                    new_node.keys[i + 1] = new_node.keys[i];
+                    new_node.values[i + 1] = new_node.values[i];
+                }
+                new_node.keys[insert_idx] = target_key;
+                new_node.values[insert_idx] = target_val;
+                new_node.header.num_cells += 1;
+                self.dirty_nodes.insert(new_page_id, new_node);
+                Ok((new_page_id, None))
+            } else {
+                let mut temp_keys = [unsafe { std::mem::zeroed::<AvIndexKey>() }; AV_NUM_CELLS + 1];
+                let mut temp_vals = [unsafe { std::mem::zeroed::<IndexValue>() }; AV_NUM_CELLS + 1];
+                temp_keys[..insert_idx].copy_from_slice(&new_node.keys[..insert_idx]);
+                temp_vals[..insert_idx].copy_from_slice(&new_node.values[..insert_idx]);
+                temp_keys[insert_idx] = target_key;
+                temp_vals[insert_idx] = target_val;
+                if insert_idx < AV_NUM_CELLS {
+                    temp_keys[insert_idx + 1..]
+                        .copy_from_slice(&new_node.keys[insert_idx..AV_NUM_CELLS]);
+                    temp_vals[insert_idx + 1..]
+                        .copy_from_slice(&new_node.values[insert_idx..AV_NUM_CELLS]);
+                }
+                let right_page_id = {
+                    let id = self.write_pager.next_page_id;
+                    self.write_pager.next_page_id += 1;
+                    id
+                };
+                let split_idx = AV_NUM_CELLS / 2;
+                let mut right_node = unsafe { std::mem::zeroed::<AvNodePage>() };
+                right_node.header.is_leaf = 1;
+                right_node.header.num_cells = ((AV_NUM_CELLS + 1) - split_idx) as u16;
+                right_node.header.right_sibling = new_node.header.right_sibling;
+                right_node.keys[..right_node.header.num_cells as usize]
+                    .copy_from_slice(&temp_keys[split_idx..]);
+                right_node.values[..right_node.header.num_cells as usize]
+                    .copy_from_slice(&temp_vals[split_idx..]);
+                new_node.header.num_cells = split_idx as u16;
+                new_node.header.right_sibling = right_page_id;
+                new_node.keys[..split_idx].copy_from_slice(&temp_keys[..split_idx]);
+                new_node.values[..split_idx].copy_from_slice(&temp_vals[..split_idx]);
+                self.dirty_nodes.insert(new_page_id, new_node);
+                self.dirty_nodes.insert(right_page_id, right_node);
+                Ok((new_page_id, Some((temp_keys[split_idx], right_page_id))))
+            }
+        } else {
+            let mut child_idx = 0;
+            while child_idx < num_cells && target_key >= new_node.keys[child_idx] {
+                child_idx += 1;
+            }
+            if child_idx > 0 {
+                child_idx -= 1;
+            }
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(&new_node.values[child_idx].payload[0..4]);
+            let child_page_id = u32::from_ne_bytes(bytes);
+            let (new_child_id, split_opt) =
+                self.insert_into_node(child_page_id, target_key, target_val)?;
+            new_node.values[child_idx] = Self::make_child_ptr(new_child_id);
+            if target_key < new_node.keys[child_idx] {
+                new_node.keys[child_idx] = target_key;
+            }
+            if let Some((split_key, right_child_id)) = split_opt {
+                let insert_idx = child_idx + 1;
+                let target_ptr = Self::make_child_ptr(right_child_id);
+                if num_cells < AV_NUM_CELLS {
+                    for i in (insert_idx..num_cells).rev() {
+                        new_node.keys[i + 1] = new_node.keys[i];
+                        new_node.values[i + 1] = new_node.values[i];
+                    }
+                    new_node.keys[insert_idx] = split_key;
+                    new_node.values[insert_idx] = target_ptr;
+                    new_node.header.num_cells += 1;
+                    self.dirty_nodes.insert(new_page_id, new_node);
+                    Ok((new_page_id, None))
+                } else {
+                    let mut temp_keys =
+                        [unsafe { std::mem::zeroed::<AvIndexKey>() }; AV_NUM_CELLS + 1];
+                    let mut temp_vals =
+                        [unsafe { std::mem::zeroed::<IndexValue>() }; AV_NUM_CELLS + 1];
+                    temp_keys[..insert_idx].copy_from_slice(&new_node.keys[..insert_idx]);
+                    temp_vals[..insert_idx].copy_from_slice(&new_node.values[..insert_idx]);
+                    temp_keys[insert_idx] = split_key;
+                    temp_vals[insert_idx] = target_ptr;
+                    if insert_idx < AV_NUM_CELLS {
+                        temp_keys[insert_idx + 1..]
+                            .copy_from_slice(&new_node.keys[insert_idx..AV_NUM_CELLS]);
+                        temp_vals[insert_idx + 1..]
+                            .copy_from_slice(&new_node.values[insert_idx..AV_NUM_CELLS]);
+                    }
+                    let right_internal_id = {
+                        let id = self.write_pager.next_page_id;
+                        self.write_pager.next_page_id += 1;
+                        id
+                    };
+                    let split_idx = AV_NUM_CELLS / 2;
+                    let mut right_node = unsafe { std::mem::zeroed::<AvNodePage>() };
+                    right_node.header.num_cells = ((AV_NUM_CELLS + 1) - split_idx) as u16;
+                    right_node.keys[..right_node.header.num_cells as usize]
+                        .copy_from_slice(&temp_keys[split_idx..]);
+                    right_node.values[..right_node.header.num_cells as usize]
+                        .copy_from_slice(&temp_vals[split_idx..]);
+                    new_node.header.num_cells = split_idx as u16;
+                    new_node.keys[..split_idx].copy_from_slice(&temp_keys[..split_idx]);
+                    new_node.values[..split_idx].copy_from_slice(&temp_vals[..split_idx]);
+                    self.dirty_nodes.insert(new_page_id, new_node);
+                    self.dirty_nodes.insert(right_internal_id, right_node);
+                    Ok((new_page_id, Some((temp_keys[split_idx], right_internal_id))))
+                }
+            } else {
+                self.dirty_nodes.insert(new_page_id, new_node);
+                Ok((new_page_id, None))
+            }
+        }
+    }
+
+    pub fn flush(&mut self) -> Result<(), MesoError> {
+        for (page_id, node) in &self.dirty_nodes {
+            self.write_pager
+                .write_page_bytes(*page_id, bytemuck::bytes_of(node))?;
+        }
+        let mut metapage = [0u8; 4096];
+        metapage[0..4].copy_from_slice(&self.root_page_id.to_ne_bytes());
+        metapage[4..8].copy_from_slice(&self.write_pager.next_page_id.to_ne_bytes());
+        self.write_pager.write_page_bytes(0, &metapage)?;
+        self.write_pager.flush()?;
+        self.read_pager = ReadPager::open(self.write_pager.file())?;
+        self.dirty_nodes.clear();
+        Ok(())
+    }
+
+    fn make_child_ptr(page_id: u32) -> IndexValue {
+        let mut payload = [0u8; 8];
+        payload[0..4].copy_from_slice(&page_id.to_ne_bytes());
+        IndexValue {
+            type_tag: 255,
+            padding: [0; 7],
+            payload,
+        }
+    }
+}
+
+pub struct AvtIndex {
+    pub core: AvtCoreBTree,
+}
+impl AvtIndex {
+    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, MesoError> {
+        Ok(Self {
+            core: AvtCoreBTree::open(path)?,
+        })
+    }
+    pub fn put(
+        &mut self,
+        a: AttributeId,
+        v: &Value,
+        e: EntityId,
+        is_add: bool,
+    ) -> Result<(), MesoError> {
+        let v_sort = match v {
+            Value::Int64(i) => crate::page::encode_i64(*i),
+            Value::Float64(f) => crate::page::encode_f64(*f),
+            Value::Timestamp(t) => crate::page::encode_i64(*t),
+            Value::Boolean(b) => {
+                if *b {
+                    1
+                } else {
+                    0
+                }
+            }
+            Value::Ref(r) => *r,
+            _ => return Ok(()),
+        };
+        let key = AvIndexKey {
+            a,
+            _pad: 0,
+            v_sort,
+            e,
+        };
+        let val = IndexValue {
+            type_tag: if is_add { 1 } else { 254 },
+            padding: [0; 7],
+            payload: [0; 8],
+        };
+        self.core.put_kv(key, val)
+    }
+    pub fn flush(&mut self) -> Result<(), MesoError> {
+        self.core.flush()
+    }
+    pub fn snapshot(&self) -> AvtIndexSnapshot {
+        AvtIndexSnapshot {
+            pager: self.core.read_pager.clone(),
+            root_page_id: self.core.root_page_id,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct AvtIndexSnapshot {
+    pub pager: ReadPager,
+    pub root_page_id: u32,
+}
+impl AvtIndexSnapshot {
+    pub fn range_scan(
+        &self,
+        a: AttributeId,
+        v_min: u64,
+        v_max: u64,
+    ) -> Result<Vec<EntityId>, MesoError> {
+        let start_key = AvIndexKey {
+            a,
+            _pad: 0,
+            v_sort: v_min,
+            e: 0,
+        };
+        let end_key = AvIndexKey {
+            a,
+            _pad: 0,
+            v_sort: v_max,
+            e: u64::MAX,
+        };
+        let mut current_page_id = self.root_page_id;
+
+        loop {
+            let node = self.pager.get_av_node(current_page_id)?;
+            let num_cells = node.header.num_cells as usize;
+            if num_cells == 0 {
+                return Ok(Vec::new());
+            }
+            if node.header.is_leaf == 1 {
+                break;
+            }
+            let mut child_idx = 0;
+            while child_idx < num_cells && start_key >= node.keys[child_idx] {
+                child_idx += 1;
+            }
+            if child_idx > 0 {
+                child_idx -= 1;
+            }
+            let mut bytes = [0u8; 4];
+            bytes.copy_from_slice(&node.values[child_idx].payload[0..4]);
+            current_page_id = u32::from_ne_bytes(bytes);
+        }
+
+        let mut results = Vec::new();
+        loop {
+            let node = self.pager.get_av_node(current_page_id)?;
+            let num_cells = node.header.num_cells as usize;
+            for i in 0..num_cells {
+                let key = node.keys[i];
+                if key > end_key {
+                    return Ok(results);
+                }
+                if key >= start_key && node.values[i].type_tag != 254 {
+                    results.push(key.e);
+                }
+            }
+            if node.header.right_sibling == 0 {
+                break;
+            }
+            current_page_id = node.header.right_sibling;
+        }
+        Ok(results)
+    }
+}
+
+// ==============================================================================
 // STRICT MILITARY-GRADE TESTS (DO NOT DELETE)
 // ==============================================================================
 
@@ -1082,5 +1458,29 @@ mod tests {
         assert_eq!(index.get(attr_age, &age_val).unwrap(), Some(111));
         assert_eq!(index.get(attr_active, &active_val).unwrap(), Some(222));
         assert_eq!(index.get(attr_age, &Value::Int64(99)).unwrap(), None);
+    }
+
+    #[test]
+    fn test_avt_index_range_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = AvtIndex::open(dir.path().join("avt.idx")).unwrap();
+
+        let attr = 50;
+        // Insert values 10, 20, 30, 40
+        index.put(attr, &Value::Int64(10), 1, true).unwrap();
+        index.put(attr, &Value::Int64(20), 2, true).unwrap();
+        index.put(attr, &Value::Int64(30), 3, true).unwrap();
+        index.put(attr, &Value::Int64(40), 4, true).unwrap();
+
+        index.flush().unwrap();
+        let snap = index.snapshot();
+
+        let v_min = crate::page::encode_i64(15);
+        let v_max = crate::page::encode_i64(35);
+
+        let results = snap.range_scan(attr, v_min, v_max).unwrap();
+
+        // Should fetch entities 2 and 3 natively via the B+Tree leaf chain
+        assert_eq!(results, vec![2, 3]);
     }
 }

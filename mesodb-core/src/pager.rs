@@ -10,7 +10,7 @@ use std::{
 
 use crate::{
     error::MesoError,
-    page::{NodePage, OverflowPage, PAGE_SIZE},
+    page::{AvNodePage, NodePage, OverflowPage, PAGE_SIZE},
 };
 
 /// 100% Lock-Free, Zero-Copy Read Engine.
@@ -56,6 +56,19 @@ impl ReadPager {
 
     #[inline(always)]
     pub fn get_overflow(&self, page_id: u32) -> Result<&OverflowPage, MesoError> {
+        if page_id >= self.num_pages {
+            return Err(MesoError::Serialization(format!(
+                "ReadPager out of bounds: {}",
+                page_id
+            )));
+        }
+        let offset = (page_id as usize) * PAGE_SIZE;
+        let page_bytes = &self.mmap[offset..(offset + PAGE_SIZE)];
+        Ok(bytemuck::from_bytes(page_bytes))
+    }
+
+    #[inline(always)]
+    pub fn get_av_node(&self, page_id: u32) -> Result<&AvNodePage, MesoError> {
         if page_id >= self.num_pages {
             return Err(MesoError::Serialization(format!(
                 "ReadPager out of bounds: {}",
