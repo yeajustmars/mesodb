@@ -41,6 +41,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // 1. Resolve Engine Backend
+    let mut _ephemeral_dir = None;
+
     let (engine, target_label): (Arc<dyn MesoEngine>, String) = if let Some(endpoint) = cli.endpoint
     {
         (Arc::new(RemoteEngine::new(endpoint.clone())), endpoint)
@@ -49,16 +51,21 @@ async fn main() -> Result<()> {
             .expect("Failed to boot embedded MesoDB engine");
         (
             Arc::new(EmbeddedEngine::new(Arc::new(core_db))),
-            "local".to_string(),
+            format!("local: {}", path),
         )
     } else {
-        // DEFAULT UX: Boot an embedded DB in the current directory if no args provided
-        let default_path = "./.mesodb";
-        let core_db = MesoDB::open(default_path, SchemaMap::new(), Config::default())
+        // DEFAULT UX: Boot an ephemeral DB in a temporary directory
+        let temp_dir = tempfile::tempdir().expect("Failed to create temporary directory");
+        let default_path = temp_dir.path().join("ephemeral.db");
+        let core_db = MesoDB::open(&default_path, SchemaMap::new(), Config::default())
             .expect("Failed to boot embedded MesoDB engine");
+
+        // Keep the TempDir handle alive until the CLI process exits
+        _ephemeral_dir = Some(temp_dir);
+
         (
             Arc::new(EmbeddedEngine::new(Arc::new(core_db))),
-            "local: ./.mesodb".to_string(),
+            "local: ephemeral".to_string(),
         )
     };
 
