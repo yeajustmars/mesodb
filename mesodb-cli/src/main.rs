@@ -1,98 +1,94 @@
 // mesodb-cli/src/main.rs
 
-use clap::{Parser, Subcommand};
+use clap::Parser;
+use color_eyre::Result;
 use reedline::{FileBackedHistory, Reedline, Signal};
-use reqwest::Client;
-
-use mesodb_doc::print_doc_to_terminal;
+use std::sync::Arc;
 
 mod commands;
-mod edn;
+mod engine;
+mod format;
 mod repl;
-mod tutor;
+
+use commands::MesoCommand;
+use engine::{MesoEngine, embedded::EmbeddedEngine, remote::RemoteEngine};
+use mesodb_core::{config::Config, db::MesoDB, schema::SchemaMap};
 
 #[derive(Parser, Debug)]
-#[command(name = "mesodb", version, about = "MesoDB Interactive Thin Client")]
+#[command(
+    name = "mesodb",
+    version,
+    about = "MesoDB Interactive CLI & Server Client"
+)]
 struct Cli {
-    #[arg(short, long)]
-    uri: Option<String>,
+    #[arg(
+        long,
+        env = "MESODB_ENDPOINT",
+        help = "Connect to a remote MesoDB Server (e.g. http://127.0.0.1:8000)"
+    )]
+    endpoint: Option<String>,
 
-    #[arg(short, long)]
-    query: Option<String>,
+    #[arg(long, help = "Path to run an embedded MesoDB instance directly")]
+    db_path: Option<String>,
 
     #[command(subcommand)]
-    command: Option<Commands>,
-}
-
-#[derive(Subcommand, Debug)]
-enum Commands {
-    TryMeso,
-}
-
-pub enum SessionState {
-    Disconnected,
-    Connected { uri: String, client: Client },
-    Tutor(Box<tutor::TutorSession>),
+    command: Option<MesoCommand>,
 }
 
 #[tokio::main]
-async fn main() -> color_eyre::Result<()> {
+async fn main() -> Result<()> {
     color_eyre::install()?;
     let cli = Cli::parse();
 
-    let mut session = if let Some(uri) = cli.uri {
-        SessionState::Connected {
-            uri,
-            client: Client::new(),
-        }
+    // 1. Resolve Engine Backend
+    let (engine, target_label): (Arc<dyn MesoEngine>, String) = if let Some(endpoint) = cli.endpoint
+    {
+        (Arc::new(RemoteEngine::new(endpoint.clone())), endpoint)
+    } else if let Some(path) = cli.db_path {
+        let core_db = MesoDB::open(&path, SchemaMap::new(), Config::default())
+            .expect("Failed to boot embedded MesoDB engine");
+        (
+            Arc::new(EmbeddedEngine::new(Arc::new(core_db))),
+            "local".to_string(),
+        )
     } else {
-        SessionState::Disconnected
+        // DEFAULT UX: Boot an embedded DB in the current directory if no args provided
+        let default_path = "./.mesodb";
+        let core_db = MesoDB::open(default_path, SchemaMap::new(), Config::default())
+            .expect("Failed to boot embedded MesoDB engine");
+        (
+            Arc::new(EmbeddedEngine::new(Arc::new(core_db))),
+            "local: ./.mesodb".to_string(),
+        )
     };
 
-    if let Some(cmd) = &cli.command {
-        match cmd {
-            Commands::TryMeso => {
-                println!("TryMeso execution moved to sandbox handler.");
-                return Ok(());
-            }
-        }
-    }
-
-    if let Some(q) = cli.query {
-        match &session {
-            SessionState::Connected { uri, client } => {
-                let _ = commands::query::execute(client, uri, &q, None).await;
-            }
-            _ => eprintln!("Error: Cannot execute shell query without a connection URI."),
+    // 2. Execute Subcommand (Non-Interactive)
+    if let Some(cmd) = cli.command {
+        if let Err(e) = commands::execute_command(engine.as_ref(), cmd).await {
+            eprintln!("❌ Error: {}", e);
+            std::process::exit(1);
         }
         return Ok(());
     }
 
-    println!("MesoDB Interactive CLI");
-    println!("Type .doc for help, .connect <uri> to connect, or .learn for the tutorial.\n");
+    // 3. Launch Interactive REPL
+    println!("MesoDB Interactive Shell");
+    println!("Type .help for commands, or directly enter EDN to query/transact.\n");
 
-    // Reedline Engine Initialization
     let history = Box::new(
         FileBackedHistory::with_file(1000, "mesodb_history.txt".into())
-            .expect("Failed to setup history"),
+            .expect("Failed to setup history file"),
     );
-    let validator = Box::new(repl::MesoValidator);
 
     let mut line_editor = Reedline::create()
         .with_history(history)
-        .with_validator(validator);
+        .with_validator(Box::new(repl::MesoValidator))
+        .with_highlighter(Box::new(repl::MesoHighlighter))
+        .with_completer(Box::new(repl::MesoCompleter::new()));
+
+    let prompt = repl::MesoPrompt::new(target_label);
 
     loop {
-        // Dynamic prompt evaluation
-        let prompt_str = match &session {
-            SessionState::Disconnected => "meso(offline)".to_string(),
-            SessionState::Connected { .. } => "meso(active)".to_string(),
-            SessionState::Tutor(_) => "meso(tutor)".to_string(), // Update this line!
-        };
-
-        let prompt = repl::MesoPrompt::new(prompt_str);
-
-        // Reedline captures signals beautifully
         let sig = line_editor.read_line(&prompt);
 
         match sig {
@@ -102,81 +98,97 @@ async fn main() -> color_eyre::Result<()> {
                     continue;
                 }
 
-                // 1. Global Escapes (Always available)
-                let cmd = input.split_whitespace().next().unwrap_or("");
-                if cmd == ".exit" || cmd == ".quit" || cmd == ".q" {
-                    break;
-                }
-
-                // 2. State Interceptors (Tutor gets first dibs)
-                if let SessionState::Tutor(ref mut tutor_session) = session {
-                    let is_active = tutor_session.process_input(input).await; // <-- Added .await
-                    if !is_active {
-                        session = SessionState::Disconnected;
-                    }
-                    continue;
-                }
-
-                // 3. Normal Meta-Commands (Shell Control)
-                if input.starts_with('.') {
-                    match cmd {
-                        ".connect" => commands::config::connect(&mut session, input),
-                        ".doc" => {
-                            // TODO: handle unicode strings (even though they're not valid here)
-                            let name = input.get(5..).expect("Failed to get doc substring");
-                            print_doc_to_terminal(name)?
-                        }
-                        ".help" => println!("TODO: impl help"),
-                        ".learn" => {
-                            let session_machine =
-                                tutor::TutorSession::new(tutor::hr_story::build()).await;
-                            session_machine.start();
-                            session = SessionState::Tutor(Box::new(session_machine)); // Box it!
-                        }
-                        _ => eprintln!("Unknown shell command. Type .doc for help."),
-                    }
-                    continue;
-                }
-
-                // 4. Database Execution (Auto-Routing)
-                if input.starts_with('[') {
-                    // Datalog queries usually start with [:find
-                    let is_query = input.replace(" ", "").starts_with("[:find");
-
-                    match &session {
-                        SessionState::Connected { uri, client } => {
-                            if is_query {
-                                let _ = commands::query::execute(client, uri, input, None).await;
-                            } else {
-                                let _ = commands::transact::execute(client, uri, input).await;
-                            }
-                        }
-                        SessionState::Disconnected => {
-                            eprintln!("⚠️ Not Connected. Use .connect :host <uri> or .learn.")
-                        }
-                        SessionState::Tutor(_) => unreachable!(), // Already handled by Block 2
-                    }
-                } else {
-                    eprintln!(
-                        "Syntax Error: Database commands must be valid EDN starting with '['."
-                    );
-                    eprintln!("Type .doc for help or .learn for an interactive tutorial.");
+                if let Err(e) = process_repl_input(engine.as_ref(), input).await {
+                    eprintln!("❌ Error: {}", e);
                 }
             }
             Ok(Signal::CtrlC) => {
                 println!("^C");
-                continue;
             }
             Ok(Signal::CtrlD) => {
-                println!("Graceful exit requested (EOF).");
+                println!("Graceful exit requested.");
                 break;
             }
             Err(err) => {
-                eprintln!("Error: {:?}", err);
+                eprintln!("REPL Error: {:?}", err);
                 break;
             }
         }
     }
 
     Ok(())
+}
+
+/// Routes raw REPL string inputs into appropriate Engine trait calls
+async fn process_repl_input(engine: &dyn MesoEngine, input: &str) -> Result<(), String> {
+    // 1. Meta Commands
+    if input.starts_with('.') {
+        let mut parts = input.split_whitespace();
+        let cmd = parts.next().unwrap_or("");
+        let rest = parts.collect::<Vec<&str>>().join(" ");
+
+        match cmd {
+            ".exit" | ".quit" | ".q" => std::process::exit(0),
+            ".help" => {
+                println!("Available Meta Commands:");
+                println!("  .query <EDN>   - Execute a Datalog query");
+                println!("  .tx <EDN>      - Execute a transaction");
+                println!("  .status        - View server status");
+                println!("  .compact       - Trigger background compaction");
+                println!("  .exit          - Close the session");
+                return Ok(());
+            }
+            ".status" => return commands::execute_command(engine, MesoCommand::Status).await,
+            ".compact" => return commands::execute_command(engine, MesoCommand::Compact).await,
+            ".query" => {
+                return commands::execute_command(
+                    engine,
+                    MesoCommand::Query {
+                        query: rest,
+                        format: "table".to_string(), // Request tabular rendering instead of raw EDN
+                        as_of: None,
+                    },
+                )
+                .await;
+            }
+            ".tx" => {
+                return commands::execute_command(engine, MesoCommand::Transact { edn: rest })
+                    .await;
+            }
+            _ => return Err(format!("Unknown meta-command: {}", cmd)),
+        }
+    }
+
+    // 2. Automatic Datalog Routing (Heuristic)
+    let stripped = input.replace(' ', "").replace('\n', "");
+    if stripped.starts_with("[:find") {
+        commands::execute_command(
+            engine,
+            MesoCommand::Query {
+                query: input.to_string(),
+                format: "table".to_string(), // Request tabular rendering
+                as_of: None,
+            },
+        )
+        .await
+    } else if stripped.starts_with("[[:") {
+        commands::execute_command(
+            engine,
+            MesoCommand::Transact {
+                edn: input.to_string(),
+            },
+        )
+        .await
+    } else {
+        Err("Syntax Error: Datalog input must begin with '[:find' or '[[:'.".to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Basic verification that the module compiles cleanly.
+    #[test]
+    fn test_main_module_compiles() {
+        assert!(true);
+    }
 }

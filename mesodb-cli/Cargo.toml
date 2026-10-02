@@ -7,16 +7,20 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-chrono.workspace = true
-clap.workspace = true
+async-trait.workspace = true
+clap = { workspace = true, features = ["derive"] }
 color-eyre.workspace = true
 comfy-table.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-reqwest.workspace = true
+crossterm.workspace = true
+nu-ansi-term.workspace = true
+ratatui.workspace = true
 reedline.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 tempfile.workspace = true
-tokio.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["full", "macros"] }
 
 mesodb-core = { path = "../mesodb-core" }
 mesodb-doc = { path = "../mesodb-doc" }

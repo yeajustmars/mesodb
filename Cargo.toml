@@ -20,24 +20,28 @@ mesodb-core = { path = "mesodb-core", version = "0.1.0" }
 mesodb-server = { path = "mesodb-server", version = "0.1.0" }
 
 # Core system (core, server, CLI, ...)
+ahash = "0.8.12"
 arrow = "58.2.0"
 arrow-flight = "58.2.0"
-ahash = "0.8.12"
+async-trait = "0.1"
 axum = { version = "0.8.9", features = ["json", "macros"] }
 bytemuck = { version = "1.25.1", features = [ "derive" ] }
 chrono = "0.4.44"
+crossterm = "0.27"
 clap = { version = "4.6.1", features = ["derive"] }
 color-eyre = "0.6.5"
 comfy-table = "7.2.2"
 datafusion = "53.1.0"
 futures = "0.3.32"
 memmap2 = "0.9.11"
+nu-ansi-term = "0.50.3"
 ordered-float = "5.3.0"
 parking_lot = "0.12.5"
 parquet = "58.2.0"
 pest = "2.8.6"
 pest_derive = "2.8.6"
 prost = "0.14.4"
+ratatui = "0.26"
 reedline = "0.38.0"
 reqwest = { version = "0.13.3", features = ["json"] }
 rkyv = "0.8.16"
