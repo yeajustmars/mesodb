@@ -11,7 +11,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Channel, Server};
 
 use mesodb_core::config::Config;
-use mesodb_core::db::MesoDB;
+use mesodb_core::db::MesoDb;
 use mesodb_core::schema::{SchemaMap, ValueType};
 use mesodb_core::transactor::Fact;
 use mesodb_core::types::Value;
@@ -21,7 +21,7 @@ use mesodb_server::flight::MesoFlightServer;
 async fn setup_bench_server() -> (
     tokio::task::JoinHandle<()>,
     FlightServiceClient<Channel>,
-    Arc<MesoDB>,
+    Arc<MesoDb>,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let mut schema = SchemaMap::new();
@@ -29,7 +29,7 @@ async fn setup_bench_server() -> (
     schema.add_attribute(":bench/value", ValueType::Int64, false);
 
     let db =
-        Arc::new(MesoDB::open(dir.path().join("bench.db"), schema, Config::default()).unwrap());
+        Arc::new(MesoDb::open(dir.path().join("bench.db"), schema, Config::default()).unwrap());
     let flight_service = MesoFlightServer::new(db.clone());
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

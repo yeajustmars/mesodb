@@ -14,16 +14,16 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::dto::QueryRequest;
 use mesodb_core::{
-    db::{MesoDB, OutputFormat, QueryOptions},
+    db::{MesoDb, OutputFormat, QueryOptions},
     wire::parse_wire_batch,
 };
 
 pub struct MesoFlightServer {
-    db: Arc<MesoDB>,
+    db: Arc<MesoDb>,
 }
 
 impl MesoFlightServer {
-    pub fn new(db: Arc<MesoDB>) -> Self {
+    pub fn new(db: Arc<MesoDb>) -> Self {
         Self { db }
     }
 }
@@ -266,7 +266,7 @@ mod tests {
     use tonic::transport::{Channel, Server};
 
     use mesodb_core::config::Config;
-    use mesodb_core::db::MesoDB;
+    use mesodb_core::db::MesoDb;
     use mesodb_core::schema::{SchemaMap, ValueType};
     use mesodb_core::transactor::Fact;
     use mesodb_core::types::Value;
@@ -279,7 +279,7 @@ mod tests {
         schema.add_attribute(":user/age", ValueType::Int64, false);
 
         let db =
-            Arc::new(MesoDB::open(dir.path().join("test.db"), schema, Config::default()).unwrap());
+            Arc::new(MesoDb::open(dir.path().join("test.db"), schema, Config::default()).unwrap());
         let flight_service = MesoFlightServer::new(db);
 
         // Bind to a random available port

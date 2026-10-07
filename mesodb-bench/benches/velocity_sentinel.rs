@@ -5,7 +5,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 use mesodb_core::config::{Config, WalSyncMode};
-use mesodb_core::db::{MesoDB, QueryOptions};
+use mesodb_core::db::{MesoDb, QueryOptions};
 use mesodb_core::schema::{SchemaMap, ValueType};
 use mesodb_core::transactor::Fact;
 use mesodb_core::types::Value;
@@ -14,7 +14,7 @@ use mesodb_core::types::Value;
 // VECTOR 4: VELOCITY SENTINEL BENCHMARKS
 // =====================================================================
 
-fn setup_scaling_db(dir: &TempDir, num_facts: usize) -> MesoDB {
+fn setup_scaling_db(dir: &TempDir, num_facts: usize) -> MesoDb {
     let mut schema = SchemaMap::new();
     schema.add_attribute(":sys/scale", ValueType::Int64, false);
 
@@ -25,7 +25,7 @@ fn setup_scaling_db(dir: &TempDir, num_facts: usize) -> MesoDB {
     // raw execution velocity in memory, isolating it from disk I/O jitter.
     config.storage.memtable_max_rows = 1_500_000;
 
-    let db = MesoDB::open(
+    let db = MesoDb::open(
         dir.path().join(format!("scale_{}.db", num_facts)),
         schema,
         config,

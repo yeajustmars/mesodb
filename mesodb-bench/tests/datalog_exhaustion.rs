@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tempfile::tempdir;
 
 use mesodb_core::config::{Config, WalSyncMode};
-use mesodb_core::db::{MesoDB, QueryOptions};
+use mesodb_core::db::{MesoDb, QueryOptions};
 use mesodb_core::schema::{SchemaMap, ValueType};
 use mesodb_core::transactor::Fact;
 use mesodb_core::types::Value;
@@ -11,7 +11,7 @@ use mesodb_core::types::Value;
 // VECTOR 3: DATALOG EXHAUSTION SUITE
 // =====================================================================
 
-fn setup_exhaustion_db(dir: &tempfile::TempDir) -> Arc<MesoDB> {
+fn setup_exhaustion_db(dir: &tempfile::TempDir) -> Arc<MesoDb> {
     let mut schema = SchemaMap::new();
     schema.add_attribute(":node/parent", ValueType::Ref, false);
     schema.add_attribute(":node/name", ValueType::String, false);
@@ -23,7 +23,7 @@ fn setup_exhaustion_db(dir: &tempfile::TempDir) -> Arc<MesoDB> {
     // and WorldView pointer swaps during query evaluation.
     config.storage.memtable_max_rows = 50;
 
-    Arc::new(MesoDB::open(dir.path().join("exhaustion.db"), schema, config).unwrap())
+    Arc::new(MesoDb::open(dir.path().join("exhaustion.db"), schema, config).unwrap())
 }
 
 #[tokio::test]

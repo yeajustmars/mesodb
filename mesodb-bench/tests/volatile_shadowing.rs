@@ -2,7 +2,7 @@ use tempfile::tempdir;
 use tokio::time::{Duration, sleep};
 
 use mesodb_core::config::{Config, WalSyncMode};
-use mesodb_core::db::MesoDB;
+use mesodb_core::db::MesoDb;
 use mesodb_core::schema::{SchemaMap, ValueType};
 use mesodb_core::transactor::Fact;
 use mesodb_core::types::Value;
@@ -13,7 +13,7 @@ use mesodb_core::types::Value;
 
 /// Forces the transactor to exceed the hardcoded 50,000 row threshold in `db.rs`
 /// to guarantee the background compactor moves the batch to Parquet.
-async fn force_disk_flush(db: &MesoDB, start_e: u64) {
+async fn force_disk_flush(db: &MesoDb, start_e: u64) {
     let mut dummy_facts = Vec::with_capacity(50_001);
     for i in 0..50_001 {
         dummy_facts.push(Fact {
@@ -30,7 +30,7 @@ async fn force_disk_flush(db: &MesoDB, start_e: u64) {
     sleep(Duration::from_millis(500)).await;
 }
 
-fn setup_shadow_db(dir: &tempfile::TempDir) -> MesoDB {
+fn setup_shadow_db(dir: &tempfile::TempDir) -> MesoDb {
     let mut schema = SchemaMap::new();
     schema.add_attribute(":user/name", ValueType::String, false);
     schema.add_attribute(":user/age", ValueType::Int64, false);
@@ -40,7 +40,7 @@ fn setup_shadow_db(dir: &tempfile::TempDir) -> MesoDB {
     let mut config = Config::default();
     config.storage.wal_sync_mode = WalSyncMode::Background;
 
-    MesoDB::open(dir.path().join("shadow.db"), schema, config).unwrap()
+    MesoDb::open(dir.path().join("shadow.db"), schema, config).unwrap()
 }
 
 #[tokio::test]

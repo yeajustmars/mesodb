@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tonic::transport::Server as TonicServer;
 
 use mesodb_core::config::Config;
-use mesodb_core::db::MesoDB;
+use mesodb_core::db::MesoDb;
 use mesodb_core::schema::SchemaMap;
 use mesodb_server::{flight::MesoFlightServer, handlers};
 
@@ -33,7 +33,7 @@ async fn main() -> color_eyre::Result<()> {
     // TODO: fix hardcoded config path
     let db_path = PathBuf::from("./data/prod_server.db");
     let config = Config::default();
-    let db = Arc::new(MesoDB::open(db_path, schema, config)?);
+    let db = Arc::new(MesoDb::open(db_path, schema, config)?);
 
     // ==========================================
     // 1. Setup Axum HTTP Server

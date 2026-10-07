@@ -2,7 +2,7 @@
 
 use comfy_table::{Cell, Table, modifiers::UTF8_ROUND_CORNERS, presets::UTF8_FULL};
 use mesodb_core::config::Config;
-use mesodb_core::db::{MesoDB, OutputFormat, QueryOptions};
+use mesodb_core::db::{MesoDb, OutputFormat, QueryOptions};
 use mesodb_core::schema::SchemaMap;
 // use mesodb_core::transactor::Fact;
 use tempfile::TempDir;
@@ -29,7 +29,7 @@ pub struct Step {
 pub struct TutorSession {
     pub story: TutorStory,
     pub current_step: usize,
-    pub db: MesoDB,
+    pub db: MesoDb,
     pub _temp_dir: TempDir, // Kept alive so the DB directory isn't deleted during the session
 }
 
@@ -41,7 +41,7 @@ impl TutorSession {
         // We boot the engine with a loose JIT schema for the tutorial sandbox
         let config = Config::default();
         let schema = SchemaMap::new();
-        let db = MesoDB::open(db_path, schema, config).expect("Failed to boot embedded MesoDB");
+        let db = MesoDb::open(db_path, schema, config).expect("Failed to boot embedded MesoDB");
 
         let session = Self {
             story,

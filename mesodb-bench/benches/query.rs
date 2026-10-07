@@ -4,12 +4,12 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use tempfile::TempDir;
 
 use mesodb_core::config::{Config, WalSyncMode};
-use mesodb_core::db::{MesoDB, OutputFormat, QueryOptions};
+use mesodb_core::db::{MesoDb, OutputFormat, QueryOptions};
 use mesodb_core::schema::{SchemaMap, ValueType};
 use mesodb_core::transactor::Fact;
 use mesodb_core::types::Value;
 
-fn setup_populated_db(dir: &TempDir) -> MesoDB {
+fn setup_populated_db(dir: &TempDir) -> MesoDb {
     let mut schema = SchemaMap::new();
     schema.add_attribute(":user/name", ValueType::String, false);
     schema.add_attribute(":user/age", ValueType::Int64, false);
@@ -20,7 +20,7 @@ fn setup_populated_db(dir: &TempDir) -> MesoDB {
     config.storage.wal_sync_mode = WalSyncMode::Background; // Fast setup
     config.storage.memtable_max_rows = 1_000_000; // Keep in RAM for raw query speed
 
-    let db = MesoDB::open(dir.path().join("bench_query.db"), schema, config).unwrap();
+    let db = MesoDb::open(dir.path().join("bench_query.db"), schema, config).unwrap();
 
     // Populate with 100,000 facts (25,000 users + 25,000 orders)
     let mut facts = Vec::with_capacity(100_000);

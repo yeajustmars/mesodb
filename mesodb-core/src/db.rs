@@ -25,7 +25,7 @@ use crate::{
     types::{Result, Value},
 };
 
-pub struct MesoDB {
+pub struct MesoDb {
     /// The transactor is the single writer, guarded by a Tokio Mutex.
     transactor: Mutex<Transactor>,
     /// The WorldView is an atomic pointer. Swapping it takes nanoseconds.
@@ -34,7 +34,7 @@ pub struct MesoDB {
     flush_tx: mpsc::Sender<(u64, RecordBatch)>,
 }
 
-impl MesoDB {
+impl MesoDb {
     pub fn open<P: AsRef<Path>>(path: P, schema: SchemaMap, config: Config) -> Result<Self> {
         let data_dir = path.as_ref().parent().unwrap().to_path_buf();
         create_dir_all(&data_dir)?;
@@ -1430,7 +1430,7 @@ mod tests {
         schema.add_attribute(":user/name", ValueType::String, false);
         schema.add_attribute(":user/age", ValueType::Int64, false);
 
-        let db = MesoDB::open(db_path, schema, Config::default()).unwrap();
+        let db = MesoDb::open(db_path, schema, Config::default()).unwrap();
 
         db.transact(vec![
             Fact {
@@ -1480,7 +1480,7 @@ mod tests {
         let mut schema = SchemaMap::new();
         schema.add_attribute(":user/name", ValueType::String, false);
 
-        let db = MesoDB::open(db_path, schema, Config::default()).unwrap();
+        let db = MesoDb::open(db_path, schema, Config::default()).unwrap();
 
         // T = 100: Assert Alice
         db.transact_at(
@@ -1591,7 +1591,7 @@ mod tests {
     #[tokio::test]
     async fn test_global_query_options_time_travel() {
         let dir = tempfile::tempdir().unwrap();
-        let db = MesoDB::open(
+        let db = MesoDb::open(
             dir.path().join("global_time.db"),
             SchemaMap::new(),
             Config::default(),
@@ -1679,7 +1679,7 @@ mod tests {
     #[tokio::test]
     async fn test_pull_json_and_edn_formats() {
         let dir = tempfile::tempdir().unwrap();
-        let db = MesoDB::open(
+        let db = MesoDb::open(
             dir.path().join("pull.db"),
             SchemaMap::new(),
             Config::default(),
@@ -1763,7 +1763,7 @@ mod tests {
         schema.add_attribute(":order/user", ValueType::Ref, false);
         schema.add_attribute(":order/total", ValueType::Int64, false);
 
-        let db = MesoDB::open(dir.path().join("aggr.db"), schema, Config::default()).unwrap();
+        let db = MesoDb::open(dir.path().join("aggr.db"), schema, Config::default()).unwrap();
 
         db.transact(vec![
             // User 1 has two orders totaling 150
@@ -1863,7 +1863,7 @@ mod tests {
         schema.add_attribute(":person/parent", ValueType::Ref, false);
         schema.add_attribute(":person/name", ValueType::String, false);
 
-        let db = MesoDB::open(dir.path().join("rules.db"), schema, Config::default()).unwrap();
+        let db = MesoDb::open(dir.path().join("rules.db"), schema, Config::default()).unwrap();
 
         db.transact(vec![
             // 1 (Alice) is parent of 2 (Bob)
@@ -1948,7 +1948,7 @@ mod tests {
     // SUITE 1: NATIVE RETURN TYPES & ZERO-COPY SERIALIZATION
     // =====================================================================
 
-    async fn setup_api_db() -> MesoDB {
+    async fn setup_api_db() -> MesoDb {
         let dir = tempfile::tempdir().unwrap();
         let mut schema = SchemaMap::new();
         schema.add_attribute(":user/name", ValueType::String, false);
@@ -1957,7 +1957,7 @@ mod tests {
         schema.add_attribute(":user/address", ValueType::Ref, false);
         schema.add_attribute(":address/city", ValueType::String, false);
 
-        let db = MesoDB::open(dir.path().join("api.db"), schema, Config::default()).unwrap();
+        let db = MesoDb::open(dir.path().join("api.db"), schema, Config::default()).unwrap();
         db.transact(vec![
             Fact {
                 e: 1,
@@ -2157,7 +2157,7 @@ mod tests {
     #[tokio::test]
     async fn test_explicit_schema_transaction_and_query() {
         let dir = tempfile::tempdir().unwrap();
-        let db = MesoDB::open(
+        let db = MesoDb::open(
             dir.path().join("explicit_schema.db"),
             SchemaMap::new(),
             Config::default(),
@@ -2229,7 +2229,7 @@ mod tests {
         let mut schema = SchemaMap::new();
         schema.add_attribute(":user/status", ValueType::String, false);
 
-        let db = MesoDB::open(dir.path().join("history.db"), schema, Config::default()).unwrap();
+        let db = MesoDb::open(dir.path().join("history.db"), schema, Config::default()).unwrap();
 
         // T = 100: User becomes "active"
         db.transact_at(
@@ -2327,7 +2327,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut schema = SchemaMap::new();
         schema.add_attribute(":item/price", ValueType::Int64, false);
-        let db = MesoDB::open(dir.path().join("pit1.db"), schema, Config::default()).unwrap();
+        let db = MesoDb::open(dir.path().join("pit1.db"), schema, Config::default()).unwrap();
 
         // T=100: Assert Initial Price
         db.transact_at(
@@ -2405,7 +2405,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut schema = SchemaMap::new();
         schema.add_attribute(":user/tag", ValueType::String, false);
-        let db = MesoDB::open(dir.path().join("pit2.db"), schema, Config::default()).unwrap();
+        let db = MesoDb::open(dir.path().join("pit2.db"), schema, Config::default()).unwrap();
 
         // T=10: Assert Tag
         db.transact_at(
@@ -2482,7 +2482,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut schema = SchemaMap::new();
         schema.add_attribute(":order/status", ValueType::String, false);
-        let db = MesoDB::open(dir.path().join("at1.db"), schema, Config::default()).unwrap();
+        let db = MesoDb::open(dir.path().join("at1.db"), schema, Config::default()).unwrap();
 
         db.transact_at(
             vec![Fact {
@@ -2533,7 +2533,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut schema = SchemaMap::new();
         schema.add_attribute(":device/state", ValueType::String, false);
-        let db = MesoDB::open(dir.path().join("at2.db"), schema, Config::default()).unwrap();
+        let db = MesoDb::open(dir.path().join("at2.db"), schema, Config::default()).unwrap();
 
         db.transact_at(
             vec![Fact {
@@ -2607,12 +2607,12 @@ mod tests {
     // SUITE 5: HISTORY API WRAPPERS
     // =====================================================================
 
-    async fn setup_history_db(name: &str) -> MesoDB {
+    async fn setup_history_db(name: &str) -> MesoDb {
         let dir = tempfile::tempdir().unwrap();
         let mut schema = SchemaMap::new();
         schema.add_attribute(":doc/title", ValueType::String, false);
 
-        let db = MesoDB::open(dir.path().join(name), schema, Config::default()).unwrap();
+        let db = MesoDb::open(dir.path().join(name), schema, Config::default()).unwrap();
 
         // Tx 1: Assert "Draft"
         db.transact(vec![Fact {
@@ -2782,7 +2782,7 @@ mod tests {
         schema.add_attribute(":account/status", ValueType::String, false);
         schema.add_attribute(":account/type", ValueType::String, false);
 
-        let db = MesoDB::open(dir.path().join("or_logic.db"), schema, Config::default()).unwrap();
+        let db = MesoDb::open(dir.path().join("or_logic.db"), schema, Config::default()).unwrap();
 
         db.transact(vec![
             // Account 1: Active Admin (Matches both)
@@ -2882,7 +2882,7 @@ mod tests {
         schema.add_attribute(":account/status", ValueType::String, false);
         schema.add_attribute(":account/type", ValueType::String, false);
 
-        let db = MesoDB::open(dir.path().join("not_logic.db"), schema, Config::default()).unwrap();
+        let db = MesoDb::open(dir.path().join("not_logic.db"), schema, Config::default()).unwrap();
 
         db.transact(vec![
             // Account 1: Active Admin
@@ -2966,7 +2966,7 @@ mod tests {
         schema.add_attribute(":tx/author", ValueType::String, false);
         schema.add_attribute(":user/name", ValueType::String, false);
 
-        let db = MesoDB::open(dir.path().join("reified.db"), schema, Config::default()).unwrap();
+        let db = MesoDb::open(dir.path().join("reified.db"), schema, Config::default()).unwrap();
 
         // Transact a user, AND attach metadata to the transaction itself using `e: 0`
         let report = db
@@ -3041,7 +3041,7 @@ mod tests {
     async fn test_parking_lot_split_lock_avoidance() {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(
-            MesoDB::open(
+            MesoDb::open(
                 dir.path().join("pl_split.db"),
                 SchemaMap::new(),
                 Config::default(),
@@ -3124,7 +3124,7 @@ mod tests {
     async fn test_snapshot_read_isolation() {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(
-            MesoDB::open(
+            MesoDb::open(
                 dir.path().join("pl_vis.db"),
                 SchemaMap::new(),
                 Config::default(),
@@ -3178,7 +3178,7 @@ mod tests {
     async fn test_parking_lot_high_contention_saturation() {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(
-            MesoDB::open(
+            MesoDb::open(
                 dir.path().join("pl_sat.db"),
                 SchemaMap::new(),
                 Config::default(),
@@ -3234,7 +3234,7 @@ mod tests {
     async fn test_schema_update_vs_compactor_in_lock_race() {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(
-            MesoDB::open(
+            MesoDb::open(
                 dir.path().join("pl_schema_race.db"),
                 SchemaMap::new(),
                 Config::default(),
@@ -3303,7 +3303,7 @@ mod tests {
     #[tokio::test]
     async fn test_idempotent_ghost_flush_handling() {
         let dir = tempfile::tempdir().unwrap();
-        let db = MesoDB::open(
+        let db = MesoDb::open(
             dir.path().join("pl_ghost.db"),
             SchemaMap::new(),
             Config::default(),
@@ -3336,7 +3336,7 @@ mod tests {
     async fn test_monotonic_time_with_safe_ids() {
         let dir = tempfile::tempdir().unwrap();
         let db = Arc::new(
-            MesoDB::open(
+            MesoDb::open(
                 dir.path().join("pl_mono.db"),
                 SchemaMap::new(),
                 Config::default(),
@@ -3402,7 +3402,7 @@ mod tests {
     #[tokio::test]
     async fn test_generational_memory_pinning_via_arc() {
         let dir = tempfile::tempdir().unwrap();
-        let db = MesoDB::open(
+        let db = MesoDb::open(
             dir.path().join("pl_pin.db"),
             SchemaMap::new(),
             Config::default(),
@@ -3452,7 +3452,7 @@ mod tests {
         config.compactor.backpressure_threshold = 2; // Compact after 2 files
         config.storage.memtable_max_rows = 1; // Flush every single datom immediately
 
-        let db = MesoDB::open(db_path, schema, config).unwrap();
+        let db = MesoDb::open(db_path, schema, config).unwrap();
 
         // 1. First transaction -> Fills the 1-row MemTable, flushes to part-000000000001.parquet
         db.transact(vec![Fact {
@@ -3527,7 +3527,7 @@ mod tests {
         schema.add_attribute(":user/name", ValueType::String, false);
         schema.add_attribute(":user/age", ValueType::Int64, false);
 
-        let db = MesoDB::open(dir.path().join("fp_multi.db"), schema, Config::default()).unwrap();
+        let db = MesoDb::open(dir.path().join("fp_multi.db"), schema, Config::default()).unwrap();
 
         db.transact(vec![
             Fact {
@@ -3581,7 +3581,7 @@ mod tests {
         let mut schema = SchemaMap::new();
         schema.add_attribute(":user/email", ValueType::String, true);
 
-        let db = MesoDB::open(dir.path().join("fp_ave.db"), schema, Config::default()).unwrap();
+        let db = MesoDb::open(dir.path().join("fp_ave.db"), schema, Config::default()).unwrap();
 
         db.transact(vec![Fact {
             e: 88,
@@ -3623,7 +3623,7 @@ mod tests {
         config.storage.memtable_max_rows = 1;
         config.compactor.backpressure_threshold = 1;
 
-        let db = MesoDB::open(dir.path().join("fp_pull.db"), schema, config).unwrap();
+        let db = MesoDb::open(dir.path().join("fp_pull.db"), schema, config).unwrap();
 
         db.transact(vec![
             Fact {
@@ -3661,7 +3661,7 @@ mod tests {
         let mut schema = SchemaMap::new();
         schema.add_attribute(":user/score", ValueType::Int64, false);
 
-        let db = MesoDB::open(dir.path().join("fp_dirty.db"), schema, Config::default()).unwrap();
+        let db = MesoDb::open(dir.path().join("fp_dirty.db"), schema, Config::default()).unwrap();
 
         // Fact in RAM (Not yet flushed to index)
         db.transact(vec![Fact {
@@ -3696,7 +3696,7 @@ mod tests {
         schema.add_attribute(":user/status", ValueType::String, false);
         schema.add_attribute(":user/name", ValueType::String, false);
 
-        let db = MesoDB::open(dir.path().join("fp_join.db"), schema, Config::default()).unwrap();
+        let db = MesoDb::open(dir.path().join("fp_join.db"), schema, Config::default()).unwrap();
 
         db.transact(vec![
             Fact {
@@ -3769,7 +3769,7 @@ mod tests {
         config.storage.memtable_max_rows = 1;
         config.compactor.backpressure_threshold = 1;
 
-        let db = MesoDB::open(dir.path().join("fp_range.db"), schema, config).unwrap();
+        let db = MesoDb::open(dir.path().join("fp_range.db"), schema, config).unwrap();
 
         let mut facts = Vec::new();
         for i in 100..=105 {
@@ -3824,7 +3824,7 @@ mod tests {
         config.storage.memtable_max_rows = 1;
         config.compactor.backpressure_threshold = 1;
 
-        let db = MesoDB::open(dir.path().join("fp_val_range.db"), schema, config).unwrap();
+        let db = MesoDb::open(dir.path().join("fp_val_range.db"), schema, config).unwrap();
 
         let mut facts = Vec::new();
         for i in 1..=5 {

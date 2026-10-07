@@ -1,5 +1,5 @@
 use mesodb_core::config::Config;
-use mesodb_core::db::MesoDB;
+use mesodb_core::db::MesoDb;
 use mesodb_core::schema::{SchemaMap, ValueType};
 use mesodb_core::transactor::Fact;
 use mesodb_core::types::Value;
@@ -22,7 +22,7 @@ fn setup_config() -> Config {
     let mut config = Config::default();
     // Force immediate background flushes to Parquet.
     // This ensures DataFusion can query the state upon reboot, bypassing
-    // the current limitation where MesoDB doesn't rebuild RAM batches from the WAL.
+    // the current limitation where MesoDb doesn't rebuild RAM batches from the WAL.
     config.storage.memtable_max_rows = 1;
     config
 }
@@ -34,7 +34,7 @@ async fn test_torn_page_recovery() {
 
     // 1. Boot up and transact a valid genesis block
     {
-        let db = MesoDB::open(&db_path, setup_base_schema(), setup_config()).unwrap();
+        let db = MesoDb::open(&db_path, setup_base_schema(), setup_config()).unwrap();
         db.transact(vec![Fact {
             e: 1,
             ident: ":sys/health".into(),
@@ -59,7 +59,7 @@ async fn test_torn_page_recovery() {
     }
 
     // 3. The Recovery
-    let recovered_db = MesoDB::open(&db_path, setup_base_schema(), setup_config()).unwrap();
+    let recovered_db = MesoDb::open(&db_path, setup_base_schema(), setup_config()).unwrap();
 
     // 4. Verification
     let query = r#"[:find ?health :where [1 :sys/health ?health]]"#;
@@ -83,7 +83,7 @@ async fn test_malicious_length_corruption() {
     let db_path = dir.path().join("length_corruption.db");
 
     {
-        let db = MesoDB::open(&db_path, setup_base_schema(), setup_config()).unwrap();
+        let db = MesoDb::open(&db_path, setup_base_schema(), setup_config()).unwrap();
         db.transact(vec![Fact {
             e: 2,
             ident: ":sys/health".into(),
@@ -105,7 +105,7 @@ async fn test_malicious_length_corruption() {
     }
 
     // 3. The Recovery
-    let recovered_db = MesoDB::open(&db_path, setup_base_schema(), setup_config()).unwrap();
+    let recovered_db = MesoDb::open(&db_path, setup_base_schema(), setup_config()).unwrap();
     let query = r#"[:find ?health :where [2 :sys/health ?health]]"#;
     let results = recovered_db.query_native(query).await.unwrap();
 
@@ -122,7 +122,7 @@ async fn test_random_garbage_bytes() {
     let db_path = dir.path().join("garbage.db");
 
     {
-        let db = MesoDB::open(&db_path, setup_base_schema(), setup_config()).unwrap();
+        let db = MesoDb::open(&db_path, setup_base_schema(), setup_config()).unwrap();
         db.transact(vec![Fact {
             e: 3,
             ident: ":sys/health".into(),
@@ -145,7 +145,7 @@ async fn test_random_garbage_bytes() {
     }
 
     // 3. The Recovery
-    let recovered_db = MesoDB::open(&db_path, setup_base_schema(), setup_config()).unwrap();
+    let recovered_db = MesoDb::open(&db_path, setup_base_schema(), setup_config()).unwrap();
     let query = r#"[:find ?health :where [3 :sys/health ?health]]"#;
     let results = recovered_db.query_native(query).await.unwrap();
 

@@ -11,14 +11,14 @@ use std::sync::Arc;
 
 use crate::dto::SchemaRequest;
 use crate::dto::{ErrorResponse, TransactionRequest};
-use mesodb_core::db::{AttributeDefinition, MesoDB};
+use mesodb_core::db::{AttributeDefinition, MesoDb};
 use mesodb_core::schema::ValueType;
 use mesodb_core::transactor::Fact;
 use mesodb_core::types::Value as MesoValue;
 
 /// POST /transact
 pub async fn handle_transact(
-    State(db): State<Arc<MesoDB>>,
+    State(db): State<Arc<MesoDb>>,
     Json(payload): Json<TransactionRequest>,
 ) -> impl IntoResponse {
     let mut core_facts = Vec::with_capacity(payload.facts.len());
@@ -96,7 +96,7 @@ pub async fn handle_transact(
 
 /// POST /query
 pub async fn handle_query(
-    State(db): State<Arc<MesoDB>>,
+    State(db): State<Arc<MesoDb>>,
     headers: HeaderMap,
     Json(payload): Json<crate::dto::QueryRequest>,
 ) -> impl IntoResponse {
@@ -147,7 +147,7 @@ pub async fn handle_query(
 }
 
 pub async fn handle_schema(
-    State(db): State<Arc<MesoDB>>,
+    State(db): State<Arc<MesoDb>>,
     Json(payload): Json<SchemaRequest>,
 ) -> impl IntoResponse {
     let mut defs = Vec::with_capacity(payload.attributes.len());
@@ -201,13 +201,13 @@ mod tests {
     use tempfile::tempdir;
 
     use mesodb_core::config::Config;
-    use mesodb_core::db::MesoDB;
+    use mesodb_core::db::MesoDb;
     use mesodb_core::schema::SchemaMap;
 
-    async fn setup_test_db() -> Arc<MesoDB> {
+    async fn setup_test_db() -> Arc<MesoDb> {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("server_test.db");
-        Arc::new(MesoDB::open(db_path, SchemaMap::new(), Config::default()).unwrap())
+        Arc::new(MesoDb::open(db_path, SchemaMap::new(), Config::default()).unwrap())
     }
 
     async fn extract_json(

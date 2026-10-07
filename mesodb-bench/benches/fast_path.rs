@@ -7,12 +7,12 @@ use tempfile::TempDir;
 
 use mesodb_core::bitmap::BitmapStore;
 use mesodb_core::config::{Config, WalSyncMode};
-use mesodb_core::db::MesoDB;
+use mesodb_core::db::MesoDb;
 use mesodb_core::schema::{SchemaMap, ValueType};
 use mesodb_core::transactor::Fact;
 use mesodb_core::types::Value;
 
-fn setup_fast_path_db(dir: &TempDir, num_entities: usize) -> Arc<MesoDB> {
+fn setup_fast_path_db(dir: &TempDir, num_entities: usize) -> Arc<MesoDb> {
     let mut schema = SchemaMap::new();
     schema.add_attribute(":user/name", ValueType::String, false);
     schema.add_attribute(":user/age", ValueType::Int64, false);
@@ -25,7 +25,7 @@ fn setup_fast_path_db(dir: &TempDir, num_entities: usize) -> Arc<MesoDB> {
     // CRITICAL FIX: Set to 1 so every 10k batch forces RAM eviction and clears the dirty set
     config.compactor.backpressure_threshold = 1;
 
-    let db = Arc::new(MesoDB::open(dir.path().join("fast_path.db"), schema, config).unwrap());
+    let db = Arc::new(MesoDb::open(dir.path().join("fast_path.db"), schema, config).unwrap());
 
     let mut facts = Vec::with_capacity(num_entities * 3);
     for i in 1..=num_entities {

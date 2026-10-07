@@ -4,12 +4,12 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use tempfile::TempDir;
 
 use mesodb_core::config::{Config, WalSyncMode};
-use mesodb_core::db::MesoDB;
+use mesodb_core::db::MesoDb;
 use mesodb_core::schema::{SchemaMap, ValueType};
 use mesodb_core::transactor::Fact;
 use mesodb_core::types::Value;
 
-fn setup_db(dir: &TempDir, sync_mode: WalSyncMode) -> MesoDB {
+fn setup_db(dir: &TempDir, sync_mode: WalSyncMode) -> MesoDb {
     let mut schema = SchemaMap::new();
     schema.add_attribute(":sensor/id", ValueType::Int64, false);
     schema.add_attribute(":sensor/reading", ValueType::Float64, false);
@@ -21,7 +21,7 @@ fn setup_db(dir: &TempDir, sync_mode: WalSyncMode) -> MesoDB {
     // transaction indexing speed without mixing compaction steps.
     config.storage.memtable_max_rows = 1_000_000;
 
-    MesoDB::open(dir.path().join("bench.db"), schema, config).unwrap()
+    MesoDb::open(dir.path().join("bench.db"), schema, config).unwrap()
 }
 
 fn generate_facts(batch_size: usize, start_id: i64) -> Vec<Fact> {
