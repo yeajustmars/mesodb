@@ -3452,7 +3452,7 @@ dependencies = [
 
 [[package]]
 name = "mesodb-bench"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ahash",
  "arrow",
@@ -3472,7 +3472,7 @@ dependencies = [
 
 [[package]]
 name = "mesodb-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "clap",
@@ -3490,7 +3490,7 @@ dependencies = [
 
 [[package]]
 name = "mesodb-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ahash",
  "arrow",
@@ -3515,7 +3515,7 @@ dependencies = [
 
 [[package]]
 name = "mesodb-doc"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "mdcat",
  "pulldown-cmark",
@@ -3527,7 +3527,7 @@ dependencies = [
 
 [[package]]
 name = "mesodb-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arrow",
  "arrow-flight",
