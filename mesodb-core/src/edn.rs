@@ -78,8 +78,13 @@ impl<'a> EdnLexer<'a> {
             '"' => {
                 self.next_char(); // Consume opening quote
                 let start = self.byte_idx;
+                let mut escaping = false;
                 while let Some(c) = self.next_char() {
-                    if c == '"' {
+                    if escaping {
+                        escaping = false;
+                    } else if c == '\\' {
+                        escaping = true;
+                    } else if c == '"' {
                         let end = self.byte_idx - 1;
                         return Ok(Some(RawToken::String(&self.input[start..end])));
                     }
@@ -358,5 +363,61 @@ mod tests {
             parse_transaction(r#"[[:db/add 1 :a "missing_quote]]"#).is_err(),
             "Must correctly drop out on string unterminated errors"
         );
+    }
+
+    #[test]
+    fn test_lexer_brutal_escape_sequences() {
+        // String 1: Rust macro with embedded quotes -> "fn main() { println!(\"Hello\"); }"
+        // String 2: Windows file path with trailing escaped backslash -> "C:\\Temp\\"
+        // String 3: Consecutive escapes and quotes -> "\\\"\\\\\""
+        let raw_input = r#"[
+            [:db/add 100 :code/signature "fn main() { println!(\"Hello\"); }"]
+            [:db/add 101 :doc/text "C:\\Temp\\"]
+            [:db/add 102 :doc/text "\\\"\\\\\""]
+        ]"#;
+
+        let facts = parse_transaction(raw_input).expect("Failed to parse brutal escape sequences");
+        assert_eq!(facts.len(), 3);
+
+        // Note: The lexer extracts the raw slice between the OUTER quotes.
+        // It does not unescape the string in memory, which is the correct zero-allocation behavior.
+        if let Value::String(s) = &facts[0].v {
+            assert_eq!(s, "fn main() { println!(\\\"Hello\\\"); }");
+        } else {
+            panic!("Expected String value for Fact 0");
+        }
+
+        if let Value::String(s) = &facts[1].v {
+            assert_eq!(s, "C:\\\\Temp\\\\");
+        } else {
+            panic!("Expected String value for Fact 1");
+        }
+
+        if let Value::String(s) = &facts[2].v {
+            assert_eq!(s, "\\\\\\\"\\\\\\\\\\\"");
+        } else {
+            panic!("Expected String value for Fact 2");
+        }
+    }
+
+    #[test]
+    fn test_lexer_unterminated_escapes() {
+        // The string ends abruptly with a backslash right before the quote.
+        // The lexer must treat the quote as escaped and realize the string never actually terminates.
+        let raw_input = r#"[ [:db/add 100 :doc/text "This quote is escaped \"] ]"#;
+
+        let result = parse_transaction(raw_input);
+        assert!(
+            result.is_err(),
+            "Must fail when the trailing quote is escaped and no valid closing quote exists"
+        );
+
+        if let Err(e) = result {
+            assert!(
+                e.to_string().contains("Unterminated string literal"),
+                "Expected unterminated string error, got: {}",
+                e
+            );
+        }
     }
 }
