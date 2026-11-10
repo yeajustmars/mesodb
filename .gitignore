@@ -14,3 +14,4 @@ assets/.!*
 **mesodb_history.txt
 **ipynb_checkpoints**
 data/
+.lena/

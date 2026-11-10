@@ -14,6 +14,7 @@ enum RawToken<'a> {
     String(&'a str),
     Int(i64),
     Float(f64),
+    Boolean(bool), // NEW
     Inst(i64),
     Symbol(&'a str),
     LeftBracket,
@@ -142,6 +143,10 @@ impl<'a> EdnLexer<'a> {
 
                 if slice.starts_with(':') {
                     Ok(Some(RawToken::Keyword(slice)))
+                } else if slice == "true" {
+                    Ok(Some(RawToken::Boolean(true)))
+                } else if slice == "false" {
+                    Ok(Some(RawToken::Boolean(false)))
                 } else if let Ok(i) = slice.parse::<i64>() {
                     Ok(Some(RawToken::Int(i)))
                 } else if let Ok(f) = slice.parse::<f64>() {
@@ -260,6 +265,7 @@ fn parse_fact_vector(lexer: &mut EdnLexer<'_>) -> Result<Fact> {
         RawToken::Keyword(k) => Value::String(k.to_string()), // Keyword coercion matching old engine constraints
         RawToken::Int(i) => Value::Int64(*i),
         RawToken::Float(f) => Value::Float64(*f),
+        RawToken::Boolean(b) => Value::Boolean(*b), // NEW
         RawToken::Inst(t) => Value::Timestamp(*t),
         _ => {
             return Err(MesoError::Serialization(
@@ -419,5 +425,111 @@ mod tests {
                 e
             );
         }
+    }
+
+    #[test]
+    fn test_parse_transaction_with_booleans() {
+        let input = r#"[
+            [:db/add 200 :user/active true]
+            [:db/add 201 :user/active false]
+        ]"#;
+
+        let facts = parse_transaction(input).expect("Failed to parse boolean transaction");
+        assert_eq!(facts.len(), 2);
+
+        // Validate true
+        assert!(facts[0].op);
+        assert_eq!(facts[0].e, 200);
+        assert_eq!(facts[0].ident, ":user/active");
+        assert_eq!(facts[0].v, Value::Boolean(true));
+
+        // Validate false
+        assert!(facts[1].op);
+        assert_eq!(facts[1].e, 201);
+        assert_eq!(facts[1].ident, ":user/active");
+        assert_eq!(facts[1].v, Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_parse_empty_transaction() {
+        // An empty EDN vector should safely parse into an empty batch, not throw a structural error.
+        let input = "[]";
+        let facts = parse_transaction(input).expect("Failed to parse empty transaction");
+        assert!(facts.is_empty(), "Empty transaction should yield 0 facts");
+
+        let input_with_spaces = "[   \n \t ]";
+        let facts_spaces = parse_transaction(input_with_spaces).expect("Failed on whitespace-only");
+        assert!(facts_spaces.is_empty());
+    }
+
+    #[test]
+    fn test_edn_commas_as_whitespace() {
+        // In EDN, commas are treated entirely as whitespace.
+        // We must ensure the lexer strips them safely without breaking token alignment.
+        let input = r#"[ , [ , :db/add , 100 , :system/config , true , ] , ]"#;
+
+        let facts = parse_transaction(input).expect("Failed to parse transaction with commas");
+        assert_eq!(facts.len(), 1);
+
+        assert!(facts[0].op);
+        assert_eq!(facts[0].e, 100);
+        assert_eq!(facts[0].ident, ":system/config");
+        assert_eq!(facts[0].v, Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_invalid_entity_id_type() {
+        // Entity IDs must strictly be unsigned integers.
+        // Passing floats, negatives, or strings should aggressively trap.
+        let input_float = r#"[ [:db/add 1.5 :user/name "Alice"] ]"#;
+        let err_float = parse_transaction(input_float).unwrap_err();
+        assert!(
+            err_float
+                .to_string()
+                .contains("Entity ID must resolve to an unsigned integer")
+        );
+
+        let input_string = r#"[ [:db/add "100" :user/name "Alice"] ]"#;
+        let err_string = parse_transaction(input_string).unwrap_err();
+        assert!(
+            err_string
+                .to_string()
+                .contains("Entity ID must resolve to an unsigned integer")
+        );
+    }
+
+    #[test]
+    fn test_invalid_operation_keyword() {
+        // The engine exclusively supports :db/add and :db/retract.
+        // Any other transaction keyword (e.g., :db/upsert) must fail immediately.
+        let input = r#"[ [:db/upsert 100 :user/name "Alice"] ]"#;
+
+        let err = parse_transaction(input).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("First argument in a fact clause must be either :db/add or :db/retract")
+        );
+    }
+
+    #[test]
+    fn test_fact_argument_count_boundaries() {
+        // Facts require exactly 4 or 5 arguments: [op e a v] or [op e a v valid_time]
+        // Testing too few arguments (3).
+        let input_short = r#"[ [:db/add 100 :user/name] ]"#;
+        let err_short = parse_transaction(input_short).unwrap_err();
+        assert!(
+            err_short
+                .to_string()
+                .contains("Fact clauses require at least 4 arguments")
+        );
+
+        // Testing invalid 5th argument type (passing an int instead of an #inst literal)
+        let input_bad_time = r#"[ [:db/add 100 :user/name "Alice" 123456] ]"#;
+        let err_bad_time = parse_transaction(input_bad_time).unwrap_err();
+        assert!(
+            err_bad_time.to_string().contains(
+                "Valid-time parameter (5th cell index) must be an #inst literal timestamp"
+            )
+        );
     }
 }
