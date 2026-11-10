@@ -10,14 +10,14 @@ members = [
 
 [workspace.package]
 description = "Bitemporal Datalog engine"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 authors = ["yeajustmars"]
 license = "AGPL-3.0-only"
 
 [workspace.dependencies]
-mesodb-core = { path = "mesodb-core", version = "0.2.1" }
-mesodb-server = { path = "mesodb-server", version = "0.2.1" }
+mesodb-core = { path = "mesodb-core", version = "0.2.2" }
+mesodb-server = { path = "mesodb-server", version = "0.2.2" }
 
 # Core system (core, server, CLI, ...)
 arrow = "58.2.0"
