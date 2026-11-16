@@ -25,13 +25,27 @@ use crate::{
     types::{Result, Value},
 };
 
+struct PendingFlush {
+    batches: Vec<(u64, RecordBatch)>,
+    rows: usize,
+    bytes: usize,
+}
+
+struct FlushPayload {
+    max_tx_id: u64,
+    evict_tx_ids: Vec<u64>,
+    batch: RecordBatch,
+}
+
 pub struct MesoDb {
     /// The transactor is the single writer, guarded by a Tokio Mutex.
     transactor: Mutex<Transactor>,
     /// The WorldView is an atomic pointer. Swapping it takes nanoseconds.
     world_view: Arc<RwLock<Arc<WorldView>>>,
-    /// The channel to send newly minted memory batches to the background compactor.
-    flush_tx: mpsc::Sender<(u64, RecordBatch)>,
+    /// Accumulates un-flushed batches until row or byte thresholds are reached.
+    pending_flush: parking_lot::Mutex<PendingFlush>,
+    /// The channel to send sealed MemTable batches to the background compactor.
+    flush_tx: mpsc::Sender<FlushPayload>,
 }
 
 impl MesoDb {
@@ -55,10 +69,12 @@ impl MesoDb {
         let mut initial_ram = Vec::new();
         let mut initial_dirty = ahash::AHashSet::new();
         let empty_batch = MemTable::new(0).finish()?;
+        initial_ram.push((0, empty_batch));
 
+        let mut initial_flush_payload = None;
         if recovered_batch.num_rows() > 0 {
-            initial_ram.push((0, empty_batch.clone()));
-            initial_ram.push((transactor.current_tx_id, recovered_batch.clone()));
+            let recovery_tx_id = transactor.current_tx_id.saturating_sub(1);
+            initial_ram.push((recovery_tx_id, recovered_batch.clone()));
 
             if let Some(e_col) = recovered_batch
                 .column(0)
@@ -69,8 +85,12 @@ impl MesoDb {
                     initial_dirty.insert(e_col.value(i));
                 }
             }
-        } else {
-            initial_ram.push((0, empty_batch));
+
+            initial_flush_payload = Some(FlushPayload {
+                max_tx_id: recovery_tx_id,
+                evict_tx_ids: vec![recovery_tx_id],
+                batch: recovered_batch,
+            });
         }
 
         let world_view = Arc::new(RwLock::new(Arc::new(WorldView {
@@ -80,11 +100,16 @@ impl MesoDb {
             timeline: Arc::new(transactor.timeline.clone()),
             now_index: now_snap,
             bitmap_index: bitmap_snap,
-            avt_index: avt_snap, // NEW
+            avt_index: avt_snap,
             dirty_entities: Arc::new(initial_dirty),
         })));
 
-        let (flush_tx, flush_rx) = mpsc::channel(config.compactor.backpressure_threshold);
+        let channel_cap = config.compactor.backpressure_threshold.max(1);
+        let (flush_tx, flush_rx) = mpsc::channel(channel_cap);
+
+        if let Some(payload) = initial_flush_payload {
+            let _ = flush_tx.try_send(payload);
+        }
 
         // Pass mutable B-Trees to the background worker
         Self::spawn_background_worker(
@@ -94,32 +119,40 @@ impl MesoDb {
             config.clone(),
             now_index,
             bitmap_store,
-            avt_index, // NEW
+            avt_index,
         );
 
         Ok(Self {
             transactor: Mutex::new(transactor),
             world_view,
+            pending_flush: parking_lot::Mutex::new(PendingFlush {
+                batches: Vec::new(),
+                rows: 0,
+                bytes: 0,
+            }),
             flush_tx,
         })
     }
 
     fn spawn_background_worker(
         data_dir: PathBuf,
-        mut flush_rx: mpsc::Receiver<(u64, RecordBatch)>,
+        mut flush_rx: mpsc::Receiver<FlushPayload>,
         world_view: Arc<RwLock<Arc<WorldView>>>,
         config: Config,
         mut now_index: crate::btree::NowIndex,
         mut bitmap_store: crate::bitmap::BitmapStore,
-        mut avt_index: crate::btree::AvtIndex, // NEW
+        mut avt_index: crate::btree::AvtIndex,
     ) {
         tokio::spawn(async move {
             let compactor = BackgroundCompactor::new(data_dir);
             let mut uncompacted_files = Vec::new();
-            let mut evict_queue = Vec::with_capacity(20);
-            const EVICT_THRESHOLD: usize = 20;
 
-            while let Some((tx_id, batch)) = flush_rx.recv().await {
+            while let Some(FlushPayload {
+                max_tx_id,
+                evict_tx_ids,
+                batch,
+            }) = flush_rx.recv().await
+            {
                 if let Err(e) = Self::update_indexes_from_batch(
                     &mut now_index,
                     &mut bitmap_store,
@@ -128,39 +161,35 @@ impl MesoDb {
                 ) {
                     eprintln!(
                         "Warning: Failed to update background indexes for Tx {}: {:?}",
-                        tx_id, e
+                        max_tx_id, e
                     );
                 }
 
-                let file_path = match compactor.flush_to_parquet(batch, tx_id) {
+                let file_path = match compactor.flush_to_parquet(batch, max_tx_id) {
                     Ok(path) => path,
                     Err(e) => {
-                        eprintln!("Failed to flush Tx {} to Parquet: {:?}", tx_id, e);
+                        eprintln!("Failed to flush Tx {} to Parquet: {:?}", max_tx_id, e);
                         continue;
                     }
                 };
                 uncompacted_files.push(file_path);
-                evict_queue.push(tx_id);
 
-                let trigger_compaction =
-                    uncompacted_files.len() >= config.compactor.backpressure_threshold;
-                let trigger_eviction = evict_queue.len() >= EVICT_THRESHOLD;
+                let flush_res = now_index
+                    .flush()
+                    .and_then(|()| bitmap_store.flush())
+                    .and_then(|()| avt_index.flush());
 
-                if trigger_eviction || trigger_compaction {
-                    let _ = now_index.flush();
-                    let _ = bitmap_store.flush();
-                    let _ = avt_index.flush(); // NEW
+                match flush_res {
+                    Ok(()) => {
+                        let new_now_snap = Arc::new(now_index.snapshot());
+                        let new_bitmap_snap = Arc::new(bitmap_store.snapshot());
+                        let new_avt_snap = Arc::new(avt_index.snapshot());
 
-                    let new_now_snap = Arc::new(now_index.snapshot());
-                    let new_bitmap_snap = Arc::new(bitmap_store.snapshot());
-                    let new_avt_snap = Arc::new(avt_index.snapshot()); // NEW
-
-                    {
                         let mut writer = world_view.write();
                         let world_view_mut = Arc::make_mut(&mut *writer);
                         let ram_vec_mut = Arc::make_mut(&mut world_view_mut.ram_batches);
 
-                        ram_vec_mut.retain(|(id, _)| !evict_queue.contains(id));
+                        ram_vec_mut.retain(|(id, _)| !evict_tx_ids.contains(id));
 
                         let mut remaining_dirty = ahash::AHashSet::new();
                         for (_, b) in ram_vec_mut.iter() {
@@ -177,18 +206,24 @@ impl MesoDb {
                         world_view_mut.dirty_entities = Arc::new(remaining_dirty);
                         world_view_mut.now_index = new_now_snap;
                         world_view_mut.bitmap_index = new_bitmap_snap;
-                        world_view_mut.avt_index = new_avt_snap; // NEW
+                        world_view_mut.avt_index = new_avt_snap;
                     }
-                    evict_queue.clear();
+                    Err(e) => {
+                        eprintln!(
+                            "Error flushing Tier-1 indexes for Tx {}; retaining RAM batches: {:?}",
+                            max_tx_id, e
+                        );
+                    }
                 }
 
-                if trigger_compaction {
+                if uncompacted_files.len() >= config.compactor.backpressure_threshold {
                     let files_to_compact = std::mem::take(&mut uncompacted_files);
                     let compactor_clone = compactor.clone();
 
                     tokio::spawn(async move {
-                        if let Err(e) = compactor_clone.compact(&files_to_compact, tx_id).await {
-                            eprintln!("Background compaction failed for Tx {}: {:?}", tx_id, e);
+                        if let Err(e) = compactor_clone.compact(&files_to_compact, max_tx_id).await
+                        {
+                            eprintln!("Background compaction failed for Tx {}: {:?}", max_tx_id, e);
                         }
                     });
                 }
@@ -328,44 +363,58 @@ impl MesoDb {
 
     /// DRY helper that handles the lock, the transaction, and the lock-free WorldView pointer swap.
     async fn execute(&self, facts: Vec<Fact>, custom_now: Option<i64>) -> Result<TxReport> {
-        let (report, sync_rx, trigger_flush) = {
+        let (report, sync_rx, sealed_batches) = {
             let mut tx = self.transactor.lock().await;
             let report = match custom_now {
                 Some(t) => tx.transact_at(facts, t)?,
                 None => tx.transact(facts)?,
             };
 
+            let mut sealed_batches = None;
+
             if report.datoms_written > 0 {
                 let batch_clone = report.batch.clone();
                 let new_schema = Arc::new(tx.schema.clone());
                 let new_timeline = Arc::new(tx.timeline.clone());
 
-                let mut writer = self.world_view.write();
-
-                let world_view_mut = Arc::make_mut(&mut *writer);
-                world_view_mut.schema = new_schema;
-                world_view_mut.timeline = new_timeline;
-
-                let ram_vec_mut = Arc::make_mut(&mut world_view_mut.ram_batches);
-                ram_vec_mut.push((report.tx_id, batch_clone.clone()));
-
-                // Insert dirty entities into WorldView
-                let dirty_mut = Arc::make_mut(&mut world_view_mut.dirty_entities);
-                if let Some(e_col) = batch_clone
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<arrow::array::UInt64Array>()
                 {
-                    for i in 0..batch_clone.num_rows() {
-                        dirty_mut.insert(e_col.value(i));
+                    let mut writer = self.world_view.write();
+
+                    let world_view_mut = Arc::make_mut(&mut *writer);
+                    world_view_mut.schema = new_schema;
+                    world_view_mut.timeline = new_timeline;
+
+                    let ram_vec_mut = Arc::make_mut(&mut world_view_mut.ram_batches);
+                    ram_vec_mut.push((report.tx_id, batch_clone.clone()));
+
+                    // Insert dirty entities into WorldView
+                    let dirty_mut = Arc::make_mut(&mut world_view_mut.dirty_entities);
+                    if let Some(e_col) = batch_clone
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow::array::UInt64Array>()
+                    {
+                        for i in 0..batch_clone.num_rows() {
+                            dirty_mut.insert(e_col.value(i));
+                        }
                     }
+                }
+
+                let mut pending = self.pending_flush.lock();
+                pending.rows += batch_clone.num_rows();
+                pending.bytes += batch_clone.get_array_memory_size();
+                pending.batches.push((report.tx_id, batch_clone));
+
+                if pending.rows >= tx.config.storage.memtable_max_rows
+                    || pending.bytes >= tx.config.storage.memtable_max_bytes
+                {
+                    pending.rows = 0;
+                    pending.bytes = 0;
+                    sealed_batches = Some(std::mem::take(&mut pending.batches));
                 }
             }
 
-            let trigger_flush = report.datoms_written > 0
-                && report.batch.num_rows() >= tx.config.storage.memtable_max_rows;
-
-            (report, tx.take_sync_rx(), trigger_flush)
+            (report, tx.take_sync_rx(), sealed_batches)
         };
 
         // 1. Await the physical disk sync outside the Transactor lock
@@ -373,15 +422,27 @@ impl MesoDb {
             let _ = rx.await;
         }
 
-        // 2. Dispatch to the background compactor outside the lock
-        if trigger_flush
-            && self
-                .flush_tx
-                .send((report.tx_id, report.batch.clone()))
-                .await
-                .is_err()
-        {
-            eprintln!("Warning: Background flusher disconnected.");
+        // 2. Coalesce and dispatch sealed batches outside the lock
+        if let Some(batches) = sealed_batches {
+            let max_tx_id = batches.last().map_or(report.tx_id, |(id, _)| *id);
+            let evict_tx_ids: Vec<u64> = batches.iter().map(|(id, _)| *id).collect();
+            let coalesced = if batches.len() == 1 {
+                batches.into_iter().next().unwrap().1
+            } else {
+                let schema = batches[0].1.schema();
+                let raw_batches: Vec<RecordBatch> = batches.into_iter().map(|(_, b)| b).collect();
+                arrow::compute::concat_batches(&schema, &raw_batches).map_err(MesoError::Arrow)?
+            };
+
+            let payload = FlushPayload {
+                max_tx_id,
+                evict_tx_ids,
+                batch: coalesced,
+            };
+
+            if self.flush_tx.send(payload).await.is_err() {
+                eprintln!("Warning: Background flusher disconnected.");
+            }
         }
 
         Ok(report)
@@ -3865,5 +3926,142 @@ mod tests {
         e_ids.sort();
         // Since price = e * 10, target entities are 2, 3, and 4
         assert_eq!(e_ids, vec![2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_cumulative_memtable_row_threshold_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":item/val", ValueType::Int64, false);
+
+        let mut config = Config::default();
+        config.storage.memtable_max_rows = 3;
+        config.compactor.backpressure_threshold = 10;
+
+        let db = MesoDb::open(dir.path().join("cum_rows.db"), schema, config).unwrap();
+
+        // Three 1-row transactions: individually below threshold (3), cumulatively hit 3
+        for i in 1..=3 {
+            db.transact(vec![Fact {
+                e: i,
+                ident: ":item/val".into(),
+                v: Value::Int64(i as i64 * 10),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            }])
+            .await
+            .unwrap();
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let view = db.world_view.read().clone();
+        assert_eq!(
+            view.ram_batches.len(),
+            1,
+            "All 3 cumulative batches should be evicted from RAM once threshold is reached"
+        );
+        assert!(
+            view.dirty_entities.is_empty(),
+            "Dirty entities should clear after cumulative flush"
+        );
+
+        let res = db
+            .query_native(r#"[:find ?v :where [2 :item/val ?v]]"#)
+            .await
+            .unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].get("v"), Some(&Value::Int64(20)));
+    }
+
+    #[tokio::test]
+    async fn test_cumulative_memtable_byte_threshold_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":doc/body", ValueType::String, false);
+
+        let mut config = Config::default();
+        config.storage.memtable_max_rows = 100_000;
+        config.storage.memtable_max_bytes = 2048; // 2 KB byte cap
+        config.compactor.backpressure_threshold = 10;
+
+        let db = MesoDb::open(dir.path().join("cum_bytes.db"), schema, config).unwrap();
+
+        let large_payload = "x".repeat(1500);
+        for i in 1..=2 {
+            db.transact(vec![Fact {
+                e: i,
+                ident: ":doc/body".into(),
+                v: Value::String(large_payload.clone()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            }])
+            .await
+            .unwrap();
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let view = db.world_view.read().clone();
+        assert_eq!(
+            view.ram_batches.len(),
+            1,
+            "Byte threshold should trigger flush and RAM eviction even when row count is low"
+        );
+        assert!(view.dirty_entities.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_startup_wal_recovery_populates_tier1_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wal_idx_recovery.db");
+
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/name", ValueType::String, false);
+
+        // Keep memtable large so data stays only in the WAL before drop
+        let mut config = Config::default();
+        config.storage.memtable_max_rows = 50_000;
+
+        {
+            let db = MesoDb::open(&db_path, schema.clone(), config.clone()).unwrap();
+            db.transact(vec![Fact {
+                e: 55,
+                ident: ":user/name".into(),
+                v: Value::String("RecoveredAlice".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            }])
+            .await
+            .unwrap();
+        }
+
+        // Reopen and allow background worker to index the WAL-recovered batch
+        let recovered_db = MesoDb::open(&db_path, schema, config).unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let view = recovered_db.world_view.read().clone();
+        assert!(
+            view.dirty_entities.is_empty(),
+            "Recovered batch should be indexed and evicted from dirty_entities"
+        );
+        assert_eq!(
+            view.now_index.get(55, 100).unwrap(),
+            Some(Value::String("RecoveredAlice".into())),
+            "NowIndex must be populated from WAL recovery"
+        );
+
+        let res = recovered_db
+            .query_native(r#"[:find ?n :where [55 :user/name ?n]]"#)
+            .await
+            .unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(
+            res[0].get("n"),
+            Some(&Value::String("RecoveredAlice".into()))
+        );
     }
 }
