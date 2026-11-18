@@ -96,3 +96,88 @@ impl ScalarUDFImpl for InBitmapUDF {
         }
     }
 }
+
+#[derive(Debug, Hash, PartialEq, Eq)]
+pub struct FormatUuidUDF {
+    signature: Signature,
+}
+
+impl Default for FormatUuidUDF {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FormatUuidUDF {
+    pub fn new() -> Self {
+        Self {
+            signature: Signature::exact(vec![DataType::FixedSizeBinary(16)], Volatility::Immutable),
+        }
+    }
+
+    fn format_bytes(b: &[u8]) -> String {
+        format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            b[0],
+            b[1],
+            b[2],
+            b[3],
+            b[4],
+            b[5],
+            b[6],
+            b[7],
+            b[8],
+            b[9],
+            b[10],
+            b[11],
+            b[12],
+            b[13],
+            b[14],
+            b[15]
+        )
+    }
+}
+
+impl ScalarUDFImpl for FormatUuidUDF {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "format_uuid"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> DFResult<DataType> {
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> DFResult<ColumnarValue> {
+        let array = match &args.args[0] {
+            ColumnarValue::Array(arr) => Arc::clone(arr),
+            ColumnarValue::Scalar(s) => s.to_array()?,
+        };
+        let bin_arr = array
+            .as_any()
+            .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+            .ok_or_else(|| {
+                datafusion::error::DataFusionError::Internal(
+                    "Expected FixedSizeBinaryArray for format_uuid".into(),
+                )
+            })?;
+
+        let mut builder =
+            arrow::array::StringBuilder::with_capacity(bin_arr.len(), bin_arr.len() * 36);
+        for i in 0..bin_arr.len() {
+            if bin_arr.is_null(i) {
+                builder.append_null();
+            } else {
+                builder.append_value(Self::format_bytes(bin_arr.value(i)));
+            }
+        }
+        Ok(ColumnarValue::Array(Arc::new(builder.finish())))
+    }
+}

@@ -819,8 +819,18 @@ impl MesoDb {
         // Match [:find (pull 101 [:user/name :user/age]) :where ...]
         if ast.find.len() == 1
             && ast.where_clauses.len() == 1
+            && options.format != OutputFormat::Tabular
             && let crate::ast::FindSpec::Pull(var, pattern) = &ast.find[0]
-            && let crate::ast::WhereClause::DataPattern { e, .. } = &ast.where_clauses[0]
+            && pattern
+                .0
+                .iter()
+                .all(|attr| matches!(attr, crate::ast::PullAttribute::Simple(_)))
+            && let crate::ast::WhereClause::DataPattern {
+                e,
+                tx: None,
+                op: None,
+                ..
+            } = &ast.where_clauses[0]
             && let crate::ast::Term::Integer(e_id) = e
         {
             let entity_id = *e_id as u64;
@@ -4694,5 +4704,147 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(bm.contains(2));
+    }
+
+    #[tokio::test]
+    async fn test_sql_single_quote_escaping_and_polymorphic_attr_var() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/name", ValueType::String, false);
+        schema.add_attribute(":user/age", ValueType::Int64, false);
+
+        let db = MesoDb::open(dir.path().join("quote_poly.db"), schema, Config::default()).unwrap();
+
+        db.transact(vec![
+            Fact {
+                e: 1,
+                ident: ":user/name".into(),
+                v: Value::String("O'Reilly".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 1,
+                ident: ":user/age".into(),
+                v: Value::Int64(42),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+        ])
+        .await
+        .unwrap();
+
+        // String literal containing single quote must not break SQL planning
+        let res_quote = db
+            .query_native(r#"[:find ?e :where [?e :user/name "O'Reilly"]]"#)
+            .await
+            .unwrap();
+        assert_eq!(res_quote.len(), 1);
+        assert_eq!(res_quote[0].get("e"), Some(&Value::Ref(1)));
+
+        // Unbound attribute variable [1 ?a ?v] must resolve both String and Int64 values
+        let res_poly = db
+            .query_native(r#"[:find ?a ?v :where [1 ?a ?v]]"#)
+            .await
+            .unwrap();
+        assert_eq!(res_poly.len(), 2);
+        let vals: Vec<Value> = res_poly
+            .iter()
+            .filter_map(|row| row.get("v").cloned())
+            .collect();
+        assert!(vals.contains(&Value::String("O'Reilly".into())));
+        assert!(vals.contains(&Value::String("42".into())));
+    }
+
+    #[tokio::test]
+    async fn test_or_join_not_join_and_constant_pull_wildcard_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/name", ValueType::String, false);
+        schema.add_attribute(":user/role", ValueType::String, false);
+        schema.add_attribute(":user/suspended", ValueType::Boolean, false);
+
+        let db = MesoDb::open(dir.path().join("joins_pull.db"), schema, Config::default()).unwrap();
+
+        db.transact(vec![
+            Fact {
+                e: 1,
+                ident: ":user/name".into(),
+                v: Value::String("Alice".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 1,
+                ident: ":user/role".into(),
+                v: Value::String("admin".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 2,
+                ident: ":user/name".into(),
+                v: Value::String("Bob".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 2,
+                ident: ":user/role".into(),
+                v: Value::String("staff".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 2,
+                ident: ":user/suspended".into(),
+                v: Value::Boolean(true),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+        ])
+        .await
+        .unwrap();
+
+        db.flush().await.unwrap();
+
+        // or-join projects only [?e] across branches with differing internal variables
+        let or_res = db
+            .query_native(
+                r#"[:find ?e
+                    :where (or-join [?e]
+                             [?e :user/role "admin"]
+                             [?e :user/suspended true])]"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(or_res.len(), 2);
+
+        // not-join correlates strictly on [?e], ignoring ?any_val
+        let not_res = db
+            .query_native(
+                r#"[:find ?e
+                    :where [?e :user/name ?any_val]
+                           (not-join [?e] [?e :user/suspended ?any_val])]"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(not_res.len(), 1);
+        assert_eq!(not_res[0].get("e"), Some(&Value::Ref(1)));
+
+        // Pull with wildcard [*] must fall back to PullEngine and populate all attributes
+        let json = db
+            .query_json(r#"[:find (pull ?e [*]) :where [?e :user/name _] [(= ?e 1)]]"#)
+            .await
+            .unwrap();
+        assert!(json.contains(r#""user/name":"Alice""#));
+        assert!(json.contains(r#""user/role":"admin""#));
     }
 }

@@ -125,8 +125,8 @@ impl<'a> QueryPlanner<'a> {
 
                     match v {
                         Term::Variable(var_name) => {
-                            let col_type = if let Some(attr) = current_attr {
-                                match attr.value_type {
+                            let col_ref = if let Some(attr) = current_attr {
+                                let col_type = match attr.value_type {
                                     ValueType::Boolean => "v_bool",
                                     ValueType::Int64 => "v_int",
                                     ValueType::Float64 => "v_float",
@@ -134,12 +134,15 @@ impl<'a> QueryPlanner<'a> {
                                     ValueType::Ref => "v_ref",
                                     ValueType::Timestamp => "v_time",
                                     ValueType::Uuid => "v_uuid",
-                                }
+                                };
+                                format!("{}.{}", alias, col_type)
                             } else {
-                                "v_str"
+                                format!(
+                                    "COALESCE({a}.v_str, CAST({a}.v_int AS VARCHAR), CAST({a}.v_float AS VARCHAR), CAST({a}.v_bool AS VARCHAR), CAST({a}.v_ref AS VARCHAR), CAST({a}.v_time AS VARCHAR), format_uuid({a}.v_uuid))",
+                                    a = alias
+                                )
                             };
 
-                            let col_ref = format!("{}.{}", alias, col_type);
                             if let Some(existing_col) = var_to_column.get(var_name) {
                                 where_conditions.push(format!("{} = {}", existing_col, col_ref));
                             } else {
@@ -147,16 +150,17 @@ impl<'a> QueryPlanner<'a> {
                             }
                         }
                         Term::String(s) => {
-                            where_conditions.push(format!("{}.v_str = '{}'", alias, s))
+                            let escaped = s.replace('\'', "''");
+                            where_conditions.push(format!("{}.v_str = '{}'", alias, escaped));
                         }
                         Term::Integer(i) => {
-                            where_conditions.push(format!("{}.v_int = {}", alias, i))
+                            where_conditions.push(format!("{}.v_int = {}", alias, i));
                         }
                         Term::Boolean(b) => {
-                            where_conditions.push(format!("{}.v_bool = {}", alias, b))
+                            where_conditions.push(format!("{}.v_bool = {}", alias, b));
                         }
                         Term::Float(f) => {
-                            where_conditions.push(format!("{}.v_float = {}", alias, f))
+                            where_conditions.push(format!("{}.v_float = {}", alias, f));
                         }
                         _ => {}
                     }
@@ -250,7 +254,9 @@ impl<'a> QueryPlanner<'a> {
                                 where_conditions.push(format!("{}.col{} = {}", alias, i, val))
                             }
                             Term::String(val) => {
-                                where_conditions.push(format!("{}.col{} = '{}'", alias, i, val))
+                                let escaped = val.replace('\'', "''");
+                                where_conditions
+                                    .push(format!("{}.col{} = '{}'", alias, i, escaped));
                             }
                             _ => {}
                         }
@@ -270,7 +276,7 @@ impl<'a> QueryPlanner<'a> {
                                 .unwrap_or_else(|| "NULL".into()),
                             Term::Integer(i) => i.to_string(),
                             Term::Float(f) => f.to_string(),
-                            Term::String(s) => format!("'{}'", s),
+                            Term::String(s) => format!("'{}'", s.replace('\'', "''")),
                             Term::Boolean(b) => b.to_string(),
                             _ => "NULL".into(),
                         })
@@ -304,7 +310,7 @@ impl<'a> QueryPlanner<'a> {
                     }
                 }
                 WhereClause::Or {
-                    join_vars: _,
+                    join_vars,
                     clauses: or_clauses,
                 } => {
                     if or_clauses.is_empty() {
@@ -315,13 +321,13 @@ impl<'a> QueryPlanner<'a> {
                     alias_counter += 1;
 
                     let mut union_branches = Vec::new();
-                    let mut projected_vars: Vec<String> = Vec::new();
+                    let mut projected_vars: Vec<String> = join_vars.clone().unwrap_or_default();
 
                     for (idx, clause) in or_clauses.iter().enumerate() {
                         let (sub_froms, sub_wheres, sub_vars) =
                             self.build_logical_plan(std::slice::from_ref(clause))?;
 
-                        if idx == 0 {
+                        if join_vars.is_none() && idx == 0 {
                             for k in sub_vars.keys() {
                                 if !k.starts_with("__lit") {
                                     projected_vars.push(k.clone());
@@ -333,6 +339,11 @@ impl<'a> QueryPlanner<'a> {
                         for var in &projected_vars {
                             if let Some(col) = sub_vars.get(var) {
                                 selects.push(format!("{} AS \"{}\"", col, var));
+                            } else if join_vars.is_some() {
+                                return Err(MesoError::PlanError(format!(
+                                    "or-join variable {} is unbound in branch {}",
+                                    var, idx
+                                )));
                             } else {
                                 selects.push(format!("NULL AS \"{}\"", var));
                             }
@@ -364,15 +375,33 @@ impl<'a> QueryPlanner<'a> {
                     }
                 }
                 WhereClause::Not {
-                    join_vars: _,
+                    join_vars,
                     clauses: not_clauses,
                 } => {
                     let (sub_froms, sub_wheres, sub_vars) = self.build_logical_plan(not_clauses)?;
 
                     let mut correlation_links = Vec::new();
-                    for (var, outer_col) in &var_to_column {
-                        if let Some(inner_col) = sub_vars.get(var) {
+                    if let Some(jvars) = join_vars {
+                        for var in jvars {
+                            let outer_col = var_to_column.get(var).ok_or_else(|| {
+                                MesoError::PlanError(format!(
+                                    "not-join variable {} is unbound in outer query",
+                                    var
+                                ))
+                            })?;
+                            let inner_col = sub_vars.get(var).ok_or_else(|| {
+                                MesoError::PlanError(format!(
+                                    "not-join variable {} is unbound in not-join body",
+                                    var
+                                ))
+                            })?;
                             correlation_links.push(format!("{} = {}", outer_col, inner_col));
+                        }
+                    } else {
+                        for (var, outer_col) in &var_to_column {
+                            if let Some(inner_col) = sub_vars.get(var) {
+                                correlation_links.push(format!("{} = {}", outer_col, inner_col));
+                            }
                         }
                     }
 
@@ -392,6 +421,11 @@ impl<'a> QueryPlanner<'a> {
     }
 
     pub async fn plan(&self, query: &Query) -> Result<DataFrame, MesoError> {
+        self.ctx
+            .register_udf(datafusion::logical_expr::ScalarUDF::from(
+                udf::FormatUuidUDF::new(),
+            ));
+
         let mut has_pull = false;
         let mut select_vars = Vec::new();
         let mut aggregate_vars = Vec::new();

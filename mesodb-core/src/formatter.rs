@@ -83,6 +83,18 @@ pub fn to_json_string(batches: &[RecordBatch], finds: &[FindSpec]) -> String {
                             out.push_str(&arr.value(row).replace('"', "\\\""));
                             out.push('"');
                         }
+                        DataType::Utf8View => {
+                            let arr = column.as_any().downcast_ref::<StringViewArray>().unwrap();
+                            out.push('"');
+                            out.push_str(&arr.value(row).replace('"', "\\\""));
+                            out.push('"');
+                        }
+                        DataType::LargeUtf8 => {
+                            let arr = column.as_any().downcast_ref::<LargeStringArray>().unwrap();
+                            out.push('"');
+                            out.push_str(&arr.value(row).replace('"', "\\\""));
+                            out.push('"');
+                        }
                         _ => out.push_str("null"),
                     }
                 }
@@ -163,6 +175,18 @@ pub fn to_edn_string(batches: &[RecordBatch], finds: &[FindSpec]) -> String {
                             out.push_str(&arr.value(row).replace('"', "\\\""));
                             out.push('"');
                         }
+                        DataType::Utf8View => {
+                            let arr = column.as_any().downcast_ref::<StringViewArray>().unwrap();
+                            out.push('"');
+                            out.push_str(&arr.value(row).replace('"', "\\\""));
+                            out.push('"');
+                        }
+                        DataType::LargeUtf8 => {
+                            let arr = column.as_any().downcast_ref::<LargeStringArray>().unwrap();
+                            out.push('"');
+                            out.push_str(&arr.value(row).replace('"', "\\\""));
+                            out.push('"');
+                        }
                         _ => out.push_str("nil"),
                     }
                 }
@@ -208,6 +232,14 @@ pub fn to_native(batches: &[RecordBatch]) -> Result<Vec<HashMap<String, Value>>>
                     }
                     DataType::Utf8 => {
                         let arr = column.as_any().downcast_ref::<StringArray>().unwrap();
+                        Value::String(arr.value(row).to_string())
+                    }
+                    DataType::Utf8View => {
+                        let arr = column.as_any().downcast_ref::<StringViewArray>().unwrap();
+                        Value::String(arr.value(row).to_string())
+                    }
+                    DataType::LargeUtf8 => {
+                        let arr = column.as_any().downcast_ref::<LargeStringArray>().unwrap();
                         Value::String(arr.value(row).to_string())
                     }
                     DataType::Timestamp(_, _) => {
