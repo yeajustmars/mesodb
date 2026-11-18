@@ -175,7 +175,8 @@ impl<'a> QueryPlanner<'a> {
                         && let Some(a_id) = self.view.schema.get_id(kw)
                         && let Ok(Some(treemap)) = self.view.bitmap_index.get(a_id, &lit)
                     {
-                        let udf_name = format!("in_bitmap_{}_{}", a_id, bitmap::hash_value(&lit));
+                        let udf_name =
+                            format!("in_bitmap_{}_{:032x}", a_id, bitmap::hash_value(&lit));
                         let dirty_for_attr = Arc::new(
                             self.view
                                 .dirty_entities

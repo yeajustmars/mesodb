@@ -1,8 +1,6 @@
 // mesodb-core/src/btree.rs
 
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
@@ -42,8 +40,8 @@ impl CoreBTree {
 
             // Page 0 is the Metapage [root_page_id, next_page_id, padding...]
             let mut metapage = [0u8; 4096];
-            metapage[0..4].copy_from_slice(&1u32.to_ne_bytes());
-            metapage[4..8].copy_from_slice(&2u32.to_ne_bytes());
+            metapage[0..4].copy_from_slice(&1u32.to_le_bytes());
+            metapage[4..8].copy_from_slice(&2u32.to_le_bytes());
             write_pager.write_page_bytes(0, &metapage)?;
             write_pager.flush()?;
 
@@ -63,11 +61,11 @@ impl CoreBTree {
 
             let mut r_bytes = [0u8; 4];
             r_bytes.copy_from_slice(&metapage[0..4]);
-            root_page_id = u32::from_ne_bytes(r_bytes);
+            root_page_id = u32::from_le_bytes(r_bytes);
 
             let mut n_bytes = [0u8; 4];
             n_bytes.copy_from_slice(&metapage[4..8]);
-            write_pager.next_page_id = u32::from_ne_bytes(n_bytes);
+            write_pager.next_page_id = u32::from_le_bytes(n_bytes);
         }
 
         let read_pager = ReadPager::open(write_pager.file())?;
@@ -355,8 +353,8 @@ impl CoreBTree {
 
         // Write the Metapage (Page 0) to finalize the transaction
         let mut metapage = [0u8; 4096];
-        metapage[0..4].copy_from_slice(&self.root_page_id.to_ne_bytes());
-        metapage[4..8].copy_from_slice(&self.write_pager.next_page_id.to_ne_bytes());
+        metapage[0..4].copy_from_slice(&self.root_page_id.to_le_bytes());
+        metapage[4..8].copy_from_slice(&self.write_pager.next_page_id.to_le_bytes());
         self.write_pager.write_page_bytes(0, &metapage)?;
 
         // Fsync storage
@@ -375,12 +373,12 @@ impl CoreBTree {
     fn child_page_id(val: &IndexValue) -> u32 {
         let mut bytes = [0u8; 4];
         bytes.copy_from_slice(&val.payload[0..4]);
-        u32::from_ne_bytes(bytes)
+        u32::from_le_bytes(bytes)
     }
 
     fn make_child_ptr(page_id: u32) -> IndexValue {
         let mut payload = [0u8; 8];
-        payload[0..4].copy_from_slice(&page_id.to_ne_bytes());
+        payload[0..4].copy_from_slice(&page_id.to_le_bytes());
         IndexValue {
             type_tag: 255,
             padding: [0; 7],
@@ -444,11 +442,11 @@ impl NowIndex {
                 0
             }
             Value::Int64(i) => {
-                payload.copy_from_slice(&i.to_ne_bytes());
+                payload.copy_from_slice(&i.to_le_bytes());
                 1
             }
             Value::Float64(f) => {
-                payload.copy_from_slice(&f.to_ne_bytes());
+                payload.copy_from_slice(&f.to_le_bytes());
                 2
             }
             Value::String(s) => {
@@ -481,15 +479,15 @@ impl NowIndex {
                     first_page_id = page_id;
                 }
 
-                payload[0..4].copy_from_slice(&first_page_id.to_ne_bytes());
+                payload[0..4].copy_from_slice(&first_page_id.to_le_bytes());
                 3
             }
             Value::Ref(r) => {
-                payload.copy_from_slice(&r.to_ne_bytes());
+                payload.copy_from_slice(&r.to_le_bytes());
                 4
             }
             Value::Timestamp(t) => {
-                payload.copy_from_slice(&t.to_ne_bytes());
+                payload.copy_from_slice(&t.to_le_bytes());
                 5
             }
             Value::Uuid(u) => {
@@ -500,7 +498,7 @@ impl NowIndex {
                 overflow.data[..16].copy_from_slice(u);
 
                 self.core.dirty_overflows.insert(page_id, overflow);
-                payload[0..4].copy_from_slice(&page_id.to_ne_bytes());
+                payload[0..4].copy_from_slice(&page_id.to_le_bytes());
                 6
             }
         };
@@ -515,12 +513,12 @@ impl NowIndex {
     fn decode_value(&self, iv: &IndexValue) -> Result<Value, MesoError> {
         match iv.type_tag {
             0 => Ok(Value::Boolean(iv.payload[0] != 0)),
-            1 => Ok(Value::Int64(i64::from_ne_bytes(iv.payload))),
-            2 => Ok(Value::Float64(f64::from_ne_bytes(iv.payload))),
+            1 => Ok(Value::Int64(i64::from_le_bytes(iv.payload))),
+            2 => Ok(Value::Float64(f64::from_le_bytes(iv.payload))),
             3 => {
                 let mut bytes = [0u8; 4];
                 bytes.copy_from_slice(&iv.payload[0..4]);
-                let mut current_page_id = u32::from_ne_bytes(bytes);
+                let mut current_page_id = u32::from_le_bytes(bytes);
                 let mut string_bytes = Vec::new();
 
                 loop {
@@ -539,12 +537,12 @@ impl NowIndex {
                 })?;
                 Ok(Value::String(s))
             }
-            4 => Ok(Value::Ref(u64::from_ne_bytes(iv.payload))),
-            5 => Ok(Value::Timestamp(i64::from_ne_bytes(iv.payload))),
+            4 => Ok(Value::Ref(u64::from_le_bytes(iv.payload))),
+            5 => Ok(Value::Timestamp(i64::from_le_bytes(iv.payload))),
             6 => {
                 let mut bytes = [0u8; 4];
                 bytes.copy_from_slice(&iv.payload[0..4]);
-                let page_id = u32::from_ne_bytes(bytes);
+                let page_id = u32::from_le_bytes(bytes);
                 let overflow = self.core.get_overflow(page_id)?;
 
                 let mut u = [0u8; 16];
@@ -560,43 +558,35 @@ impl NowIndex {
 // AVE INDEX (A-V-E Inverted Lookups)
 // ==============================================================================
 
+// ==============================================================================
+// AVE INDEX (A-V-E Inverted Lookups - 128-Bit Collision-Safe)
+// ==============================================================================
+
 pub struct AveIndex {
-    pub core: CoreBTree,
+    pub core: AvtCoreBTree,
 }
 
 impl AveIndex {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, MesoError> {
         Ok(Self {
-            core: CoreBTree::open(path)?,
+            core: AvtCoreBTree::open(path)?,
         })
     }
 
-    fn hash_value(value: &Value) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        match value {
-            Value::Int64(i) => i.hash(&mut hasher),
-            Value::Float64(f) => hasher.write(&f.to_ne_bytes()),
-            Value::Boolean(b) => b.hash(&mut hasher),
-            Value::Timestamp(t) => t.hash(&mut hasher),
-            Value::Ref(r) => r.hash(&mut hasher),
-            Value::String(s) => s.hash(&mut hasher),
-            Value::Uuid(u) => u.hash(&mut hasher),
-        }
-        hasher.finish()
-    }
-
-    fn make_key(a: AttributeId, val_hash: u64) -> IndexKey {
-        IndexKey {
-            e: val_hash,
+    fn make_key(a: AttributeId, v: &Value) -> AvIndexKey {
+        let hash = crate::bitmap::hash_value(v);
+        AvIndexKey {
             a,
             _pad: 0,
+            v_sort: (hash >> 64) as u64,
+            e: hash as u64,
         }
     }
 
     pub fn put(&mut self, a: AttributeId, v: &Value, e: EntityId) -> Result<(), MesoError> {
-        let key = Self::make_key(a, Self::hash_value(v));
+        let key = Self::make_key(a, v);
         let mut payload = [0u8; 8];
-        payload.copy_from_slice(&e.to_ne_bytes());
+        payload.copy_from_slice(&e.to_le_bytes());
 
         let val = IndexValue {
             type_tag: 1, // EntityId payload tag
@@ -607,24 +597,130 @@ impl AveIndex {
         self.core.put_kv(key, val)
     }
 
+    pub fn delete(&mut self, a: AttributeId, v: &Value) -> Result<(), MesoError> {
+        let key = Self::make_key(a, v);
+        let tombstone = IndexValue {
+            type_tag: 254,
+            padding: [0; 7],
+            payload: [0; 8],
+        };
+        self.core.put_kv(key, tombstone)
+    }
+
     #[inline(always)]
     pub fn get(&self, a: AttributeId, v: &Value) -> Result<Option<EntityId>, MesoError> {
-        let key = Self::make_key(a, Self::hash_value(v));
+        let target_key = Self::make_key(a, v);
+        let mut current_page_id = self.core.root_page_id;
 
-        if let Some(iv) = self.core.get_kv(key)? {
-            if iv.type_tag == 254 {
+        loop {
+            let node = self.core.get_node(current_page_id)?;
+            let num_cells = node.header.num_cells as usize;
+            if num_cells == 0 {
                 return Ok(None);
             }
-            let mut e_bytes = [0u8; 8];
-            e_bytes.copy_from_slice(&iv.payload);
-            Ok(Some(EntityId::from_ne_bytes(e_bytes)))
-        } else {
-            Ok(None)
+
+            if node.header.is_leaf == 1 {
+                let mut left = 0;
+                let mut right = num_cells;
+                while left < right {
+                    let mid = left + (right - left) / 2;
+                    if node.keys[mid] < target_key {
+                        left = mid + 1;
+                    } else {
+                        right = mid;
+                    }
+                }
+                if left < num_cells && node.keys[left] == target_key {
+                    let iv = node.values[left];
+                    if iv.type_tag == 254 {
+                        return Ok(None);
+                    }
+                    let mut e_bytes = [0u8; 8];
+                    e_bytes.copy_from_slice(&iv.payload);
+                    return Ok(Some(EntityId::from_le_bytes(e_bytes)));
+                }
+                return Ok(None);
+            } else {
+                let mut child_idx = 0;
+                while child_idx < num_cells && target_key >= node.keys[child_idx] {
+                    child_idx += 1;
+                }
+                if child_idx > 0 {
+                    child_idx -= 1;
+                }
+                let mut bytes = [0u8; 4];
+                bytes.copy_from_slice(&node.values[child_idx].payload[0..4]);
+                current_page_id = u32::from_le_bytes(bytes);
+            }
         }
     }
 
     pub fn flush(&mut self) -> Result<(), MesoError> {
         self.core.flush()
+    }
+}
+
+#[derive(Clone)]
+pub struct AveIndexSnapshot {
+    pub pager: ReadPager,
+    pub root_page_id: u32,
+}
+
+impl AveIndex {
+    pub fn snapshot(&self) -> AveIndexSnapshot {
+        AveIndexSnapshot {
+            pager: self.core.read_pager.clone(),
+            root_page_id: self.core.root_page_id,
+        }
+    }
+}
+
+impl AveIndexSnapshot {
+    pub fn get(&self, a: AttributeId, v: &Value) -> Result<Option<EntityId>, MesoError> {
+        let target_key = AveIndex::make_key(a, v);
+        let mut current_page_id = self.root_page_id;
+
+        loop {
+            let node = self.pager.get_av_node(current_page_id)?;
+            let num_cells = node.header.num_cells as usize;
+            if num_cells == 0 {
+                return Ok(None);
+            }
+
+            if node.header.is_leaf == 1 {
+                let mut left = 0;
+                let mut right = num_cells;
+                while left < right {
+                    let mid = left + (right - left) / 2;
+                    if node.keys[mid] < target_key {
+                        left = mid + 1;
+                    } else {
+                        right = mid;
+                    }
+                }
+                if left < num_cells && node.keys[left] == target_key {
+                    let iv = node.values[left];
+                    if iv.type_tag == 254 {
+                        return Ok(None);
+                    }
+                    let mut e_bytes = [0u8; 8];
+                    e_bytes.copy_from_slice(&iv.payload);
+                    return Ok(Some(EntityId::from_le_bytes(e_bytes)));
+                }
+                return Ok(None);
+            } else {
+                let mut child_idx = 0;
+                while child_idx < num_cells && target_key >= node.keys[child_idx] {
+                    child_idx += 1;
+                }
+                if child_idx > 0 {
+                    child_idx -= 1;
+                }
+                let mut bytes = [0u8; 4];
+                bytes.copy_from_slice(&node.values[child_idx].payload[0..4]);
+                current_page_id = u32::from_le_bytes(bytes);
+            }
+        }
     }
 }
 
@@ -673,7 +769,7 @@ impl BTreeSnapshot {
                 }
                 let mut bytes = [0u8; 4];
                 bytes.copy_from_slice(&node.values[child_idx].payload[0..4]);
-                current_page_id = u32::from_ne_bytes(bytes);
+                current_page_id = u32::from_le_bytes(bytes);
             }
         }
     }
@@ -706,7 +802,7 @@ impl BTreeSnapshot {
                 }
                 let mut bytes = [0u8; 4];
                 bytes.copy_from_slice(&node.values[child_idx].payload[0..4]);
-                current_page_id = u32::from_ne_bytes(bytes);
+                current_page_id = u32::from_le_bytes(bytes);
             }
         }
 
@@ -805,12 +901,12 @@ impl NowIndexSnapshot {
     fn decode_value(&self, iv: &IndexValue) -> Result<Value, MesoError> {
         match iv.type_tag {
             0 => Ok(Value::Boolean(iv.payload[0] != 0)),
-            1 => Ok(Value::Int64(i64::from_ne_bytes(iv.payload))),
-            2 => Ok(Value::Float64(f64::from_ne_bytes(iv.payload))),
+            1 => Ok(Value::Int64(i64::from_le_bytes(iv.payload))),
+            2 => Ok(Value::Float64(f64::from_le_bytes(iv.payload))),
             3 => {
                 let mut bytes = [0u8; 4];
                 bytes.copy_from_slice(&iv.payload[0..4]);
-                let mut current_page_id = u32::from_ne_bytes(bytes);
+                let mut current_page_id = u32::from_le_bytes(bytes);
                 let mut string_bytes = Vec::new();
                 loop {
                     let overflow = self.core.pager.get_overflow(current_page_id)?;
@@ -824,50 +920,17 @@ impl NowIndexSnapshot {
                     String::from_utf8(string_bytes).unwrap_or_default(),
                 ))
             }
-            4 => Ok(Value::Ref(u64::from_ne_bytes(iv.payload))),
-            5 => Ok(Value::Timestamp(i64::from_ne_bytes(iv.payload))),
+            4 => Ok(Value::Ref(u64::from_le_bytes(iv.payload))),
+            5 => Ok(Value::Timestamp(i64::from_le_bytes(iv.payload))),
             6 => {
                 let mut bytes = [0u8; 4];
                 bytes.copy_from_slice(&iv.payload[0..4]);
-                let overflow = self.core.pager.get_overflow(u32::from_ne_bytes(bytes))?;
+                let overflow = self.core.pager.get_overflow(u32::from_le_bytes(bytes))?;
                 let mut u = [0u8; 16];
                 u.copy_from_slice(&overflow.data[..16]);
                 Ok(Value::Uuid(u))
             }
             _ => Ok(Value::Boolean(false)),
-        }
-    }
-}
-
-#[derive(Clone)]
-pub struct AveIndexSnapshot {
-    pub core: BTreeSnapshot,
-}
-
-impl AveIndex {
-    pub fn snapshot(&self) -> AveIndexSnapshot {
-        AveIndexSnapshot {
-            core: self.core.snapshot(),
-        }
-    }
-}
-
-impl AveIndexSnapshot {
-    pub fn get(&self, a: AttributeId, v: &Value) -> Result<Option<EntityId>, MesoError> {
-        let key = IndexKey {
-            e: AveIndex::hash_value(v),
-            a,
-            _pad: 0,
-        };
-        if let Some(iv) = self.core.get_kv(key)? {
-            if iv.type_tag == 254 {
-                return Ok(None);
-            }
-            let mut e_bytes = [0u8; 8];
-            e_bytes.copy_from_slice(&iv.payload);
-            Ok(Some(EntityId::from_ne_bytes(e_bytes)))
-        } else {
-            Ok(None)
         }
     }
 }
@@ -894,8 +957,8 @@ impl AvtCoreBTree {
             empty_root.header.is_leaf = 1;
             write_pager.write_page_bytes(1, bytemuck::bytes_of(&empty_root))?;
             let mut metapage = [0u8; 4096];
-            metapage[0..4].copy_from_slice(&1u32.to_ne_bytes());
-            metapage[4..8].copy_from_slice(&2u32.to_ne_bytes());
+            metapage[0..4].copy_from_slice(&1u32.to_le_bytes());
+            metapage[4..8].copy_from_slice(&2u32.to_le_bytes());
             write_pager.write_page_bytes(0, &metapage)?;
             write_pager.flush()?;
             root_page_id = 1;
@@ -912,10 +975,10 @@ impl AvtCoreBTree {
                 .map_err(MesoError::Io)?;
             let mut r_bytes = [0u8; 4];
             r_bytes.copy_from_slice(&metapage[0..4]);
-            root_page_id = u32::from_ne_bytes(r_bytes);
+            root_page_id = u32::from_le_bytes(r_bytes);
             let mut n_bytes = [0u8; 4];
             n_bytes.copy_from_slice(&metapage[4..8]);
-            write_pager.next_page_id = u32::from_ne_bytes(n_bytes);
+            write_pager.next_page_id = u32::from_le_bytes(n_bytes);
         }
         let read_pager = ReadPager::open(write_pager.file())?;
         Ok(Self {
@@ -1038,7 +1101,7 @@ impl AvtCoreBTree {
             }
             let mut bytes = [0u8; 4];
             bytes.copy_from_slice(&new_node.values[child_idx].payload[0..4]);
-            let child_page_id = u32::from_ne_bytes(bytes);
+            let child_page_id = u32::from_le_bytes(bytes);
             let (new_child_id, split_opt) =
                 self.insert_into_node(child_page_id, target_key, target_val)?;
             new_node.values[child_idx] = Self::make_child_ptr(new_child_id);
@@ -1105,8 +1168,8 @@ impl AvtCoreBTree {
                 .write_page_bytes(*page_id, bytemuck::bytes_of(node))?;
         }
         let mut metapage = [0u8; 4096];
-        metapage[0..4].copy_from_slice(&self.root_page_id.to_ne_bytes());
-        metapage[4..8].copy_from_slice(&self.write_pager.next_page_id.to_ne_bytes());
+        metapage[0..4].copy_from_slice(&self.root_page_id.to_le_bytes());
+        metapage[4..8].copy_from_slice(&self.write_pager.next_page_id.to_le_bytes());
         self.write_pager.write_page_bytes(0, &metapage)?;
         self.write_pager.flush()?;
         self.read_pager = ReadPager::open(self.write_pager.file())?;
@@ -1116,7 +1179,7 @@ impl AvtCoreBTree {
 
     fn make_child_ptr(page_id: u32) -> IndexValue {
         let mut payload = [0u8; 8];
-        payload[0..4].copy_from_slice(&page_id.to_ne_bytes());
+        payload[0..4].copy_from_slice(&page_id.to_le_bytes());
         IndexValue {
             type_tag: 255,
             padding: [0; 7],
@@ -1223,7 +1286,7 @@ impl AvtIndexSnapshot {
             }
             let mut bytes = [0u8; 4];
             bytes.copy_from_slice(&node.values[child_idx].payload[0..4]);
-            current_page_id = u32::from_ne_bytes(bytes);
+            current_page_id = u32::from_le_bytes(bytes);
         }
 
         let mut results = Vec::new();
@@ -1482,5 +1545,25 @@ mod tests {
 
         // Should fetch entities 2 and 3 natively via the B+Tree leaf chain
         assert_eq!(results, vec![2, 3]);
+    }
+
+    #[test]
+    fn test_ave_index_type_separation_and_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ave_128_test.idx");
+
+        {
+            let mut index = AveIndex::open(&path).unwrap();
+            index.put(10, &Value::Int64(42), 1001).unwrap();
+            index.put(10, &Value::Ref(42), 1002).unwrap();
+            index.put(10, &Value::Timestamp(42), 1003).unwrap();
+            index.flush().unwrap();
+        }
+
+        let reopened = AveIndex::open(&path).unwrap();
+        let snap = reopened.snapshot();
+        assert_eq!(snap.get(10, &Value::Int64(42)).unwrap(), Some(1001));
+        assert_eq!(snap.get(10, &Value::Ref(42)).unwrap(), Some(1002));
+        assert_eq!(snap.get(10, &Value::Timestamp(42)).unwrap(), Some(1003));
     }
 }
