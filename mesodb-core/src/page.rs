@@ -67,6 +67,21 @@ pub struct OverflowPage {
 unsafe impl bytemuck::Zeroable for OverflowPage {}
 unsafe impl bytemuck::Pod for OverflowPage {}
 
+pub const METAPAGE_INLINE_FREE_CAP: usize = 1020;
+pub const FREELIST_PAGE_CAP: usize = 1022;
+
+#[repr(C, align(64))]
+#[derive(Copy, Clone)]
+pub struct FreeListPage {
+    pub next_page_id: u32,
+    pub count: u32,
+    pub pages: [u32; FREELIST_PAGE_CAP], // 4 + 4 + 4088 = 4096 bytes
+}
+
+// Manually implement bytemuck traits to bypass array length limits in the derive macro
+unsafe impl bytemuck::Zeroable for FreeListPage {}
+unsafe impl bytemuck::Pod for FreeListPage {}
+
 // --- AVT INDEX (Attribute -> Value -> Entity) ---
 
 pub const AV_NUM_CELLS: usize = 101;
@@ -159,6 +174,12 @@ mod tests {
             std::mem::size_of::<AvNodePage>(),
             PAGE_SIZE,
             "AvNodePage must exactly match the 4KB OS Page size"
+        );
+
+        assert_eq!(
+            std::mem::size_of::<FreeListPage>(),
+            PAGE_SIZE,
+            "FreeListPage must exactly match the 4KB OS Page size"
         );
     }
 

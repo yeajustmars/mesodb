@@ -17,7 +17,7 @@ use crate::{
 /// Readers hold an immutable Arc to the memory map. They can never be blocked.
 #[derive(Clone)]
 pub struct ReadPager {
-    mmap: Arc<Mmap>,
+    pub(crate) mmap: Arc<Mmap>,
     pub num_pages: u32,
 }
 
