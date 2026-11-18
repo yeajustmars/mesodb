@@ -156,6 +156,16 @@ pub fn decode_f64(v: u64) -> f64 {
     f64::from_bits(bits)
 }
 
+/// Packs up to the first 8 bytes in big-endian order so lexicographical byte order
+/// maps monotonically to `u64` sort order.
+#[inline(always)]
+pub fn encode_bytes_prefix(bytes: &[u8]) -> u64 {
+    let mut buf = [0u8; 8];
+    let len = bytes.len().min(8);
+    buf[..len].copy_from_slice(&bytes[..len]);
+    u64::from_be_bytes(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -467,6 +467,11 @@ impl MesoDb {
             .as_any()
             .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
             .ok_or_else(|| MesoError::Serialization("Missing v_time".into()))?;
+        let v_uuid = batch
+            .column(8)
+            .as_any()
+            .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+            .ok_or_else(|| MesoError::Serialization("Missing v_uuid".into()))?;
         let op_col = batch
             .column(10)
             .as_any()
@@ -490,6 +495,12 @@ impl MesoDb {
                 Value::Ref(v_ref.value(i))
             } else if v_time.is_valid(i) {
                 Value::Timestamp(v_time.value(i))
+            } else if v_uuid.is_valid(i) {
+                let bytes: [u8; 16] = v_uuid
+                    .value(i)
+                    .try_into()
+                    .map_err(|_| MesoError::Serialization("Invalid 16-byte UUID".into()))?;
+                Value::Uuid(bytes)
             } else {
                 continue;
             };
@@ -1104,33 +1115,58 @@ impl MesoDb {
                 let mut v_min = 0u64;
                 let mut v_max = u64::MAX;
                 let mut bounds_applied = false;
+                let mut has_numeric_bound = false;
+                let mut str_bounds: Vec<(&str, &str)> = Vec::new();
 
                 for (fn_name, args) in funcs {
                     if args.len() == 2
                         && let crate::ast::Term::Variable(arg_var) = &args[0]
                         && arg_var == v_var
                     {
-                        let enc_val = match &args[1] {
-                            crate::ast::Term::Integer(i) => Some(crate::page::encode_i64(*i)),
-                            crate::ast::Term::Float(f) => Some(crate::page::encode_f64(*f)),
-                            _ => None,
-                        };
-
-                        if let Some(lim) = enc_val {
-                            match fn_name.as_str() {
-                                ">" => v_min = v_min.max(lim.saturating_add(1)),
-                                ">=" => v_min = v_min.max(lim),
-                                "<" => v_max = v_max.min(lim.saturating_sub(1)),
-                                "<=" => v_max = v_max.min(lim),
-                                _ => is_valid = false,
+                        match &args[1] {
+                            crate::ast::Term::Integer(i) => {
+                                let lim = crate::page::encode_i64(*i);
+                                match fn_name.as_str() {
+                                    ">" => v_min = v_min.max(lim.saturating_add(1)),
+                                    ">=" => v_min = v_min.max(lim),
+                                    "<" => v_max = v_max.min(lim.saturating_sub(1)),
+                                    "<=" => v_max = v_max.min(lim),
+                                    _ => is_valid = false,
+                                }
+                                has_numeric_bound = true;
+                                bounds_applied = true;
                             }
-                            bounds_applied = true;
-                        } else {
-                            is_valid = false;
+                            crate::ast::Term::Float(f) => {
+                                let lim = crate::page::encode_f64(*f);
+                                match fn_name.as_str() {
+                                    ">" => v_min = v_min.max(lim.saturating_add(1)),
+                                    ">=" => v_min = v_min.max(lim),
+                                    "<" => v_max = v_max.min(lim.saturating_sub(1)),
+                                    "<=" => v_max = v_max.min(lim),
+                                    _ => is_valid = false,
+                                }
+                                has_numeric_bound = true;
+                                bounds_applied = true;
+                            }
+                            crate::ast::Term::String(s) => {
+                                let lim = crate::page::encode_bytes_prefix(s.as_bytes());
+                                match fn_name.as_str() {
+                                    ">" | ">=" => v_min = v_min.max(lim),
+                                    "<" | "<=" => v_max = v_max.min(lim),
+                                    _ => is_valid = false,
+                                }
+                                str_bounds.push((fn_name.as_str(), s.as_str()));
+                                bounds_applied = true;
+                            }
+                            _ => is_valid = false,
                         }
                     } else {
                         is_valid = false;
                     }
+                }
+
+                if has_numeric_bound && !str_bounds.is_empty() {
+                    is_valid = false;
                 }
 
                 if is_valid
@@ -1138,28 +1174,65 @@ impl MesoDb {
                     && let Some(a_id) = view.schema.get_id(a_ident)
                     && !view.is_attr_dirty(a_id)
                 {
-                    // Execute the scan against the 24-byte B-Tree keys!
-                    let e_ids = view.avt_index.range_scan(a_id, v_min, v_max)?;
-                    if e_ids.is_empty() {
+                    let candidate_ids = view.avt_index.range_scan(a_id, v_min, v_max)?;
+                    if candidate_ids.is_empty() {
                         return Ok(Some(vec![]));
                     }
 
                     let clean_var = find_var.replace("?", "");
 
-                    let (field, array) = if find_var == e_var {
+                    let (field, array) = if !str_bounds.is_empty() {
+                        let mut matched_e = Vec::new();
+                        let mut matched_v = Vec::new();
+
+                        for e_id in candidate_ids {
+                            if let Some(Value::String(val_str)) = view.now_index.get(e_id, a_id)? {
+                                let passes = str_bounds.iter().all(|(op, bound)| match *op {
+                                    ">" => val_str.as_str() > *bound,
+                                    ">=" => val_str.as_str() >= *bound,
+                                    "<" => val_str.as_str() < *bound,
+                                    "<=" => val_str.as_str() <= *bound,
+                                    _ => false,
+                                });
+                                if passes {
+                                    matched_e.push(e_id);
+                                    if find_var != e_var {
+                                        matched_v.push(Value::String(val_str));
+                                    }
+                                }
+                            }
+                        }
+
+                        if matched_e.is_empty() {
+                            return Ok(Some(vec![]));
+                        }
+
+                        if find_var == e_var {
+                            (
+                                arrow::datatypes::Field::new(
+                                    &clean_var,
+                                    arrow::datatypes::DataType::UInt64,
+                                    true,
+                                ),
+                                Arc::new(arrow::array::UInt64Array::from(matched_e))
+                                    as Arc<dyn arrow::array::Array>,
+                            )
+                        } else {
+                            Self::vals_to_arrow_column(&clean_var, &matched_v)
+                        }
+                    } else if find_var == e_var {
                         (
                             arrow::datatypes::Field::new(
                                 &clean_var,
                                 arrow::datatypes::DataType::UInt64,
                                 true,
                             ),
-                            Arc::new(arrow::array::UInt64Array::from(e_ids))
+                            Arc::new(arrow::array::UInt64Array::from(candidate_ids))
                                 as Arc<dyn arrow::array::Array>,
                         )
                     } else {
-                        // If they asked for the value instead of the entity, fetch it via O(1) point lookups
-                        let mut v_vec = Vec::with_capacity(e_ids.len());
-                        for e_id in e_ids {
+                        let mut v_vec = Vec::with_capacity(candidate_ids.len());
+                        for e_id in candidate_ids {
                             if let Some(val) = view.now_index.get(e_id, a_id)? {
                                 v_vec.push(val);
                             }
@@ -4538,5 +4611,88 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resolved[0].get("s"), Some(&Value::String("paused".into())));
+    }
+
+    #[tokio::test]
+    async fn test_fast_path_string_range_scan_and_uuid_indexing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":item/code", ValueType::String, false);
+        schema.add_attribute(":item/uuid", ValueType::Uuid, false);
+
+        let db =
+            MesoDb::open(dir.path().join("fp_str_uuid.db"), schema, Config::default()).unwrap();
+
+        let u_target = [0xAB; 16];
+        db.transact(vec![
+            // Long strings sharing an identical 8-byte prefix ("product_")
+            Fact {
+                e: 1,
+                ident: ":item/code".into(),
+                v: Value::String("product_100".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 2,
+                ident: ":item/code".into(),
+                v: Value::String("product_200".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 3,
+                ident: ":item/code".into(),
+                v: Value::String("product_300".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 2,
+                ident: ":item/uuid".into(),
+                v: Value::Uuid(u_target),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+        ])
+        .await
+        .unwrap();
+
+        db.flush().await.unwrap();
+
+        // Verify strict > and < on strings sharing an 8-byte prefix via try_fast_path
+        let view = db.world_view.read().clone();
+        let ast = parser::parse_query(
+            r#"[:find ?e :where [?e :item/code ?c] [(> ?c "product_100")] [(< ?c "product_300")]]"#,
+        )
+        .unwrap();
+        let fast_res = db
+            .try_fast_path(&ast, &QueryOptions::default(), &view)
+            .unwrap()
+            .expect("String range scan must hit fast path");
+        assert_eq!(fast_res[0].num_rows(), 1);
+        let e_col = fast_res[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .unwrap();
+        assert_eq!(e_col.value(0), 2);
+
+        // Verify UUID was indexed into NowIndex and BitmapStore
+        let uuid_attr = view.schema.get_id(":item/uuid").unwrap();
+        assert_eq!(
+            view.now_index.get(2, uuid_attr).unwrap(),
+            Some(Value::Uuid(u_target))
+        );
+        let bm = view
+            .bitmap_index
+            .get(uuid_attr, &Value::Uuid(u_target))
+            .unwrap()
+            .unwrap();
+        assert!(bm.contains(2));
     }
 }

@@ -1402,6 +1402,7 @@ impl AvtIndex {
             core: AvtCoreBTree::open(path)?,
         })
     }
+
     pub fn put(
         &mut self,
         a: AttributeId,
@@ -1413,15 +1414,10 @@ impl AvtIndex {
             Value::Int64(i) => crate::page::encode_i64(*i),
             Value::Float64(f) => crate::page::encode_f64(*f),
             Value::Timestamp(t) => crate::page::encode_i64(*t),
-            Value::Boolean(b) => {
-                if *b {
-                    1
-                } else {
-                    0
-                }
-            }
+            Value::Boolean(b) => u64::from(*b),
             Value::Ref(r) => *r,
-            _ => return Ok(()),
+            Value::String(s) => crate::page::encode_bytes_prefix(s.as_bytes()),
+            Value::Uuid(u) => crate::page::encode_bytes_prefix(u),
         };
         let key = AvIndexKey {
             a,
@@ -1436,9 +1432,11 @@ impl AvtIndex {
         };
         self.core.put_kv(key, val)
     }
+
     pub fn flush(&mut self) -> Result<(), MesoError> {
         self.core.flush()
     }
+
     pub fn snapshot(&self) -> AvtIndexSnapshot {
         AvtIndexSnapshot {
             pager: self.core.read_pager.clone(),
@@ -1848,5 +1846,46 @@ mod tests {
         // Dropping the snapshot allows retired pages to be reclaimed on subsequent allocations
         drop(pinned_snap);
         let _ = index.core.allocate_page();
+    }
+
+    #[test]
+    fn test_avt_index_string_and_uuid_range_scans() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = AvtIndex::open(dir.path().join("avt_str_uuid.idx")).unwrap();
+
+        let str_attr = 60;
+        index
+            .put(str_attr, &Value::String("alpha_0001".into()), 1, true)
+            .unwrap();
+        index
+            .put(str_attr, &Value::String("beta_0001".into()), 2, true)
+            .unwrap();
+        index
+            .put(str_attr, &Value::String("beta_0002".into()), 3, true)
+            .unwrap();
+        index
+            .put(str_attr, &Value::String("gamma_0001".into()), 4, true)
+            .unwrap();
+
+        let uuid_attr = 61;
+        let u1 = [0x10; 16];
+        let u2 = [0x20; 16];
+        let u3 = [0x30; 16];
+        index.put(uuid_attr, &Value::Uuid(u1), 10, true).unwrap();
+        index.put(uuid_attr, &Value::Uuid(u2), 20, true).unwrap();
+        index.put(uuid_attr, &Value::Uuid(u3), 30, true).unwrap();
+
+        index.flush().unwrap();
+        let snap = index.snapshot();
+
+        let s_min = crate::page::encode_bytes_prefix(b"beta_0000");
+        let s_max = crate::page::encode_bytes_prefix(b"beta_9999");
+        let str_hits = snap.range_scan(str_attr, s_min, s_max).unwrap();
+        assert_eq!(str_hits, vec![2, 3]);
+
+        let u_min = crate::page::encode_bytes_prefix(&[0x15; 16]);
+        let u_max = crate::page::encode_bytes_prefix(&[0x30; 16]);
+        let uuid_hits = snap.range_scan(uuid_attr, u_min, u_max).unwrap();
+        assert_eq!(uuid_hits, vec![20, 30]);
     }
 }
