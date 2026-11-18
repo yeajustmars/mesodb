@@ -100,6 +100,32 @@ impl MesoDb {
         (compacted, volatile, max_tx_id)
     }
 
+    fn record_dirty_batch(
+        dirty_map: &mut ahash::AHashMap<
+            crate::types::AttributeId,
+            ahash::AHashSet<crate::types::EntityId>,
+        >,
+        batch: &RecordBatch,
+    ) {
+        if let (Some(e_col), Some(a_col)) = (
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>(),
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::UInt32Array>(),
+        ) {
+            for i in 0..batch.num_rows() {
+                dirty_map
+                    .entry(a_col.value(i))
+                    .or_default()
+                    .insert(e_col.value(i));
+            }
+        }
+    }
+
     pub fn open<P: AsRef<Path>>(path: P, schema: SchemaMap, config: Config) -> Result<Self> {
         let data_dir = path.as_ref().parent().unwrap().to_path_buf();
         let pq_dir = data_dir.join("parquet");
@@ -127,7 +153,7 @@ impl MesoDb {
         )?;
 
         let mut initial_ram = Vec::new();
-        let mut initial_dirty = ahash::AHashSet::new();
+        let mut initial_dirty = ahash::AHashMap::new();
         let empty_batch = MemTable::new(0).finish()?;
         initial_ram.push((0, empty_batch));
 
@@ -135,16 +161,7 @@ impl MesoDb {
         if recovered_batch.num_rows() > 0 {
             let recovery_tx_id = transactor.current_tx_id.saturating_sub(1);
             initial_ram.push((recovery_tx_id, recovered_batch.clone()));
-
-            if let Some(e_col) = recovered_batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::UInt64Array>()
-            {
-                for i in 0..recovered_batch.num_rows() {
-                    initial_dirty.insert(e_col.value(i));
-                }
-            }
+            Self::record_dirty_batch(&mut initial_dirty, &recovered_batch);
 
             initial_flush_payload = Some(FlushPayload {
                 max_tx_id: recovery_tx_id,
@@ -314,17 +331,9 @@ impl MesoDb {
 
                                 ram_vec_mut.retain(|(id, _)| !evict_tx_ids.contains(id));
 
-                                let mut remaining_dirty = ahash::AHashSet::new();
+                                let mut remaining_dirty = ahash::AHashMap::new();
                                 for (_, b) in ram_vec_mut.iter() {
-                                    if let Some(e_col) =
-                                        b.column(0)
-                                            .as_any()
-                                            .downcast_ref::<arrow::array::UInt64Array>()
-                                    {
-                                        for i in 0..b.num_rows() {
-                                            remaining_dirty.insert(e_col.value(i));
-                                        }
-                                    }
+                                    Self::record_dirty_batch(&mut remaining_dirty, b);
                                 }
 
                                 let vol_mut = Arc::make_mut(&mut world_view_mut.volatile_files);
@@ -568,17 +577,9 @@ impl MesoDb {
                     let ram_vec_mut = Arc::make_mut(&mut world_view_mut.ram_batches);
                     ram_vec_mut.push((report.tx_id, batch_clone.clone()));
 
-                    // Insert dirty entities into WorldView
+                    // Insert dirty (entity, attribute) pairs into WorldView
                     let dirty_mut = Arc::make_mut(&mut world_view_mut.dirty_entities);
-                    if let Some(e_col) = batch_clone
-                        .column(0)
-                        .as_any()
-                        .downcast_ref::<arrow::array::UInt64Array>()
-                    {
-                        for i in 0..batch_clone.num_rows() {
-                            dirty_mut.insert(e_col.value(i));
-                        }
-                    }
+                    Self::record_dirty_batch(dirty_mut, &batch_clone);
                 }
 
                 let mut pending = self.pending_flush.lock();
@@ -711,11 +712,6 @@ impl MesoDb {
                 None => return Ok(None),
             };
 
-            // Fast O(1) dirty check!
-            if view.dirty_entities.contains(&e_id) {
-                return Ok(None); // Let DataFusion resolve pending RAM state
-            }
-
             // Direct B+Tree lookup
             let now_index = &view.now_index;
             let mut fields = Vec::new();
@@ -733,6 +729,10 @@ impl MesoDb {
                         Some(id) => id,
                         None => return Ok(Some(vec![])), // Attribute doesn't exist
                     };
+
+                    if view.is_entity_attr_dirty(e_id, a_id) {
+                        return Ok(None); // Let DataFusion resolve pending RAM state
+                    }
 
                     let clean_var = find_var.replace("?", "");
                     if let Some(val) = now_index.get(e_id, a_id)? {
@@ -776,7 +776,7 @@ impl MesoDb {
             if let Some(val) = literal_val
                 && let Some(a_id) = view.schema.get_id(a_ident)
             {
-                if !view.dirty_entities.is_empty() {
+                if view.is_attr_dirty(a_id) {
                     return Ok(None);
                 }
 
@@ -813,8 +813,13 @@ impl MesoDb {
             && let crate::ast::Term::Integer(e_id) = e
         {
             let entity_id = *e_id as u64;
-            if view.dirty_entities.contains(&entity_id) {
-                return Ok(None);
+            for pull_attr in &pattern.0 {
+                if let crate::ast::PullAttribute::Simple(a_ident) = pull_attr
+                    && let Some(a_id) = view.schema.get_id(a_ident)
+                    && view.is_entity_attr_dirty(entity_id, a_id)
+                {
+                    return Ok(None);
+                }
             }
 
             let now_index = &view.now_index;
@@ -918,7 +923,8 @@ impl MesoDb {
                 if let Some(val) = literal_val
                     && let Some(a_id1) = view.schema.get_id(a_kw1)
                     && let Some(a_id2) = view.schema.get_id(a_kw2)
-                    && view.dirty_entities.is_empty()
+                    && !view.is_attr_dirty(a_id1)
+                    && !view.is_attr_dirty(a_id2)
                     && let Some(treemap) = view.bitmap_index.get(a_id1, &val)?
                 {
                     let mut results = Vec::new();
@@ -1016,8 +1022,8 @@ impl MesoDb {
 
                 if is_valid
                     && bounds_applied
-                    && view.dirty_entities.is_empty()
                     && let Some(a_id) = view.schema.get_id(a_ident)
+                    && !view.is_attr_dirty(a_id)
                 {
                     let kvs = view.now_index.range_scan(e_min, e_max, a_id)?;
                     if kvs.is_empty() {
@@ -1129,8 +1135,8 @@ impl MesoDb {
 
                 if is_valid
                     && bounds_applied
-                    && view.dirty_entities.is_empty()
                     && let Some(a_id) = view.schema.get_id(a_ident)
+                    && !view.is_attr_dirty(a_id)
                 {
                     // Execute the scan against the 24-byte B-Tree keys!
                     let e_ids = view.avt_index.range_scan(a_id, v_min, v_max)?;
@@ -1704,7 +1710,28 @@ pub struct WorldView {
     pub now_index: Arc<crate::btree::NowIndexSnapshot>,
     pub avt_index: Arc<crate::btree::AvtIndexSnapshot>,
     pub bitmap_index: Arc<crate::bitmap::BitmapSnapshot>,
-    pub dirty_entities: Arc<ahash::AHashSet<crate::types::EntityId>>,
+    pub dirty_entities:
+        Arc<ahash::AHashMap<crate::types::AttributeId, ahash::AHashSet<crate::types::EntityId>>>,
+}
+
+impl WorldView {
+    #[inline(always)]
+    pub fn is_entity_attr_dirty(
+        &self,
+        e: crate::types::EntityId,
+        a: crate::types::AttributeId,
+    ) -> bool {
+        self.dirty_entities
+            .get(&a)
+            .is_some_and(|entities| entities.contains(&e))
+    }
+
+    #[inline(always)]
+    pub fn is_attr_dirty(&self, a: crate::types::AttributeId) -> bool {
+        self.dirty_entities
+            .get(&a)
+            .is_some_and(|entities| !entities.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -4420,5 +4447,96 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res[0].get("sum_t"), Some(&Value::Int64(600)));
+    }
+
+    #[tokio::test]
+    async fn test_attribute_scoped_dirty_tracking_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/name", ValueType::String, false);
+        schema.add_attribute(":user/status", ValueType::String, false);
+
+        // Large threshold so subsequent writes stay in RAM
+        let mut config = Config::default();
+        config.storage.memtable_max_rows = 100_000;
+
+        let db = MesoDb::open(dir.path().join("scoped_dirty.db"), schema, config).unwrap();
+
+        db.transact(vec![
+            Fact {
+                e: 1,
+                ident: ":user/name".into(),
+                v: Value::String("Alice".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 1,
+                ident: ":user/status".into(),
+                v: Value::String("active".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+        ])
+        .await
+        .unwrap();
+
+        // Flush initial batch to Tier-1/2 indexes
+        db.flush().await.unwrap();
+        assert!(db.world_view.read().dirty_entities.is_empty());
+
+        // Mutate ONLY :user/status in RAM without flushing
+        db.transact(vec![Fact {
+            e: 1,
+            ident: ":user/status".into(),
+            v: Value::String("paused".into()),
+            op: true,
+            cas_old_v: None,
+            valid_time: None,
+        }])
+        .await
+        .unwrap();
+
+        let view = db.world_view.read().clone();
+        let name_attr = view.schema.get_id(":user/name").unwrap();
+        let status_attr = view.schema.get_id(":user/status").unwrap();
+
+        // :user/name must remain completely clean for fast-path queries
+        assert!(!view.is_attr_dirty(name_attr));
+        assert!(!view.is_entity_attr_dirty(1, name_attr));
+        assert!(view.is_attr_dirty(status_attr));
+        assert!(view.is_entity_attr_dirty(1, status_attr));
+
+        let fast_name = db
+            .try_fast_path(
+                &parser::parse_query(r#"[:find ?n :where [1 :user/name ?n]]"#).unwrap(),
+                &QueryOptions::default(),
+                &view,
+            )
+            .unwrap();
+        assert!(
+            fast_name.is_some(),
+            "Fast path for :user/name must remain active when only :user/status is dirty"
+        );
+
+        let dirty_status = db
+            .try_fast_path(
+                &parser::parse_query(r#"[:find ?s :where [1 :user/status ?s]]"#).unwrap(),
+                &QueryOptions::default(),
+                &view,
+            )
+            .unwrap();
+        assert!(
+            dirty_status.is_none(),
+            "Fast path for dirty :user/status must fall back to DataFusion"
+        );
+
+        let resolved = db
+            .query_native(r#"[:find ?s :where [1 :user/status ?s]]"#)
+            .await
+            .unwrap();
+        assert_eq!(resolved[0].get("s"), Some(&Value::String("paused".into())));
     }
 }

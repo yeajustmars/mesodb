@@ -176,11 +176,18 @@ impl<'a> QueryPlanner<'a> {
                         && let Ok(Some(treemap)) = self.view.bitmap_index.get(a_id, &lit)
                     {
                         let udf_name = format!("in_bitmap_{}_{}", a_id, bitmap::hash_value(&lit));
+                        let dirty_for_attr = Arc::new(
+                            self.view
+                                .dirty_entities
+                                .get(&a_id)
+                                .cloned()
+                                .unwrap_or_default(),
+                        );
 
                         let udf = datafusion::logical_expr::ScalarUDF::from(udf::InBitmapUDF::new(
                             treemap,
                             udf_name.clone(),
-                            self.view.dirty_entities.clone(), // Passed here
+                            dirty_for_attr,
                         ));
                         self.ctx.register_udf(udf);
 
