@@ -645,9 +645,7 @@ impl AveIndex {
                 while child_idx < num_cells && target_key >= node.keys[child_idx] {
                     child_idx += 1;
                 }
-                if child_idx > 0 {
-                    child_idx -= 1;
-                }
+                child_idx = child_idx.saturating_sub(1);
                 let mut bytes = [0u8; 4];
                 bytes.copy_from_slice(&node.values[child_idx].payload[0..4]);
                 current_page_id = u32::from_le_bytes(bytes);
@@ -713,9 +711,7 @@ impl AveIndexSnapshot {
                 while child_idx < num_cells && target_key >= node.keys[child_idx] {
                     child_idx += 1;
                 }
-                if child_idx > 0 {
-                    child_idx -= 1;
-                }
+                child_idx = child_idx.saturating_sub(1);
                 let mut bytes = [0u8; 4];
                 bytes.copy_from_slice(&node.values[child_idx].payload[0..4]);
                 current_page_id = u32::from_le_bytes(bytes);
@@ -1096,9 +1092,7 @@ impl AvtCoreBTree {
             while child_idx < num_cells && target_key >= new_node.keys[child_idx] {
                 child_idx += 1;
             }
-            if child_idx > 0 {
-                child_idx -= 1;
-            }
+            child_idx = child_idx.saturating_sub(1);
             let mut bytes = [0u8; 4];
             bytes.copy_from_slice(&new_node.values[child_idx].payload[0..4]);
             let child_page_id = u32::from_le_bytes(bytes);
@@ -1281,9 +1275,7 @@ impl AvtIndexSnapshot {
             while child_idx < num_cells && start_key >= node.keys[child_idx] {
                 child_idx += 1;
             }
-            if child_idx > 0 {
-                child_idx -= 1;
-            }
+            child_idx = child_idx.saturating_sub(1);
             let mut bytes = [0u8; 4];
             bytes.copy_from_slice(&node.values[child_idx].payload[0..4]);
             current_page_id = u32::from_le_bytes(bytes);
@@ -1310,10 +1302,6 @@ impl AvtIndexSnapshot {
         Ok(results)
     }
 }
-
-// ==============================================================================
-// STRICT MILITARY-GRADE TESTS (DO NOT DELETE)
-// ==============================================================================
 
 #[cfg(test)]
 mod tests {
