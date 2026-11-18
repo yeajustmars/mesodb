@@ -30,8 +30,11 @@ find_elem    = { pull_expr | aggr_expr | variable }
 find_clause  = { ":find" ~ find_elem+ }
 
 // --- In Clause ---
-in_elem      = { data_src | variable }
-in_clause    = { ":in" ~ in_elem+ }
+in_collection = { "[" ~ variable ~ "..." ~ "]" }
+in_tuple      = { "[" ~ variable+ ~ "]" }
+in_rel        = { "[[" ~ variable+ ~ "]]" }
+in_elem       = { data_src | in_rel | in_collection | in_tuple | variable }
+in_clause     = { ":in" ~ in_elem+ }
 
 // --- Where Clause ---
 data_pattern   = { "[" ~ term ~ term ~ term? ~ term? ~ term? ~ "]" }

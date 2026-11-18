@@ -255,9 +255,12 @@ impl MesoDb {
             let run_compaction = |compactor: BackgroundCompactor,
                                   world_view: Arc<RwLock<Arc<WorldView>>>,
                                   output_id: u64| async move {
-                let files_to_compact = {
+                let (files_to_compact, many_attr_ids) = {
                     let view = world_view.read();
-                    view.volatile_files.as_ref().clone()
+                    (
+                        view.volatile_files.as_ref().clone(),
+                        view.schema.many_attribute_ids(),
+                    )
                 };
 
                 if files_to_compact.len() < 2 {
@@ -265,7 +268,7 @@ impl MesoDb {
                 }
 
                 let compacted_path = compactor
-                    .compact_retaining_sources(&files_to_compact, output_id)
+                    .compact_retaining_sources(&files_to_compact, output_id, &many_attr_ids)
                     .await?;
 
                 let old_manifest = {
@@ -303,11 +306,13 @@ impl MesoDb {
                             continue;
                         };
 
+                        let schema_snap = world_view.read().schema.clone();
                         let step_res: Result<()> = (|| {
                             Self::update_indexes_from_batch(
                                 &mut now_index,
                                 &mut bitmap_store,
                                 &mut avt_index,
+                                &schema_snap,
                                 &batch,
                             )?;
 
@@ -424,7 +429,8 @@ impl MesoDb {
     fn update_indexes_from_batch(
         now_index: &mut crate::btree::NowIndex,
         bitmap_store: &mut crate::bitmap::BitmapStore,
-        avt_index: &mut crate::btree::AvtIndex, // NEW
+        avt_index: &mut crate::btree::AvtIndex,
+        schema: &SchemaMap,
         batch: &RecordBatch,
     ) -> Result<()> {
         let e_col = batch
@@ -505,14 +511,22 @@ impl MesoDb {
                 continue;
             };
 
+            let is_many = schema
+                .get_by_id(a)
+                .is_some_and(|attr| attr.cardinality == crate::schema::Cardinality::Many);
+
             if op {
-                let _ = now_index.put(e, a, &val);
+                if !is_many {
+                    let _ = now_index.put(e, a, &val);
+                }
                 let _ = bitmap_store.put(a, &val, e, true);
-                let _ = avt_index.put(a, &val, e, true); // NEW
+                let _ = avt_index.put(a, &val, e, true);
             } else {
-                let _ = now_index.delete(e, a);
+                if !is_many {
+                    let _ = now_index.delete(e, a);
+                }
                 let _ = bitmap_store.put(a, &val, e, false);
-                let _ = avt_index.put(a, &val, e, false); // NEW
+                let _ = avt_index.put(a, &val, e, false);
             }
         }
         Ok(())
@@ -540,7 +554,12 @@ impl MesoDb {
             let mut added_attrs = Vec::with_capacity(attributes.len());
 
             for attr in attributes {
-                let added = tx.transact_schema(&attr.ident, attr.value_type, attr.is_unique)?;
+                let added = tx.transact_schema_with_cardinality(
+                    &attr.ident,
+                    attr.value_type,
+                    attr.is_unique,
+                    attr.cardinality,
+                )?;
                 added_attrs.push(added);
             }
 
@@ -554,7 +573,6 @@ impl MesoDb {
             (added_attrs, tx.take_sync_rx())
         };
 
-        // Await the physical disk sync entirely outside the Transactor lock!
         if let Some(rx) = sync_rx {
             let _ = rx.await;
         }
@@ -662,9 +680,20 @@ impl MesoDb {
         view: &WorldView,
     ) -> Result<Option<Vec<RecordBatch>>> {
         // Must be a "Now" query
-        if options.history || options.as_of.is_some() || options.rules.is_some() {
+        if options.history
+            || options.as_of.is_some()
+            || options.rules.is_some()
+            || ast.in_vars.is_some()
+            || !options.inputs.is_empty()
+        {
             return Ok(None);
         }
+
+        let is_card_many = |a_id: crate::types::AttributeId| {
+            view.schema
+                .get_by_id(a_id)
+                .is_some_and(|attr| attr.cardinality == crate::schema::Cardinality::Many)
+        };
 
         // --- PATTERN 1 & 2: Single or Multi-Attribute EAV Point Lookup ---
         // Match [:find ?v1 ... :where [101 :attr1 ?v1] [101 :attr2 ?v2]]
@@ -741,8 +770,8 @@ impl MesoDb {
                         None => return Ok(Some(vec![])), // Attribute doesn't exist
                     };
 
-                    if view.is_entity_attr_dirty(e_id, a_id) {
-                        return Ok(None); // Let DataFusion resolve pending RAM state
+                    if is_card_many(a_id) || view.is_entity_attr_dirty(e_id, a_id) {
+                        return Ok(None); // Let DataFusion resolve Cardinality::Many or pending RAM state
                     }
 
                     let clean_var = find_var.replace("?", "");
@@ -837,7 +866,7 @@ impl MesoDb {
             for pull_attr in &pattern.0 {
                 if let crate::ast::PullAttribute::Simple(a_ident) = pull_attr
                     && let Some(a_id) = view.schema.get_id(a_ident)
-                    && view.is_entity_attr_dirty(entity_id, a_id)
+                    && (is_card_many(a_id) || view.is_entity_attr_dirty(entity_id, a_id))
                 {
                     return Ok(None);
                 }
@@ -944,6 +973,7 @@ impl MesoDb {
                 if let Some(val) = literal_val
                     && let Some(a_id1) = view.schema.get_id(a_kw1)
                     && let Some(a_id2) = view.schema.get_id(a_kw2)
+                    && !is_card_many(a_id2)
                     && !view.is_attr_dirty(a_id1)
                     && !view.is_attr_dirty(a_id2)
                     && let Some(treemap) = view.bitmap_index.get(a_id1, &val)?
@@ -1045,6 +1075,7 @@ impl MesoDb {
                     && bounds_applied
                     && let Some(a_id) = view.schema.get_id(a_ident)
                     && !view.is_attr_dirty(a_id)
+                    && (find_var == e_var || !is_card_many(a_id))
                 {
                     let kvs = view.now_index.range_scan(e_min, e_max, a_id)?;
                     if kvs.is_empty() {
@@ -1183,6 +1214,7 @@ impl MesoDb {
                     && bounds_applied
                     && let Some(a_id) = view.schema.get_id(a_ident)
                     && !view.is_attr_dirty(a_id)
+                    && (find_var == e_var || !is_card_many(a_id))
                 {
                     let candidate_ids = view.avt_index.range_scan(a_id, v_min, v_max)?;
                     if candidate_ids.is_empty() {
@@ -1550,35 +1582,102 @@ impl MesoDb {
                 ),
             };
 
-            format!(
-                r#"
-                WITH
-                volatile_filtered AS (
-                    SELECT * FROM volatile_datoms {vol_filter}
-                ),
-                volatile_bounds AS (
-                    SELECT *, LEAD(valid_from) OVER (PARTITION BY e, a ORDER BY valid_from ASC, t ASC, op ASC) as next_from
-                    FROM volatile_filtered
-                ),
-                active_volatile AS (
-                    SELECT e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid, t, op, valid_from, next_from, COALESCE(next_from, valid_to) as valid_to
-                    FROM volatile_bounds
-                    WHERE op = true {active_vol_filter}
-                ),
-                volatile_mask AS (
-                    SELECT DISTINCT e, a FROM volatile_filtered
-                ),
-                surviving_compacted AS (
-                    SELECT c.e, c.a, c.v_bool, c.v_int, c.v_float, c.v_str, c.v_ref, c.v_time, c.v_uuid, c.t, c.op, c.valid_from, (CASE WHEN false THEN c.valid_from ELSE NULL END) as next_from, c.valid_to
-                    FROM compacted_datoms c
-                    WHERE c.op = true {comp_filter}
-                      AND NOT EXISTS (SELECT 1 FROM volatile_mask m WHERE m.e = c.e AND m.a = c.a)
+            let many_attr_ids = view.schema.many_attribute_ids();
+            if many_attr_ids.is_empty() {
+                format!(
+                    r#"
+                    WITH
+                    volatile_filtered AS (
+                        SELECT * FROM volatile_datoms {vol_filter}
+                    ),
+                    volatile_bounds AS (
+                        SELECT *, LEAD(valid_from) OVER (PARTITION BY e, a ORDER BY valid_from ASC, t ASC, op ASC) as next_from
+                        FROM volatile_filtered
+                    ),
+                    active_volatile AS (
+                        SELECT e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid, t, op, valid_from, next_from, COALESCE(next_from, valid_to) as valid_to
+                        FROM volatile_bounds
+                        WHERE op = true {active_vol_filter}
+                    ),
+                    volatile_mask AS (
+                        SELECT DISTINCT e, a FROM volatile_filtered
+                    ),
+                    surviving_compacted AS (
+                        SELECT c.e, c.a, c.v_bool, c.v_int, c.v_float, c.v_str, c.v_ref, c.v_time, c.v_uuid, c.t, c.op, c.valid_from, (CASE WHEN false THEN c.valid_from ELSE NULL END) as next_from, c.valid_to
+                        FROM compacted_datoms c
+                        WHERE c.op = true {comp_filter}
+                          AND NOT EXISTS (SELECT 1 FROM volatile_mask m WHERE m.e = c.e AND m.a = c.a)
+                    )
+                    SELECT * FROM surviving_compacted
+                    UNION ALL
+                    SELECT * FROM active_volatile
+                    "#
                 )
-                SELECT * FROM surviving_compacted
-                UNION ALL
-                SELECT * FROM active_volatile
-                "#
-            )
+            } else {
+                let in_list = many_attr_ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    r#"
+                    WITH
+                    volatile_filtered AS (
+                        SELECT * FROM volatile_datoms {vol_filter}
+                    ),
+                    volatile_bounds AS (
+                        SELECT *,
+                            CASE WHEN a IN ({in_list}) THEN
+                                LEAD(valid_from) OVER (
+                                    PARTITION BY e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid
+                                    ORDER BY valid_from ASC, t ASC, op ASC
+                                )
+                            ELSE
+                                LEAD(valid_from) OVER (
+                                    PARTITION BY e, a
+                                    ORDER BY valid_from ASC, t ASC, op ASC
+                                )
+                            END as next_from
+                        FROM volatile_filtered
+                    ),
+                    active_volatile AS (
+                        SELECT e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid, t, op, valid_from, next_from, COALESCE(next_from, valid_to) as valid_to
+                        FROM volatile_bounds
+                        WHERE op = true {active_vol_filter}
+                    ),
+                    volatile_mask_one AS (
+                        SELECT DISTINCT e, a FROM volatile_filtered WHERE a NOT IN ({in_list})
+                    ),
+                    volatile_mask_many AS (
+                        SELECT DISTINCT e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid
+                        FROM volatile_filtered WHERE a IN ({in_list})
+                    ),
+                    surviving_compacted AS (
+                        SELECT c.e, c.a, c.v_bool, c.v_int, c.v_float, c.v_str, c.v_ref, c.v_time, c.v_uuid, c.t, c.op, c.valid_from, (CASE WHEN false THEN c.valid_from ELSE NULL END) as next_from, c.valid_to
+                        FROM compacted_datoms c
+                        WHERE c.op = true {comp_filter}
+                          AND (
+                              (c.a NOT IN ({in_list}) AND NOT EXISTS (SELECT 1 FROM volatile_mask_one m WHERE m.e = c.e AND m.a = c.a))
+                              OR
+                              (c.a IN ({in_list}) AND NOT EXISTS (
+                                  SELECT 1 FROM volatile_mask_many m
+                                  WHERE m.e = c.e AND m.a = c.a
+                                    AND (m.v_bool = c.v_bool OR (m.v_bool IS NULL AND c.v_bool IS NULL))
+                                    AND (m.v_int = c.v_int OR (m.v_int IS NULL AND c.v_int IS NULL))
+                                    AND (m.v_float = c.v_float OR (m.v_float IS NULL AND c.v_float IS NULL))
+                                    AND (m.v_str = c.v_str OR (m.v_str IS NULL AND c.v_str IS NULL))
+                                    AND (m.v_ref = c.v_ref OR (m.v_ref IS NULL AND c.v_ref IS NULL))
+                                    AND (m.v_time = c.v_time OR (m.v_time IS NULL AND c.v_time IS NULL))
+                                    AND (m.v_uuid = c.v_uuid OR (m.v_uuid IS NULL AND c.v_uuid IS NULL))
+                              ))
+                          )
+                    )
+                    SELECT * FROM surviving_compacted
+                    UNION ALL
+                    SELECT * FROM active_volatile
+                    "#
+                )
+            }
         };
 
         let resolved_df = ctx
@@ -1594,6 +1693,7 @@ impl MesoDb {
             options.format.clone(),
             options.as_of,
             ruleset,
+            &options.inputs,
         );
 
         let final_df = planner.plan(&ast).await?;
@@ -1826,12 +1926,21 @@ pub enum OutputFormat {
     Json,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryInput {
+    Scalar(Value),
+    Collection(Vec<Value>),
+    Tuple(Vec<Value>),
+    Relation(Vec<Vec<Value>>),
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct QueryOptions {
     pub as_of: Option<i64>,
     pub format: OutputFormat,
     pub rules: Option<String>,
     pub history: bool,
+    pub inputs: Vec<QueryInput>,
 }
 
 #[derive(Debug, Clone)]
@@ -1839,6 +1948,7 @@ pub struct AttributeDefinition {
     pub ident: String,
     pub value_type: ValueType,
     pub is_unique: bool,
+    pub cardinality: crate::schema::Cardinality,
 }
 
 // --- TESTS ---
@@ -2078,6 +2188,7 @@ mod tests {
             format: OutputFormat::Tabular,
             rules: None,
             history: false,
+            inputs: Vec::new(),
         };
         let res_150 = db.query_with_options(query, opts_150).await.unwrap();
         let col_150 = res_150[0]
@@ -2152,6 +2263,7 @@ mod tests {
             as_of: None,
             rules: None,
             history: false,
+            inputs: Vec::new(),
         };
         let res_json = db.query_with_options(query, opts_json).await.unwrap();
         let json_str = res_json[0]
@@ -2171,6 +2283,7 @@ mod tests {
             as_of: None,
             rules: None,
             history: false,
+            inputs: Vec::new(),
         };
         let res_edn = db.query_with_options(query, opts_edn).await.unwrap();
         let edn_str = res_edn[0]
@@ -2599,11 +2712,13 @@ mod tests {
                 ident: ":product/sku".into(),
                 value_type: ValueType::String,
                 is_unique: true,
+                cardinality: crate::schema::Cardinality::One,
             },
             AttributeDefinition {
                 ident: ":product/price".into(),
                 value_type: ValueType::Float64,
                 is_unique: false,
+                cardinality: crate::schema::Cardinality::One,
             },
         ];
 
@@ -3717,6 +3832,7 @@ mod tests {
             ident: ":new/racing_attr".into(),
             value_type: ValueType::String,
             is_unique: false,
+            cardinality: crate::schema::Cardinality::One,
         };
         db.transact_schema(vec![attr_def]).await.unwrap();
 
@@ -4846,5 +4962,263 @@ mod tests {
             .unwrap();
         assert!(json.contains(r#""user/name":"Alice""#));
         assert!(json.contains(r#""user/role":"admin""#));
+    }
+
+    #[tokio::test]
+    async fn test_parameterized_in_bindings_scalar_collection_tuple_relation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/name", ValueType::String, false);
+        schema.add_attribute(":user/dept", ValueType::String, false);
+        schema.add_attribute(":user/level", ValueType::Int64, false);
+
+        let db =
+            MesoDb::open(dir.path().join("in_bindings.db"), schema, Config::default()).unwrap();
+
+        db.transact(vec![
+            Fact {
+                e: 1,
+                ident: ":user/name".into(),
+                v: Value::String("Alice".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 1,
+                ident: ":user/dept".into(),
+                v: Value::String("eng".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 1,
+                ident: ":user/level".into(),
+                v: Value::Int64(5),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 2,
+                ident: ":user/name".into(),
+                v: Value::String("Bob".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 2,
+                ident: ":user/dept".into(),
+                v: Value::String("ops".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 2,
+                ident: ":user/level".into(),
+                v: Value::Int64(4),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 3,
+                ident: ":user/name".into(),
+                v: Value::String("Carol".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 3,
+                ident: ":user/dept".into(),
+                v: Value::String("eng".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 3,
+                ident: ":user/level".into(),
+                v: Value::Int64(3),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+        ])
+        .await
+        .unwrap();
+
+        // 1. Scalar :in binding
+        let scalar_res = db
+            .query_native_with_options(
+                r#"[:find ?name :in $ ?target_dept :where [?e :user/dept ?target_dept] [?e :user/name ?name]]"#,
+                QueryOptions {
+                    inputs: vec![QueryInput::Scalar(Value::String("ops".into()))],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(scalar_res.len(), 1);
+        assert_eq!(
+            scalar_res[0].get("name"),
+            Some(&Value::String("Bob".into()))
+        );
+
+        // 2. Collection :in [?e ...] binding
+        let coll_res = db
+            .query_native_with_options(
+                r#"[:find ?name :in $ [?e ...] :where [?e :user/name ?name]]"#,
+                QueryOptions {
+                    inputs: vec![QueryInput::Collection(vec![
+                        Value::Int64(1),
+                        Value::Int64(3),
+                    ])],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(coll_res.len(), 2);
+
+        // 3. Tuple :in [?dept ?lvl] binding
+        let tuple_res = db
+            .query_native_with_options(
+                r#"[:find ?name :in $ [?dept ?lvl] :where [?e :user/dept ?dept] [?e :user/level ?lvl] [?e :user/name ?name]]"#,
+                QueryOptions {
+                    inputs: vec![QueryInput::Tuple(vec![
+                        Value::String("eng".into()),
+                        Value::Int64(5),
+                    ])],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(tuple_res.len(), 1);
+        assert_eq!(
+            tuple_res[0].get("name"),
+            Some(&Value::String("Alice".into()))
+        );
+
+        // 4. Relation :in [[?dept ?lvl]] binding
+        let rel_res = db
+            .query_native_with_options(
+                r#"[:find ?name :in $ [[?dept ?lvl]] :where [?e :user/dept ?dept] [?e :user/level ?lvl] [?e :user/name ?name]]"#,
+                QueryOptions {
+                    inputs: vec![QueryInput::Relation(vec![
+                        vec![Value::String("ops".into()), Value::Int64(4)],
+                        vec![Value::String("eng".into()), Value::Int64(3)],
+                    ])],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(rel_res.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cardinality_many_accumulation_retraction_and_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/name", ValueType::String, false);
+        schema.add_attribute_with_cardinality(
+            ":user/tag",
+            ValueType::String,
+            false,
+            crate::schema::Cardinality::Many,
+        );
+
+        let db = MesoDb::open(dir.path().join("card_many.db"), schema, Config::default()).unwrap();
+
+        // Assert multiple tags on the same entity without overwriting prior values
+        db.transact(vec![
+            Fact {
+                e: 1,
+                ident: ":user/name".into(),
+                v: Value::String("Alice".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 1,
+                ident: ":user/tag".into(),
+                v: Value::String("rust".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 1,
+                ident: ":user/tag".into(),
+                v: Value::String("datalog".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+        ])
+        .await
+        .unwrap();
+
+        db.flush().await.unwrap();
+
+        // Add a third tag and retract one specific tag ("rust")
+        db.transact(vec![
+            Fact {
+                e: 1,
+                ident: ":user/tag".into(),
+                v: Value::String("systems".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 1,
+                ident: ":user/tag".into(),
+                v: Value::String("rust".into()),
+                op: false,
+                cas_old_v: None,
+                valid_time: None,
+            },
+        ])
+        .await
+        .unwrap();
+
+        let tags_res = db
+            .query_native(r#"[:find ?tag :where [1 :user/tag ?tag]]"#)
+            .await
+            .unwrap();
+        let mut tags: Vec<String> = tags_res
+            .iter()
+            .filter_map(|row| match row.get("tag") {
+                Some(Value::String(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        tags.sort();
+        assert_eq!(tags, vec!["datalog".to_string(), "systems".to_string()]);
+
+        // Verify Pull renders Cardinality::Many as an array
+        let pull_json = db
+            .query_json(
+                r#"[:find (pull ?e [:user/name :user/tag]) :where [?e :user/name "Alice"]]"#,
+            )
+            .await
+            .unwrap();
+        assert!(pull_json.contains("\"user/tag\":["));
+
+        // Verify Option A compaction preserves all surviving multi-valued members
+        db.compact().await.unwrap();
+        let post_compact = db
+            .query_native(r#"[:find ?tag :where [1 :user/tag ?tag]]"#)
+            .await
+            .unwrap();
+        assert_eq!(post_compact.len(), 2);
     }
 }

@@ -59,12 +59,11 @@ impl BackgroundCompactor {
         Ok(file_path)
     }
 
-    /// Compacts `file_paths` into a single `compacted-{output_id}.parquet` file
-    /// without deleting `file_paths`, allowing callers to swap readers atomically first.
     pub async fn compact_retaining_sources(
         &self,
         file_paths: &[PathBuf],
         output_id: u64,
+        many_attr_ids: &[crate::types::AttributeId],
     ) -> Result<PathBuf> {
         let ctx = SessionContext::new();
         let pq_dir = self.data_dir.join("parquet");
@@ -81,7 +80,8 @@ impl BackgroundCompactor {
         ctx.register_table("raw_fragments", df.into_view())?;
 
         // 2. The Iceberg Resolution (Option A)
-        let sql = r#"
+        let sql = if many_attr_ids.is_empty() {
+            r#"
             WITH bounds AS (
                 SELECT *,
                     LEAD(valid_from)
@@ -93,10 +93,42 @@ impl BackgroundCompactor {
                 COALESCE(next_from, valid_to) as valid_to
             FROM bounds
             WHERE op = true
-        "#;
+            "#
+            .to_string()
+        } else {
+            let in_list = many_attr_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                r#"
+                WITH bounds AS (
+                    SELECT *,
+                        CASE WHEN a IN ({in_list}) THEN
+                            LEAD(valid_from) OVER (
+                                PARTITION BY e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid
+                                ORDER BY valid_from ASC, t ASC, op ASC
+                            )
+                        ELSE
+                            LEAD(valid_from) OVER (
+                                PARTITION BY e, a
+                                ORDER BY valid_from ASC, t ASC, op ASC
+                            )
+                        END as next_from
+                    FROM raw_fragments
+                )
+                SELECT
+                    e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid, t, op, valid_from,
+                    COALESCE(next_from, valid_to) as valid_to
+                FROM bounds
+                WHERE op = true
+                "#
+            )
+        };
 
         // Execute the transformation
-        let compacted_df = ctx.sql(sql).await.map_err(MesoError::DataFusion)?;
+        let compacted_df = ctx.sql(&sql).await.map_err(MesoError::DataFusion)?;
 
         // 3. Write the mathematically pure result out to a temporary file, then rename
         let write_options = DataFrameWriteOptions::default().with_single_file_output(true);
@@ -109,15 +141,11 @@ impl BackgroundCompactor {
         Ok(output_path)
     }
 
-    /// OPTION A BITEMPORAL COMPACTION
-    /// Merges multiple parquet files, mathematically resolves the bitemporal valid_to bounds,
-    /// and strips the op=false rows to maximize Point-in-Time read throughput.
     pub async fn compact(&self, file_paths: &[PathBuf], output_id: u64) -> Result<PathBuf> {
         let output_path = self
-            .compact_retaining_sources(file_paths, output_id)
+            .compact_retaining_sources(file_paths, output_id, &[])
             .await?;
 
-        // Cleanup the old, fragmented files
         for path in file_paths {
             let _ = fs::remove_file(path);
         }

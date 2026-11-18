@@ -7,6 +7,7 @@ use std::{
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::oneshot;
 
 use crate::{
     config::Config,
@@ -14,11 +15,28 @@ use crate::{
     error::MesoError,
     index::IndexManager,
     memtable::MemTable,
-    schema::{Attribute, SchemaMutation},
-    schema::{SchemaMap, SchemaTimeline, ValueType},
-    types::{EntityId, Result, TxId, Value},
+    schema::{Attribute, Cardinality, SchemaMap, SchemaMutation, SchemaTimeline, ValueType},
+    types::{EntityId, Result, Value},
     wal::{Wal, WalEntry},
 };
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Fact {
+    pub e: EntityId,
+    pub ident: String,
+    pub v: Value,
+    pub op: bool,
+    pub cas_old_v: Option<Value>,
+    pub valid_time: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TxReport {
+    pub tx_id: u64,
+    pub timestamp: i64,
+    pub datoms_written: usize,
+    pub batch: RecordBatch,
+}
 
 pub struct Transactor {
     pub config: Config,
@@ -26,7 +44,7 @@ pub struct Transactor {
     pub schema: SchemaMap,
     pub timeline: SchemaTimeline,
     pub indices: IndexManager,
-    pub current_tx_id: TxId,
+    pub current_tx_id: u64,
 }
 
 impl Transactor {
@@ -63,7 +81,23 @@ impl Transactor {
                             current_tx_id = datom.t + 1;
                         }
                         if let Some(attr) = schema.get_by_id(datom.a) {
-                            if datom.op {
+                            if attr.cardinality == Cardinality::Many {
+                                if datom.op {
+                                    indices.insert_many(
+                                        datom.e,
+                                        datom.a,
+                                        datom.v.clone(),
+                                        datom.valid_from,
+                                    );
+                                } else {
+                                    indices.remove_many(
+                                        datom.e,
+                                        datom.a,
+                                        datom.v.clone(),
+                                        datom.valid_from,
+                                    );
+                                }
+                            } else if datom.op {
                                 indices.insert(
                                     datom.e,
                                     datom.a,
@@ -119,11 +153,37 @@ impl Transactor {
         ))
     }
 
+    pub fn take_sync_rx(&mut self) -> Option<oneshot::Receiver<()>> {
+        self.wal.take_last_sync_rx()
+    }
+
+    pub fn transact(&mut self, facts: Vec<Fact>) -> Result<TxReport> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_micros() as i64;
+        self.execute(facts, now)
+    }
+
+    pub fn transact_at(&mut self, facts: Vec<Fact>, tx_time: i64) -> Result<TxReport> {
+        self.execute(facts, tx_time)
+    }
+
     pub fn transact_schema(
         &mut self,
         ident: &str,
         value_type: ValueType,
         is_unique: bool,
+    ) -> Result<Arc<Attribute>> {
+        self.transact_schema_with_cardinality(ident, value_type, is_unique, Cardinality::One)
+    }
+
+    pub fn transact_schema_with_cardinality(
+        &mut self,
+        ident: &str,
+        value_type: ValueType,
+        is_unique: bool,
+        cardinality: Cardinality,
     ) -> Result<Arc<Attribute>> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -132,7 +192,9 @@ impl Transactor {
         let tx_id = self.current_tx_id;
         self.current_tx_id += 1;
 
-        let attr = self.schema.add_attribute(ident, value_type, is_unique);
+        let attr =
+            self.schema
+                .add_attribute_with_cardinality(ident, value_type, is_unique, cardinality);
 
         let mutation = SchemaMutation::AddAttribute {
             tx_id,
@@ -150,18 +212,6 @@ impl Transactor {
         Ok(attr)
     }
 
-    pub fn transact(&mut self, facts: Vec<Fact>) -> Result<TxReport> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as i64;
-        self.execute(facts, now)
-    }
-
-    pub fn transact_at(&mut self, facts: Vec<Fact>, custom_now: i64) -> Result<TxReport> {
-        self.execute(facts, custom_now)
-    }
-
     fn execute(&mut self, facts: Vec<Fact>, now: i64) -> Result<TxReport> {
         if facts.is_empty() {
             let empty_batch = MemTable::new(0).finish()?;
@@ -174,7 +224,7 @@ impl Transactor {
         }
 
         let tx_id = self.current_tx_id;
-        let mut pending_datoms = Vec::with_capacity(facts.len() * 2); // Room for retractions
+        let mut pending_datoms = Vec::with_capacity(facts.len() * 2);
         let mut batch_uniques = HashSet::new();
 
         // --- PHASE 1: Validation & Bitemporal Resolution ---
@@ -231,16 +281,23 @@ impl Transactor {
             }
 
             self.schema.validate_value(&fact.ident, &fact.v)?;
-            let is_unique = self.schema.get_by_id(attr_id).unwrap().is_unique;
+            let attr_meta = self.schema.get_by_id(attr_id).unwrap();
+            let is_unique = attr_meta.is_unique;
+            let is_many = attr_meta.cardinality == Cardinality::Many;
 
             // --- CAS VALIDATION ---
             if let Some(expected_v) = &fact.cas_old_v {
                 let current_v = self
                     .indices
                     .get_value_at(fact.e, attr_id, resolved_valid_time);
-                let current_matches = match current_v {
-                    Some(v) => v == expected_v,
-                    None => false,
+                let current_matches = if is_many {
+                    self.indices
+                        .has_many_value_at(fact.e, attr_id, expected_v, resolved_valid_time)
+                } else {
+                    match current_v {
+                        Some(v) => v == expected_v,
+                        None => false,
+                    }
                 };
 
                 if !current_matches {
@@ -288,8 +345,14 @@ impl Transactor {
                     }
                 }
 
-                // Automatic Retraction Check (RESTORED unconditionally)
-                if let Some(existing_v) =
+                if is_many {
+                    if self
+                        .indices
+                        .has_many_value_at(fact.e, attr_id, &fact.v, resolved_valid_time)
+                    {
+                        continue;
+                    }
+                } else if let Some(existing_v) =
                     self.indices
                         .get_value_at(fact.e, attr_id, resolved_valid_time)
                 {
@@ -302,7 +365,7 @@ impl Transactor {
                             resolved_valid_time,
                         ));
                     } else {
-                        continue; // No-op: value already set
+                        continue;
                     }
                 }
 
@@ -313,12 +376,10 @@ impl Transactor {
                     tx_id,
                     resolved_valid_time,
                 ));
-            } else {
-                // Retraction (RESTORED verification)
-                if let Some(existing_v) =
-                    self.indices
-                        .get_value_at(fact.e, attr_id, resolved_valid_time)
-                    && existing_v == &fact.v
+            } else if is_many {
+                if self
+                    .indices
+                    .has_many_value_at(fact.e, attr_id, &fact.v, resolved_valid_time)
                 {
                     pending_datoms.push(Datom::retract(
                         fact.e,
@@ -328,6 +389,18 @@ impl Transactor {
                         resolved_valid_time,
                     ));
                 }
+            } else if let Some(existing_v) =
+                self.indices
+                    .get_value_at(fact.e, attr_id, resolved_valid_time)
+                && existing_v == &fact.v
+            {
+                pending_datoms.push(Datom::retract(
+                    fact.e,
+                    attr_id,
+                    fact.v,
+                    tx_id,
+                    resolved_valid_time,
+                ));
             }
         }
 
@@ -341,10 +414,19 @@ impl Transactor {
         let mut tx_memtable = MemTable::new(pending_datoms.len());
 
         for datom in &pending_datoms {
-            let is_unique = self.schema.get_by_id(datom.a).unwrap().is_unique;
+            let attr_meta = self.schema.get_by_id(datom.a).unwrap();
+            let is_unique = attr_meta.is_unique;
+            let is_many = attr_meta.cardinality == Cardinality::Many;
 
-            // RESTORED unconditionally to maintain EAVT for history and CAS
-            if datom.op {
+            if is_many {
+                if datom.op {
+                    self.indices
+                        .insert_many(datom.e, datom.a, datom.v.clone(), datom.valid_from);
+                } else {
+                    self.indices
+                        .remove_many(datom.e, datom.a, datom.v.clone(), datom.valid_from);
+                }
+            } else if datom.op {
                 self.indices.insert(
                     datom.e,
                     datom.a,
@@ -370,29 +452,6 @@ impl Transactor {
             batch,
         })
     }
-
-    pub fn take_sync_rx(&mut self) -> Option<tokio::sync::oneshot::Receiver<()>> {
-        self.wal.take_last_sync_rx()
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Fact {
-    pub e: EntityId,
-    pub ident: String,
-    pub v: Value,
-    pub op: bool,
-    pub cas_old_v: Option<Value>, // Compare-And-Swap expectation
-    pub valid_time: Option<i64>,
-}
-
-#[derive(Debug)]
-pub struct TxReport {
-    pub tx_id: TxId,
-    pub timestamp: i64,
-    pub datoms_written: usize,
-    /// The immutable Arrow batch for this specific transaction
-    pub batch: RecordBatch,
 }
 
 #[cfg(test)]

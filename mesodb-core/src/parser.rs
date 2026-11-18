@@ -54,6 +54,18 @@ pub fn parse_query(query_str: &str) -> Result<Query, MesoError> {
                         Rule::data_src => {
                             in_vars.push(InSpec::DataSource(inner.as_str().to_string()))
                         }
+                        Rule::in_collection => {
+                            let var = inner.into_inner().next().unwrap().as_str().to_string();
+                            in_vars.push(InSpec::Collection(var));
+                        }
+                        Rule::in_tuple => {
+                            let vars = inner.into_inner().map(|p| p.as_str().to_string()).collect();
+                            in_vars.push(InSpec::Tuple(vars));
+                        }
+                        Rule::in_rel => {
+                            let vars = inner.into_inner().map(|p| p.as_str().to_string()).collect();
+                            in_vars.push(InSpec::Relation(vars));
+                        }
                         _ => {}
                     }
                 }

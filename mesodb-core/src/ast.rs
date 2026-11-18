@@ -40,6 +40,9 @@ pub enum FindSpec {
 pub enum InSpec {
     DataSource(String),
     Variable(String),
+    Collection(String),
+    Tuple(Vec<String>),
+    Relation(Vec<String>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

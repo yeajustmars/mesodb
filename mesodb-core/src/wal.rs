@@ -345,6 +345,7 @@ mod tests {
                 ident: ":test/new".into(),
                 value_type: crate::schema::ValueType::String,
                 is_unique: false,
+                cardinality: crate::schema::Cardinality::One,
             },
         };
         wal.append_entry(
