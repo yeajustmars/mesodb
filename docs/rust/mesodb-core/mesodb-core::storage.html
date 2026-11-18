@@ -671,9 +671,23 @@
           <pre class="symbol-sig"><code>fn compact(&amp;self, file_paths: &amp;[PathBuf], output_id: u64) -&gt; Result&lt;PathBuf&gt;</code></pre>
         
         
-          <div class="symbol-desc">OPTION A BITEMPORAL COMPACTION
-Merges multiple parquet files, mathematically resolves the bitemporal valid_to bounds,
-and strips the op=false rows to maximize Point-in-Time read throughput.</div>
+        
+      </div>
+    
+      <div class="symbol-card" id="BackgroundCompactor::compact_retaining_sources">
+        <div class="symbol-header">
+          <span class="badge badge-fn">Method</span>
+          <h3 class="symbol-name">BackgroundCompactor::compact_retaining_sources</h3>
+          <span class="symbol-line">Line 1</span>
+        </div>
+        
+          <pre class="symbol-sig"><code>fn compact_retaining_sources(
+        &amp;self,
+        file_paths: &amp;[PathBuf],
+        output_id: u64,
+        many_attr_ids: &amp;[crate::types::AttributeId],
+    ) -&gt; Result&lt;PathBuf&gt;</code></pre>
+        
         
         
       </div>

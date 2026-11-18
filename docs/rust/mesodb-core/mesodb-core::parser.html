@@ -689,14 +689,14 @@
   classDef current fill:#2563eb,stroke:#1d4ed8,stroke-width:2px,color:#fff;
   classDef neighbor fill:#f1f5f9,stroke:#cbd5e1,stroke-width:1px,color:#0f172a;
   node_target[&quot;parse_query&quot;]:::current
-  c_0[&quot;test_parse_pull_simple&quot;]:::neighbor --&gt; node_target
-  c_1[&quot;test_parse_basic_id_2_with_in&quot;]:::neighbor --&gt; node_target
-  c_2[&quot;test_parse_predicate_string&quot;]:::neighbor --&gt; node_target
+  c_0[&quot;test_parse_basic_id_1&quot;]:::neighbor --&gt; node_target
+  c_1[&quot;test_parse_datomic_pull_syntax&quot;]:::neighbor --&gt; node_target
+  c_2[&quot;test_parse_pull_simple&quot;]:::neighbor --&gt; node_target
   c_3[&quot;test_parse_basic_id_0&quot;]:::neighbor --&gt; node_target
-  c_4[&quot;test_parse_basic_id_1&quot;]:::neighbor --&gt; node_target
-  c_5[&quot;test_parse_datomic_pull_syntax&quot;]:::neighbor --&gt; node_target
-  node_target --&gt; e_0[&quot;parse_where_elem&quot;]:::neighbor
-  node_target --&gt; e_1[&quot;parse_pull_pattern&quot;]:::neighbor</pre>
+  c_4[&quot;test_parse_basic_id_2_with_in&quot;]:::neighbor --&gt; node_target
+  c_5[&quot;test_parse_predicate_string&quot;]:::neighbor --&gt; node_target
+  node_target --&gt; e_0[&quot;parse_pull_pattern&quot;]:::neighbor
+  node_target --&gt; e_1[&quot;parse_where_elem&quot;]:::neighbor</pre>
           </div>
         
       </div>
@@ -719,7 +719,7 @@
   classDef neighbor fill:#f1f5f9,stroke:#cbd5e1,stroke-width:1px,color:#0f172a;
   node_target[&quot;parse_ruleset&quot;]:::current
   c_0[&quot;test_parse_ruleset&quot;]:::neighbor --&gt; node_target
-  node_target --&gt; e_0[&quot;parse_term&quot;]:::neighbor</pre>
+  node_target --&gt; e_0[&quot;parse_where_elem&quot;]:::neighbor</pre>
           </div>
         
       </div>
@@ -731,7 +731,7 @@
           <span class="symbol-line">Line 1</span>
         </div>
         
-          <pre class="symbol-sig"><code>fn parse_term(pair: pest::iterators::Pair&lt;Rule&gt;) -&gt; Term</code></pre>
+          <pre class="symbol-sig"><code>fn parse_term(pair: pest::iterators::Pair&lt;Rule&gt;) -&gt; Result&lt;Term, MesoError&gt;</code></pre>
         
         
         
@@ -741,8 +741,8 @@
   classDef current fill:#2563eb,stroke:#1d4ed8,stroke-width:2px,color:#fff;
   classDef neighbor fill:#f1f5f9,stroke:#cbd5e1,stroke-width:1px,color:#0f172a;
   node_target[&quot;parse_term&quot;]:::current
-  c_0[&quot;parse_ruleset&quot;]:::neighbor --&gt; node_target
-  c_1[&quot;parse_where_elem&quot;]:::neighbor --&gt; node_target</pre>
+  c_0[&quot;parse_where_elem&quot;]:::neighbor --&gt; node_target
+  node_target --&gt; e_0[&quot;unescape_datalog_str&quot;]:::neighbor</pre>
           </div>
         
       </div>
@@ -754,7 +754,7 @@
           <span class="symbol-line">Line 1</span>
         </div>
         
-          <pre class="symbol-sig"><code>fn parse_where_elem(where_elem: pest::iterators::Pair&lt;Rule&gt;) -&gt; WhereClause</code></pre>
+          <pre class="symbol-sig"><code>fn parse_where_elem(where_elem: pest::iterators::Pair&lt;Rule&gt;) -&gt; Result&lt;WhereClause, MesoError&gt;</code></pre>
         
         
         
@@ -764,10 +764,11 @@
   classDef current fill:#2563eb,stroke:#1d4ed8,stroke-width:2px,color:#fff;
   classDef neighbor fill:#f1f5f9,stroke:#cbd5e1,stroke-width:1px,color:#0f172a;
   node_target[&quot;parse_where_elem&quot;]:::current
-  c_0[&quot;parse_query&quot;]:::neighbor --&gt; node_target
+  c_0[&quot;parse_ruleset&quot;]:::neighbor --&gt; node_target
   c_1[&quot;parse_where_elem&quot;]:::neighbor --&gt; node_target
-  node_target --&gt; e_0[&quot;parse_where_elem&quot;]:::neighbor
-  node_target --&gt; e_1[&quot;parse_term&quot;]:::neighbor</pre>
+  c_2[&quot;parse_query&quot;]:::neighbor --&gt; node_target
+  node_target --&gt; e_0[&quot;parse_term&quot;]:::neighbor
+  node_target --&gt; e_1[&quot;parse_where_elem&quot;]:::neighbor</pre>
           </div>
         
       </div>
@@ -922,6 +923,28 @@
   classDef neighbor fill:#f1f5f9,stroke:#cbd5e1,stroke-width:1px,color:#0f172a;
   node_target[&quot;test_parse_ruleset&quot;]:::current
   node_target --&gt; e_0[&quot;parse_ruleset&quot;]:::neighbor</pre>
+          </div>
+        
+      </div>
+    
+      <div class="symbol-card" id="unescape_datalog_str">
+        <div class="symbol-header">
+          <span class="badge badge-fn">Function</span>
+          <h3 class="symbol-name">unescape_datalog_str</h3>
+          <span class="symbol-line">Line 1</span>
+        </div>
+        
+          <pre class="symbol-sig"><code>fn unescape_datalog_str(raw: &amp;str) -&gt; String</code></pre>
+        
+        
+        
+          <div class="neighborhood-graph">
+            <h4>Call Neighborhood</h4>
+            <pre class="mermaid">graph LR
+  classDef current fill:#2563eb,stroke:#1d4ed8,stroke-width:2px,color:#fff;
+  classDef neighbor fill:#f1f5f9,stroke:#cbd5e1,stroke-width:1px,color:#0f172a;
+  node_target[&quot;unescape_datalog_str&quot;]:::current
+  c_0[&quot;parse_term&quot;]:::neighbor --&gt; node_target</pre>
           </div>
         
       </div>

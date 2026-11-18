@@ -635,14 +635,14 @@
   <hr />
   <section class="symbols">
     
-      <div class="symbol-card" id="hash_value">
+      <div class="symbol-card" id="fnv1a_update">
         <div class="symbol-header">
           <span class="badge badge-fn">Function</span>
-          <h3 class="symbol-name">hash_value</h3>
+          <h3 class="symbol-name">fnv1a_update</h3>
           <span class="symbol-line">Line 1</span>
         </div>
         
-          <pre class="symbol-sig"><code>fn hash_value(value: &amp;Value) -&gt; u64</code></pre>
+          <pre class="symbol-sig"><code>fn fnv1a_update(mut state: u64, prime: u64, bytes: &amp;[u8]) -&gt; u64</code></pre>
         
         
         
@@ -651,9 +651,93 @@
             <pre class="mermaid">graph LR
   classDef current fill:#2563eb,stroke:#1d4ed8,stroke-width:2px,color:#fff;
   classDef neighbor fill:#f1f5f9,stroke:#cbd5e1,stroke-width:1px,color:#0f172a;
+  node_target[&quot;fnv1a_update&quot;]:::current
+  c_0[&quot;hash_value&quot;]:::neighbor --&gt; node_target</pre>
+          </div>
+        
+      </div>
+    
+      <div class="symbol-card" id="hash_value">
+        <div class="symbol-header">
+          <span class="badge badge-fn">Function</span>
+          <h3 class="symbol-name">hash_value</h3>
+          <span class="symbol-line">Line 1</span>
+        </div>
+        
+          <pre class="symbol-sig"><code>fn hash_value(value: &amp;Value) -&gt; u128</code></pre>
+        
+        
+          <div class="symbol-desc">Deterministic, platform-independent 128-bit hash with explicit `Value` variant separation.</div>
+        
+        
+          <div class="neighborhood-graph">
+            <h4>Call Neighborhood</h4>
+            <pre class="mermaid">graph LR
+  classDef current fill:#2563eb,stroke:#1d4ed8,stroke-width:2px,color:#fff;
+  classDef neighbor fill:#f1f5f9,stroke:#cbd5e1,stroke-width:1px,color:#0f172a;
   node_target[&quot;hash_value&quot;]:::current
-  c_0[&quot;BitmapSnapshot::get&quot;]:::neighbor --&gt; node_target
-  c_1[&quot;BitmapStore::put&quot;]:::neighbor --&gt; node_target</pre>
+  c_0[&quot;BitmapStore::put&quot;]:::neighbor --&gt; node_target
+  c_1[&quot;test_deterministic_128bit_hash_type_separation&quot;]:::neighbor --&gt; node_target
+  c_2[&quot;BitmapSnapshot::get&quot;]:::neighbor --&gt; node_target
+  node_target --&gt; e_0[&quot;mix64&quot;]:::neighbor
+  node_target --&gt; e_1[&quot;fnv1a_update&quot;]:::neighbor</pre>
+          </div>
+        
+      </div>
+    
+      <div class="symbol-card" id="mix64">
+        <div class="symbol-header">
+          <span class="badge badge-fn">Function</span>
+          <h3 class="symbol-name">mix64</h3>
+          <span class="symbol-line">Line 1</span>
+        </div>
+        
+          <pre class="symbol-sig"><code>fn mix64(mut x: u64) -&gt; u64</code></pre>
+        
+        
+        
+          <div class="neighborhood-graph">
+            <h4>Call Neighborhood</h4>
+            <pre class="mermaid">graph LR
+  classDef current fill:#2563eb,stroke:#1d4ed8,stroke-width:2px,color:#fff;
+  classDef neighbor fill:#f1f5f9,stroke:#cbd5e1,stroke-width:1px,color:#0f172a;
+  node_target[&quot;mix64&quot;]:::current
+  c_0[&quot;hash_value&quot;]:::neighbor --&gt; node_target</pre>
+          </div>
+        
+      </div>
+    
+      <div class="symbol-card" id="test_bitmap_store_reopen_and_truncated_tail_recovery">
+        <div class="symbol-header">
+          <span class="badge badge-fn">Function</span>
+          <h3 class="symbol-name">test_bitmap_store_reopen_and_truncated_tail_recovery</h3>
+          <span class="symbol-line">Line 1</span>
+        </div>
+        
+          <pre class="symbol-sig"><code>fn test_bitmap_store_reopen_and_truncated_tail_recovery()</code></pre>
+        
+        
+        
+      </div>
+    
+      <div class="symbol-card" id="test_deterministic_128bit_hash_type_separation">
+        <div class="symbol-header">
+          <span class="badge badge-fn">Function</span>
+          <h3 class="symbol-name">test_deterministic_128bit_hash_type_separation</h3>
+          <span class="symbol-line">Line 1</span>
+        </div>
+        
+          <pre class="symbol-sig"><code>fn test_deterministic_128bit_hash_type_separation()</code></pre>
+        
+        
+        
+          <div class="neighborhood-graph">
+            <h4>Call Neighborhood</h4>
+            <pre class="mermaid">graph LR
+  classDef current fill:#2563eb,stroke:#1d4ed8,stroke-width:2px,color:#fff;
+  classDef neighbor fill:#f1f5f9,stroke:#cbd5e1,stroke-width:1px,color:#0f172a;
+  node_target[&quot;test_deterministic_128bit_hash_type_separation&quot;]:::current
+  node_target --&gt; e_0[&quot;hash_value&quot;]:::neighbor</pre>
           </div>
         
       </div>

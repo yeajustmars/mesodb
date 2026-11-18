@@ -635,6 +635,74 @@
   <hr />
   <section class="symbols">
     
+      <div class="symbol-card" id="out_ref">
+        <div class="symbol-header">
+          <span class="badge badge-fn">Function</span>
+          <h3 class="symbol-name">out_ref</h3>
+          <span class="symbol-line">Line 1</span>
+        </div>
+        
+          <pre class="symbol-sig"><code>fn out_ref(s: &amp;mut String) -&gt; &amp;mut String</code></pre>
+        
+        
+        
+          <div class="neighborhood-graph">
+            <h4>Call Neighborhood</h4>
+            <pre class="mermaid">graph LR
+  classDef current fill:#2563eb,stroke:#1d4ed8,stroke-width:2px,color:#fff;
+  classDef neighbor fill:#f1f5f9,stroke:#cbd5e1,stroke-width:1px,color:#0f172a;
+  node_target[&quot;out_ref&quot;]:::current
+  c_0[&quot;to_json_string&quot;]:::neighbor --&gt; node_target</pre>
+          </div>
+        
+      </div>
+    
+      <div class="symbol-card" id="push_escaped_quoted">
+        <div class="symbol-header">
+          <span class="badge badge-fn">Function</span>
+          <h3 class="symbol-name">push_escaped_quoted</h3>
+          <span class="symbol-line">Line 1</span>
+        </div>
+        
+          <pre class="symbol-sig"><code>fn push_escaped_quoted(out: &amp;mut String, s: &amp;str, json_mode: bool)</code></pre>
+        
+        
+        
+          <div class="neighborhood-graph">
+            <h4>Call Neighborhood</h4>
+            <pre class="mermaid">graph LR
+  classDef current fill:#2563eb,stroke:#1d4ed8,stroke-width:2px,color:#fff;
+  classDef neighbor fill:#f1f5f9,stroke:#cbd5e1,stroke-width:1px,color:#0f172a;
+  node_target[&quot;push_escaped_quoted&quot;]:::current
+  c_0[&quot;to_edn_string&quot;]:::neighbor --&gt; node_target
+  c_1[&quot;to_json_string&quot;]:::neighbor --&gt; node_target</pre>
+          </div>
+        
+      </div>
+    
+      <div class="symbol-card" id="push_uuid_hex">
+        <div class="symbol-header">
+          <span class="badge badge-fn">Function</span>
+          <h3 class="symbol-name">push_uuid_hex</h3>
+          <span class="symbol-line">Line 1</span>
+        </div>
+        
+          <pre class="symbol-sig"><code>fn push_uuid_hex(out: &amp;mut String, b: &amp;[u8])</code></pre>
+        
+        
+        
+          <div class="neighborhood-graph">
+            <h4>Call Neighborhood</h4>
+            <pre class="mermaid">graph LR
+  classDef current fill:#2563eb,stroke:#1d4ed8,stroke-width:2px,color:#fff;
+  classDef neighbor fill:#f1f5f9,stroke:#cbd5e1,stroke-width:1px,color:#0f172a;
+  node_target[&quot;push_uuid_hex&quot;]:::current
+  c_0[&quot;to_edn_string&quot;]:::neighbor --&gt; node_target
+  c_1[&quot;to_json_string&quot;]:::neighbor --&gt; node_target</pre>
+          </div>
+        
+      </div>
+    
       <div class="symbol-card" id="to_edn_string">
         <div class="symbol-header">
           <span class="badge badge-fn">Function</span>
@@ -647,6 +715,16 @@
         
           <div class="symbol-desc">Formats a series of RecordBatches directly into an EDN string.</div>
         
+        
+          <div class="neighborhood-graph">
+            <h4>Call Neighborhood</h4>
+            <pre class="mermaid">graph LR
+  classDef current fill:#2563eb,stroke:#1d4ed8,stroke-width:2px,color:#fff;
+  classDef neighbor fill:#f1f5f9,stroke:#cbd5e1,stroke-width:1px,color:#0f172a;
+  node_target[&quot;to_edn_string&quot;]:::current
+  node_target --&gt; e_0[&quot;push_uuid_hex&quot;]:::neighbor
+  node_target --&gt; e_1[&quot;push_escaped_quoted&quot;]:::neighbor</pre>
+          </div>
         
       </div>
     
@@ -662,6 +740,17 @@
         
           <div class="symbol-desc">Formats a series of RecordBatches directly into a JSON string with zero intermediate structs.</div>
         
+        
+          <div class="neighborhood-graph">
+            <h4>Call Neighborhood</h4>
+            <pre class="mermaid">graph LR
+  classDef current fill:#2563eb,stroke:#1d4ed8,stroke-width:2px,color:#fff;
+  classDef neighbor fill:#f1f5f9,stroke:#cbd5e1,stroke-width:1px,color:#0f172a;
+  node_target[&quot;to_json_string&quot;]:::current
+  node_target --&gt; e_0[&quot;push_uuid_hex&quot;]:::neighbor
+  node_target --&gt; e_1[&quot;push_escaped_quoted&quot;]:::neighbor
+  node_target --&gt; e_2[&quot;out_ref&quot;]:::neighbor</pre>
+          </div>
         
       </div>
     

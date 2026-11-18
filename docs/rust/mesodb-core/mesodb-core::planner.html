@@ -635,6 +635,32 @@
   <hr />
   <section class="symbols">
     
+      <div class="symbol-card" id="QueryPlanner&lt;&#x27;a&gt;::bind_in_clause">
+        <div class="symbol-header">
+          <span class="badge badge-fn">Method</span>
+          <h3 class="symbol-name">QueryPlanner&lt;&#x27;a&gt;::bind_in_clause</h3>
+          <span class="symbol-line">Line 1</span>
+        </div>
+        
+          <pre class="symbol-sig"><code>fn bind_in_clause(&amp;self, query: &amp;Query) -&gt; Result&lt;PlanParts, MesoError&gt;</code></pre>
+        
+        
+        
+      </div>
+    
+      <div class="symbol-card" id="QueryPlanner&lt;&#x27;a&gt;::build_input_memtable">
+        <div class="symbol-header">
+          <span class="badge badge-fn">Method</span>
+          <h3 class="symbol-name">QueryPlanner&lt;&#x27;a&gt;::build_input_memtable</h3>
+          <span class="symbol-line">Line 1</span>
+        </div>
+        
+          <pre class="symbol-sig"><code>fn build_input_memtable(cols: &amp;[Vec&lt;Value&gt;]) -&gt; Result&lt;Arc&lt;DataFusionMemTable&gt;, MesoError&gt;</code></pre>
+        
+        
+        
+      </div>
+    
       <div class="symbol-card" id="QueryPlanner&lt;&#x27;a&gt;::build_logical_plan">
         <div class="symbol-header">
           <span class="badge badge-fn">Method</span>
@@ -642,7 +668,11 @@
           <span class="symbol-line">Line 1</span>
         </div>
         
-          <pre class="symbol-sig"><code>fn build_logical_plan(&amp;self, clauses: &amp;[WhereClause]) -&gt; Result&lt;PlanParts, MesoError&gt;</code></pre>
+          <pre class="symbol-sig"><code>fn build_logical_plan(
+        &amp;self,
+        clauses: &amp;[WhereClause],
+        initial_vars: PlanPartVars,
+    ) -&gt; Result&lt;PlanParts, MesoError&gt;</code></pre>
         
         
         
@@ -662,6 +692,7 @@
         format: OutputFormat,
         as_of: Option&lt;i64&gt;,
         ruleset: Option&lt;RuleSet&gt;,
+        inputs: &amp;&#x27;a [crate::db::QueryInput],
     ) -&gt; Self</code></pre>
         
         
