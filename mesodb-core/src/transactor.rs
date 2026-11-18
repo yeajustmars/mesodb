@@ -32,8 +32,17 @@ pub struct Transactor {
 impl Transactor {
     pub fn new<P: AsRef<Path>>(
         wal_path: P,
+        schema: SchemaMap,
+        config: Config,
+    ) -> Result<(Self, RecordBatch)> {
+        Self::new_with_persisted_tx(wal_path, schema, config, 0)
+    }
+
+    pub fn new_with_persisted_tx<P: AsRef<Path>>(
+        wal_path: P,
         mut schema: SchemaMap,
         config: Config,
+        max_persisted_tx_id: u64,
     ) -> Result<(Self, RecordBatch)> {
         let mut wal = Wal::open(wal_path)?;
         let mut indices = IndexManager::new();
@@ -72,8 +81,10 @@ impl Transactor {
                                 );
                             }
                         }
-                        // Push the recovered datom into RAM
-                        recovery_memtable.append(datom);
+                        // Only rebuild RAM batches for transactions not yet persisted to Parquet/indexes
+                        if datom.t > max_persisted_tx_id {
+                            recovery_memtable.append(datom);
+                        }
                     }
                 }
                 WalEntry::SchemaMutation(mutation) => match mutation {

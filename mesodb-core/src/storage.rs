@@ -25,11 +25,12 @@ impl BackgroundCompactor {
     }
 
     pub fn flush_to_parquet(&self, batch: RecordBatch, tx_id: u64) -> Result<PathBuf> {
-        let file_path = self
-            .data_dir
-            .join("parquet")
-            .join(format!("part-{:012}.parquet", tx_id));
-        let file = File::create(&file_path)?;
+        let pq_dir = self.data_dir.join("parquet");
+        let file_path = pq_dir.join(format!("part-{:012}.parquet", tx_id));
+        let tmp_path = pq_dir.join(format!("part-{:012}.parquet.tmp", tx_id));
+
+        let file = File::create(&tmp_path)?;
+        let sync_handle = file.try_clone()?;
 
         let props = WriterProperties::builder()
             .set_compression(parquet::basic::Compression::SNAPPY)
@@ -51,19 +52,24 @@ impl BackgroundCompactor {
         writer
             .close()
             .map_err(|e| MesoError::Serialization(format!("Parquet close error: {}", e)))?;
+        sync_handle.sync_all()?;
+
+        fs::rename(&tmp_path, &file_path)?;
 
         Ok(file_path)
     }
 
-    /// OPTION A BITEMPORAL COMPACTION
-    /// Merges multiple parquet files, mathematically resolves the bitemporal valid_to bounds,
-    /// and strips the op=false rows to maximize Point-in-Time read throughput.
-    pub async fn compact(&self, file_paths: &[PathBuf], output_id: u64) -> Result<PathBuf> {
+    /// Compacts `file_paths` into a single `compacted-{output_id}.parquet` file
+    /// without deleting `file_paths`, allowing callers to swap readers atomically first.
+    pub async fn compact_retaining_sources(
+        &self,
+        file_paths: &[PathBuf],
+        output_id: u64,
+    ) -> Result<PathBuf> {
         let ctx = SessionContext::new();
-        let output_path = self
-            .data_dir
-            .join("parquet")
-            .join(format!("compacted-{:012}.parquet", output_id));
+        let pq_dir = self.data_dir.join("parquet");
+        let output_path = pq_dir.join(format!("compacted-{:012}.parquet", output_id));
+        let tmp_path = pq_dir.join(format!("compacted-{:012}.parquet.tmp", output_id));
 
         let paths = file_paths
             .iter()
@@ -92,13 +98,26 @@ impl BackgroundCompactor {
         // Execute the transformation
         let compacted_df = ctx.sql(sql).await.map_err(MesoError::DataFusion)?;
 
-        // 3. Write the mathematically pure result out to a single file
+        // 3. Write the mathematically pure result out to a temporary file, then rename
         let write_options = DataFrameWriteOptions::default().with_single_file_output(true);
         compacted_df
-            .write_parquet(output_path.to_str().unwrap(), write_options, None)
+            .write_parquet(tmp_path.to_str().unwrap(), write_options, None)
             .await?;
 
-        // 4. Cleanup the old, fragmented files
+        fs::rename(&tmp_path, &output_path)?;
+
+        Ok(output_path)
+    }
+
+    /// OPTION A BITEMPORAL COMPACTION
+    /// Merges multiple parquet files, mathematically resolves the bitemporal valid_to bounds,
+    /// and strips the op=false rows to maximize Point-in-Time read throughput.
+    pub async fn compact(&self, file_paths: &[PathBuf], output_id: u64) -> Result<PathBuf> {
+        let output_path = self
+            .compact_retaining_sources(file_paths, output_id)
+            .await?;
+
+        // Cleanup the old, fragmented files
         for path in file_paths {
             let _ = fs::remove_file(path);
         }

@@ -37,34 +37,94 @@ struct FlushPayload {
     batch: RecordBatch,
 }
 
+enum WorkerCommand {
+    Flush {
+        payload: Option<FlushPayload>,
+        ack: Option<tokio::sync::oneshot::Sender<Result<()>>>,
+    },
+    Compact {
+        ack: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+    Shutdown {
+        ack: tokio::sync::oneshot::Sender<()>,
+    },
+}
+
 pub struct MesoDb {
     /// The transactor is the single writer, guarded by a Tokio Mutex.
-    transactor: Mutex<Transactor>,
+    transactor: Arc<Mutex<Transactor>>,
     /// The WorldView is an atomic pointer. Swapping it takes nanoseconds.
     world_view: Arc<RwLock<Arc<WorldView>>>,
     /// Accumulates un-flushed batches until row or byte thresholds are reached.
     pending_flush: parking_lot::Mutex<PendingFlush>,
-    /// The channel to send sealed MemTable batches to the background compactor.
-    flush_tx: mpsc::Sender<FlushPayload>,
+    /// The channel to send commands and sealed MemTable batches to the background worker.
+    flush_tx: mpsc::Sender<WorkerCommand>,
 }
 
 impl MesoDb {
+    fn scan_parquet_manifest(pq_dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, u64) {
+        let mut compacted = Vec::new();
+        let mut volatile = Vec::new();
+        let mut max_tx_id = 0u64;
+
+        if let Ok(entries) = std::fs::read_dir(pq_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(".tmp") {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                if let Some(stem) = name
+                    .strip_prefix("compacted-")
+                    .and_then(|s| s.strip_suffix(".parquet"))
+                {
+                    if let Ok(tx_id) = stem.parse::<u64>() {
+                        max_tx_id = max_tx_id.max(tx_id);
+                    }
+                    compacted.push(path);
+                } else if let Some(stem) = name
+                    .strip_prefix("part-")
+                    .and_then(|s| s.strip_suffix(".parquet"))
+                {
+                    if let Ok(tx_id) = stem.parse::<u64>() {
+                        max_tx_id = max_tx_id.max(tx_id);
+                    }
+                    volatile.push(path);
+                }
+            }
+        }
+
+        compacted.sort();
+        volatile.sort();
+        (compacted, volatile, max_tx_id)
+    }
+
     pub fn open<P: AsRef<Path>>(path: P, schema: SchemaMap, config: Config) -> Result<Self> {
         let data_dir = path.as_ref().parent().unwrap().to_path_buf();
+        let pq_dir = data_dir.join("parquet");
         create_dir_all(&data_dir)?;
-        create_dir_all(data_dir.join("parquet"))?;
+        create_dir_all(&pq_dir)?;
+
+        let (initial_compacted, initial_volatile, max_persisted_tx_id) =
+            Self::scan_parquet_manifest(&pq_dir);
 
         // Initialize Tier 1 B+Trees (Owned by the background worker)
         let now_index = NowIndex::open(data_dir.join("now.idx"))?;
         let bitmap_store = BitmapStore::open(data_dir.join("bitmaps.idx"))?;
-        let avt_index = crate::btree::AvtIndex::open(data_dir.join("avt.idx"))?; // NEW
+        let avt_index = crate::btree::AvtIndex::open(data_dir.join("avt.idx"))?;
 
         // Take initial snapshots for WorldView
         let now_snap = Arc::new(now_index.snapshot());
         let bitmap_snap = Arc::new(bitmap_store.snapshot());
-        let avt_snap = Arc::new(avt_index.snapshot()); // NEW
+        let avt_snap = Arc::new(avt_index.snapshot());
 
-        let (transactor, recovered_batch) = Transactor::new(path, schema.clone(), config.clone())?;
+        let (transactor, recovered_batch) = Transactor::new_with_persisted_tx(
+            path,
+            schema.clone(),
+            config.clone(),
+            max_persisted_tx_id,
+        )?;
 
         let mut initial_ram = Vec::new();
         let mut initial_dirty = ahash::AHashSet::new();
@@ -93,11 +153,20 @@ impl MesoDb {
             });
         }
 
+        let transactor = Arc::new(Mutex::new(transactor));
+
         let world_view = Arc::new(RwLock::new(Arc::new(WorldView {
             ram_batches: Arc::new(initial_ram),
+            compacted_files: Arc::new(initial_compacted),
+            volatile_files: Arc::new(initial_volatile),
             data_dir: data_dir.clone(),
             schema: Arc::new(schema),
-            timeline: Arc::new(transactor.timeline.clone()),
+            timeline: Arc::new(
+                transactor
+                    .try_lock()
+                    .map(|t| t.timeline.clone())
+                    .unwrap_or_default(),
+            ),
             now_index: now_snap,
             bitmap_index: bitmap_snap,
             avt_index: avt_snap,
@@ -108,22 +177,25 @@ impl MesoDb {
         let (flush_tx, flush_rx) = mpsc::channel(channel_cap);
 
         if let Some(payload) = initial_flush_payload {
-            let _ = flush_tx.try_send(payload);
+            let _ = flush_tx.try_send(WorkerCommand::Flush {
+                payload: Some(payload),
+                ack: None,
+            });
         }
 
-        // Pass mutable B-Trees to the background worker
         Self::spawn_background_worker(
             data_dir,
             flush_rx,
+            transactor.clone(),
             world_view.clone(),
-            config.clone(),
+            config,
             now_index,
             bitmap_store,
             avt_index,
         );
 
         Ok(Self {
-            transactor: Mutex::new(transactor),
+            transactor,
             world_view,
             pending_flush: parking_lot::Mutex::new(PendingFlush {
                 batches: Vec::new(),
@@ -134,9 +206,11 @@ impl MesoDb {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_background_worker(
         data_dir: PathBuf,
-        mut flush_rx: mpsc::Receiver<FlushPayload>,
+        mut flush_rx: mpsc::Receiver<WorkerCommand>,
+        transactor: Arc<Mutex<Transactor>>,
         world_view: Arc<RwLock<Arc<WorldView>>>,
         config: Config,
         mut now_index: crate::btree::NowIndex,
@@ -145,87 +219,194 @@ impl MesoDb {
     ) {
         tokio::spawn(async move {
             let compactor = BackgroundCompactor::new(data_dir);
-            let mut uncompacted_files = Vec::new();
+            let mut last_flushed_tx_id = 0u64;
+            let mut retired_files: Vec<(Arc<Vec<PathBuf>>, Vec<PathBuf>)> = Vec::new();
 
-            while let Some(FlushPayload {
-                max_tx_id,
-                evict_tx_ids,
-                batch,
-            }) = flush_rx.recv().await
-            {
-                if let Err(e) = Self::update_indexes_from_batch(
-                    &mut now_index,
-                    &mut bitmap_store,
-                    &mut avt_index,
-                    &batch,
-                ) {
-                    eprintln!(
-                        "Warning: Failed to update background indexes for Tx {}: {:?}",
-                        max_tx_id, e
-                    );
+            let reap_retired = |retired: &mut Vec<(Arc<Vec<PathBuf>>, Vec<PathBuf>)>| {
+                retired.retain(|(old_manifest, files)| {
+                    if Arc::strong_count(old_manifest) == 1 {
+                        for path in files {
+                            let _ = std::fs::remove_file(path);
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
+            };
+
+            let run_compaction = |compactor: BackgroundCompactor,
+                                  world_view: Arc<RwLock<Arc<WorldView>>>,
+                                  output_id: u64| async move {
+                let files_to_compact = {
+                    let view = world_view.read();
+                    view.volatile_files.as_ref().clone()
+                };
+
+                if files_to_compact.len() < 2 {
+                    return Ok::<Option<(Arc<Vec<PathBuf>>, Vec<PathBuf>)>, MesoError>(None);
                 }
 
-                let file_path = match compactor.flush_to_parquet(batch, max_tx_id) {
-                    Ok(path) => path,
-                    Err(e) => {
-                        eprintln!("Failed to flush Tx {} to Parquet: {:?}", max_tx_id, e);
-                        continue;
-                    }
+                let compacted_path = compactor
+                    .compact_retaining_sources(&files_to_compact, output_id)
+                    .await?;
+
+                let old_manifest = {
+                    let mut writer = world_view.write();
+                    let world_view_mut = Arc::make_mut(&mut *writer);
+                    let prev_volatile = world_view_mut.volatile_files.clone();
+
+                    let mut next_volatile = prev_volatile.as_ref().clone();
+                    next_volatile.retain(|p| !files_to_compact.contains(p));
+                    world_view_mut.volatile_files = Arc::new(next_volatile);
+
+                    let compacted_mut = Arc::make_mut(&mut world_view_mut.compacted_files);
+                    compacted_mut.push(compacted_path);
+
+                    prev_volatile
                 };
-                uncompacted_files.push(file_path);
 
-                let flush_res = now_index
-                    .flush()
-                    .and_then(|()| bitmap_store.flush())
-                    .and_then(|()| avt_index.flush());
+                Ok(Some((old_manifest, files_to_compact)))
+            };
 
-                match flush_res {
-                    Ok(()) => {
-                        let new_now_snap = Arc::new(now_index.snapshot());
-                        let new_bitmap_snap = Arc::new(bitmap_store.snapshot());
-                        let new_avt_snap = Arc::new(avt_index.snapshot());
+            while let Some(cmd) = flush_rx.recv().await {
+                reap_retired(&mut retired_files);
 
-                        let mut writer = world_view.write();
-                        let world_view_mut = Arc::make_mut(&mut *writer);
-                        let ram_vec_mut = Arc::make_mut(&mut world_view_mut.ram_batches);
+                match cmd {
+                    WorkerCommand::Flush { payload, ack } => {
+                        let Some(FlushPayload {
+                            max_tx_id,
+                            evict_tx_ids,
+                            batch,
+                        }) = payload
+                        else {
+                            if let Some(tx) = ack {
+                                let _ = tx.send(Ok(()));
+                            }
+                            continue;
+                        };
 
-                        ram_vec_mut.retain(|(id, _)| !evict_tx_ids.contains(id));
+                        let step_res: Result<()> = (|| {
+                            Self::update_indexes_from_batch(
+                                &mut now_index,
+                                &mut bitmap_store,
+                                &mut avt_index,
+                                &batch,
+                            )?;
 
-                        let mut remaining_dirty = ahash::AHashSet::new();
-                        for (_, b) in ram_vec_mut.iter() {
-                            if let Some(e_col) = b
-                                .column(0)
-                                .as_any()
-                                .downcast_ref::<arrow::array::UInt64Array>()
+                            // 1. Persist Tier-1/2/3 indexes first so Parquet presence guarantees index durability
+                            now_index.flush()?;
+                            bitmap_store.flush()?;
+                            avt_index.flush()?;
+
+                            // 2. Atomically write Parquet part file
+                            let file_path = compactor.flush_to_parquet(batch, max_tx_id)?;
+
+                            let new_now_snap = Arc::new(now_index.snapshot());
+                            let new_bitmap_snap = Arc::new(bitmap_store.snapshot());
+                            let new_avt_snap = Arc::new(avt_index.snapshot());
+
+                            // 3. Atomically swap RAM batches, Parquet manifest, and index snapshots
                             {
-                                for i in 0..b.num_rows() {
-                                    remaining_dirty.insert(e_col.value(i));
+                                let mut writer = world_view.write();
+                                let world_view_mut = Arc::make_mut(&mut *writer);
+                                let ram_vec_mut = Arc::make_mut(&mut world_view_mut.ram_batches);
+
+                                ram_vec_mut.retain(|(id, _)| !evict_tx_ids.contains(id));
+
+                                let mut remaining_dirty = ahash::AHashSet::new();
+                                for (_, b) in ram_vec_mut.iter() {
+                                    if let Some(e_col) =
+                                        b.column(0)
+                                            .as_any()
+                                            .downcast_ref::<arrow::array::UInt64Array>()
+                                    {
+                                        for i in 0..b.num_rows() {
+                                            remaining_dirty.insert(e_col.value(i));
+                                        }
+                                    }
+                                }
+
+                                let vol_mut = Arc::make_mut(&mut world_view_mut.volatile_files);
+                                vol_mut.push(file_path);
+
+                                world_view_mut.dirty_entities = Arc::new(remaining_dirty);
+                                world_view_mut.now_index = new_now_snap;
+                                world_view_mut.bitmap_index = new_bitmap_snap;
+                                world_view_mut.avt_index = new_avt_snap;
+                            }
+
+                            Ok(())
+                        })();
+
+                        if step_res.is_ok() {
+                            last_flushed_tx_id = last_flushed_tx_id.max(max_tx_id);
+
+                            // 4. Prune WAL entries already persisted to Parquet + indexes
+                            let mut tx_guard = transactor.lock().await;
+                            if let Err(e) = tx_guard.wal.checkpoint(max_tx_id) {
+                                eprintln!(
+                                    "Warning: WAL checkpoint failed at Tx {}: {:?}",
+                                    max_tx_id, e
+                                );
+                            }
+                        } else if let Err(ref e) = step_res {
+                            eprintln!(
+                                "Error flushing Tx {}; retaining RAM batches: {:?}",
+                                max_tx_id, e
+                            );
+                        }
+
+                        if let Some(tx) = ack {
+                            let _ = tx.send(step_res);
+                        }
+
+                        let volatile_count = world_view.read().volatile_files.len();
+                        if volatile_count >= config.compactor.backpressure_threshold {
+                            match run_compaction(
+                                compactor.clone(),
+                                world_view.clone(),
+                                last_flushed_tx_id,
+                            )
+                            .await
+                            {
+                                Ok(Some(retired)) => {
+                                    retired_files.push(retired);
+                                    reap_retired(&mut retired_files);
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    eprintln!(
+                                        "Background compaction failed for Tx {}: {:?}",
+                                        last_flushed_tx_id, e
+                                    );
                                 }
                             }
                         }
-                        world_view_mut.dirty_entities = Arc::new(remaining_dirty);
-                        world_view_mut.now_index = new_now_snap;
-                        world_view_mut.bitmap_index = new_bitmap_snap;
-                        world_view_mut.avt_index = new_avt_snap;
                     }
-                    Err(e) => {
-                        eprintln!(
-                            "Error flushing Tier-1 indexes for Tx {}; retaining RAM batches: {:?}",
-                            max_tx_id, e
-                        );
-                    }
-                }
-
-                if uncompacted_files.len() >= config.compactor.backpressure_threshold {
-                    let files_to_compact = std::mem::take(&mut uncompacted_files);
-                    let compactor_clone = compactor.clone();
-
-                    tokio::spawn(async move {
-                        if let Err(e) = compactor_clone.compact(&files_to_compact, max_tx_id).await
+                    WorkerCommand::Compact { ack } => {
+                        let res = match run_compaction(
+                            compactor.clone(),
+                            world_view.clone(),
+                            last_flushed_tx_id,
+                        )
+                        .await
                         {
-                            eprintln!("Background compaction failed for Tx {}: {:?}", max_tx_id, e);
-                        }
-                    });
+                            Ok(Some(retired)) => {
+                                retired_files.push(retired);
+                                reap_retired(&mut retired_files);
+                                Ok(())
+                            }
+                            Ok(None) => Ok(()),
+                            Err(e) => Err(e),
+                        };
+                        let _ = ack.send(res);
+                    }
+                    WorkerCommand::Shutdown { ack } => {
+                        reap_retired(&mut retired_files);
+                        let _ = ack.send(());
+                        break;
+                    }
                 }
             }
         });
@@ -440,7 +621,15 @@ impl MesoDb {
                 batch: coalesced,
             };
 
-            if self.flush_tx.send(payload).await.is_err() {
+            if self
+                .flush_tx
+                .send(WorkerCommand::Flush {
+                    payload: Some(payload),
+                    ack: None,
+                })
+                .await
+                .is_err()
+            {
                 eprintln!("Warning: Background flusher disconnected.");
             }
         }
@@ -1170,22 +1359,17 @@ impl MesoDb {
         let pq_options =
             datafusion::prelude::ParquetReadOptions::default().schema(arrow_schema.as_ref());
 
-        // 1. Separate Physical Isolated Streams to Preserve Predicate Pushdown
-        let mut compacted_paths = vec![];
-        let mut volatile_paths = vec![];
-        let pq_dir = view.data_dir.join("parquet");
-
-        if let Ok(entries) = std::fs::read_dir(&pq_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                let path = entry.path().to_string_lossy().to_string();
-                if name.starts_with("compacted-") && name.ends_with(".parquet") {
-                    compacted_paths.push(path);
-                } else if name.starts_with("part-") && name.ends_with(".parquet") {
-                    volatile_paths.push(path);
-                }
-            }
-        }
+        // 1. Read Physical Isolated Streams from the atomic WorldView manifest
+        let compacted_paths: Vec<String> = view
+            .compacted_files
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        let volatile_paths: Vec<String> = view
+            .volatile_files
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
 
         if !compacted_paths.is_empty() {
             let df = ctx
@@ -1433,17 +1617,93 @@ impl MesoDb {
         let batches = self.query_with_options(query_str, opts).await?;
         Ok(formatter::to_edn_string(&batches, &ast.find))
     }
+
+    fn seal_pending_flush(&self) -> Result<Option<FlushPayload>> {
+        let batches = {
+            let mut pending = self.pending_flush.lock();
+            if pending.batches.is_empty() {
+                return Ok(None);
+            }
+            pending.rows = 0;
+            pending.bytes = 0;
+            std::mem::take(&mut pending.batches)
+        };
+
+        let max_tx_id = batches.last().map_or(0, |(id, _)| *id);
+        let evict_tx_ids: Vec<u64> = batches.iter().map(|(id, _)| *id).collect();
+        let coalesced = if batches.len() == 1 {
+            batches.into_iter().next().unwrap().1
+        } else {
+            let schema = batches[0].1.schema();
+            let raw_batches: Vec<RecordBatch> = batches.into_iter().map(|(_, b)| b).collect();
+            arrow::compute::concat_batches(&schema, &raw_batches).map_err(MesoError::Arrow)?
+        };
+
+        Ok(Some(FlushPayload {
+            max_tx_id,
+            evict_tx_ids,
+            batch: coalesced,
+        }))
+    }
+
+    /// Forces all pending RAM batches to flush to disk and updates Tier-1/2/3 indexes.
+    pub async fn flush(&self) -> Result<()> {
+        let payload = self.seal_pending_flush()?;
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        self.flush_tx
+            .send(WorkerCommand::Flush {
+                payload,
+                ack: Some(ack_tx),
+            })
+            .await
+            .map_err(|_| MesoError::Serialization("Background worker disconnected".into()))?;
+
+        ack_rx
+            .await
+            .map_err(|_| MesoError::Serialization("Background flush aborted".into()))?
+    }
+
+    /// Flushes any pending RAM batches and runs Option A bitemporal compaction on volatile Parquet files.
+    pub async fn compact(&self) -> Result<()> {
+        self.flush().await?;
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        self.flush_tx
+            .send(WorkerCommand::Compact { ack: ack_tx })
+            .await
+            .map_err(|_| MesoError::Serialization("Background worker disconnected".into()))?;
+
+        ack_rx
+            .await
+            .map_err(|_| MesoError::Serialization("Background compaction aborted".into()))?
+    }
+
+    /// Flushes all pending data and cleanly terminates the background worker.
+    pub async fn shutdown(&self) -> Result<()> {
+        self.flush().await?;
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        if self
+            .flush_tx
+            .send(WorkerCommand::Shutdown { ack: ack_tx })
+            .await
+            .is_ok()
+        {
+            let _ = ack_rx.await;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
 pub struct WorldView {
     pub ram_batches: Arc<Vec<(u64, RecordBatch)>>,
+    pub compacted_files: Arc<Vec<PathBuf>>,
+    pub volatile_files: Arc<Vec<PathBuf>>,
     pub data_dir: PathBuf,
     pub schema: Arc<SchemaMap>,
     pub timeline: Arc<SchemaTimeline>,
     pub now_index: Arc<crate::btree::NowIndexSnapshot>,
     pub avt_index: Arc<crate::btree::AvtIndexSnapshot>,
-    pub bitmap_index: Arc<crate::bitmap::BitmapSnapshot>, // Swapped out AveIndex
+    pub bitmap_index: Arc<crate::bitmap::BitmapSnapshot>,
     pub dirty_entities: Arc<ahash::AHashSet<crate::types::EntityId>>,
 }
 
@@ -1470,8 +1730,6 @@ pub struct AttributeDefinition {
     pub value_type: ValueType,
     pub is_unique: bool,
 }
-
-// Ensure you retain the existing `mod tests { ... }` block entirely here!
 
 // --- TESTS ---
 #[cfg(test)]
@@ -3144,6 +3402,8 @@ mod tests {
                 avt_index: current_view.avt_index.clone(),
                 bitmap_index: current_view.bitmap_index.clone(),
                 dirty_entities: current_view.dirty_entities.clone(),
+                compacted_files: current_view.compacted_files.clone(),
+                volatile_files: current_view.volatile_files.clone(),
             });
         });
 
@@ -3336,6 +3596,8 @@ mod tests {
                 avt_index: current_view.avt_index.clone(),
                 bitmap_index: current_view.bitmap_index.clone(),
                 dirty_entities: current_view.dirty_entities.clone(),
+                compacted_files: current_view.compacted_files.clone(),
+                volatile_files: current_view.volatile_files.clone(),
             });
         });
 
@@ -4063,5 +4325,100 @@ mod tests {
             res[0].get("n"),
             Some(&Value::String("RecoveredAlice".into()))
         );
+    }
+
+    #[tokio::test]
+    async fn test_wal_checkpoint_and_idempotent_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wal_checkpoint.db");
+
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/name", ValueType::String, false);
+
+        let config = Config::default();
+        let initial_wal_len;
+
+        {
+            let db = MesoDb::open(&db_path, schema.clone(), config.clone()).unwrap();
+            for i in 1..=20 {
+                db.transact(vec![Fact {
+                    e: i,
+                    ident: ":user/name".into(),
+                    v: Value::String(format!("User_{}", i)),
+                    op: true,
+                    cas_old_v: None,
+                    valid_time: None,
+                }])
+                .await
+                .unwrap();
+            }
+
+            let pre_flush_len = std::fs::metadata(&db_path).unwrap().len();
+            assert!(pre_flush_len > 0);
+
+            // Explicit flush persists Parquet + Tier-1 indexes and checkpoints the WAL
+            db.flush().await.unwrap();
+            initial_wal_len = std::fs::metadata(&db_path).unwrap().len();
+            assert!(
+                initial_wal_len < pre_flush_len,
+                "WAL should shrink after checkpointing flushed transactions"
+            );
+
+            db.shutdown().await.unwrap();
+        }
+
+        // Reopen and verify zero duplicate rows in history or current queries
+        let reopened = MesoDb::open(&db_path, schema, config).unwrap();
+        let hist = reopened
+            .history_native(r#"[:find ?v ?op :where [10 :user/name ?v _ ?op]]"#)
+            .await
+            .unwrap();
+        assert_eq!(
+            hist.len(),
+            1,
+            "Restart must not duplicate already-persisted Parquet datoms"
+        );
+        assert_eq!(hist[0].get("v"), Some(&Value::String("User_10".into())));
+    }
+
+    #[tokio::test]
+    async fn test_explicit_compact_and_atomic_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":order/total", ValueType::Int64, false);
+
+        let mut config = Config::default();
+        config.compactor.backpressure_threshold = 100; // Prevent auto-compaction
+
+        let db = MesoDb::open(dir.path().join("explicit_compact.db"), schema, config).unwrap();
+
+        for i in 1..=3 {
+            db.transact(vec![Fact {
+                e: i,
+                ident: ":order/total".into(),
+                v: Value::Int64(i as i64 * 100),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            }])
+            .await
+            .unwrap();
+            db.flush().await.unwrap();
+        }
+
+        assert_eq!(db.world_view.read().volatile_files.len(), 3);
+        assert_eq!(db.world_view.read().compacted_files.len(), 0);
+
+        db.compact().await.unwrap();
+
+        let view = db.world_view.read().clone();
+        assert_eq!(view.volatile_files.len(), 0);
+        assert_eq!(view.compacted_files.len(), 1);
+
+        let res = db
+            .query_native(r#"[:find (sum ?t) :where [?e :order/total ?t]]"#)
+            .await
+            .unwrap();
+        assert_eq!(res[0].get("sum_t"), Some(&Value::Int64(600)));
     }
 }
