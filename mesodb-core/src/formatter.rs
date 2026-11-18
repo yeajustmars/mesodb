@@ -76,23 +76,24 @@ pub fn to_json_string(batches: &[RecordBatch], finds: &[FindSpec]) -> String {
                             out.push_str(&arr.value(row).to_string());
                         }
                         DataType::Utf8 => {
-                            // Standard strings MUST be escaped
                             let arr = column.as_any().downcast_ref::<StringArray>().unwrap();
-                            out.push('"');
-                            // Simple escape for quotes to keep it fast
-                            out.push_str(&arr.value(row).replace('"', "\\\""));
-                            out.push('"');
+                            push_escaped_quoted(out_ref(&mut out), arr.value(row), true);
                         }
                         DataType::Utf8View => {
                             let arr = column.as_any().downcast_ref::<StringViewArray>().unwrap();
-                            out.push('"');
-                            out.push_str(&arr.value(row).replace('"', "\\\""));
-                            out.push('"');
+                            push_escaped_quoted(out_ref(&mut out), arr.value(row), true);
                         }
                         DataType::LargeUtf8 => {
                             let arr = column.as_any().downcast_ref::<LargeStringArray>().unwrap();
+                            push_escaped_quoted(out_ref(&mut out), arr.value(row), true);
+                        }
+                        DataType::FixedSizeBinary(16) => {
+                            let arr = column
+                                .as_any()
+                                .downcast_ref::<FixedSizeBinaryArray>()
+                                .unwrap();
                             out.push('"');
-                            out.push_str(&arr.value(row).replace('"', "\\\""));
+                            push_uuid_hex(&mut out, arr.value(row));
                             out.push('"');
                         }
                         _ => out.push_str("null"),
@@ -104,6 +105,54 @@ pub fn to_json_string(batches: &[RecordBatch], finds: &[FindSpec]) -> String {
     }
     out.push(']');
     out
+}
+
+#[inline(always)]
+fn out_ref(s: &mut String) -> &mut String {
+    s
+}
+
+fn push_uuid_hex(out: &mut String, b: &[u8]) {
+    use std::fmt::Write;
+    let _ = write!(
+        out,
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0],
+        b[1],
+        b[2],
+        b[3],
+        b[4],
+        b[5],
+        b[6],
+        b[7],
+        b[8],
+        b[9],
+        b[10],
+        b[11],
+        b[12],
+        b[13],
+        b[14],
+        b[15]
+    );
+}
+
+fn push_escaped_quoted(out: &mut String, s: &str, json_mode: bool) {
+    use std::fmt::Write;
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if json_mode && (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('"');
 }
 
 /// Formats a series of RecordBatches directly into an EDN string.
@@ -171,20 +220,23 @@ pub fn to_edn_string(batches: &[RecordBatch], finds: &[FindSpec]) -> String {
                         }
                         DataType::Utf8 => {
                             let arr = column.as_any().downcast_ref::<StringArray>().unwrap();
-                            out.push('"');
-                            out.push_str(&arr.value(row).replace('"', "\\\""));
-                            out.push('"');
+                            push_escaped_quoted(&mut out, arr.value(row), false);
                         }
                         DataType::Utf8View => {
                             let arr = column.as_any().downcast_ref::<StringViewArray>().unwrap();
-                            out.push('"');
-                            out.push_str(&arr.value(row).replace('"', "\\\""));
-                            out.push('"');
+                            push_escaped_quoted(&mut out, arr.value(row), false);
                         }
                         DataType::LargeUtf8 => {
                             let arr = column.as_any().downcast_ref::<LargeStringArray>().unwrap();
-                            out.push('"');
-                            out.push_str(&arr.value(row).replace('"', "\\\""));
+                            push_escaped_quoted(&mut out, arr.value(row), false);
+                        }
+                        DataType::FixedSizeBinary(16) => {
+                            let arr = column
+                                .as_any()
+                                .downcast_ref::<FixedSizeBinaryArray>()
+                                .unwrap();
+                            out.push_str("#uuid \"");
+                            push_uuid_hex(&mut out, arr.value(row));
                             out.push('"');
                         }
                         _ => out.push_str("nil"),
@@ -248,6 +300,14 @@ pub fn to_native(batches: &[RecordBatch]) -> Result<Vec<HashMap<String, Value>>>
                             .downcast_ref::<TimestampMicrosecondArray>()
                             .unwrap();
                         Value::Timestamp(arr.value(row))
+                    }
+                    DataType::FixedSizeBinary(16) => {
+                        let arr = column
+                            .as_any()
+                            .downcast_ref::<FixedSizeBinaryArray>()
+                            .unwrap();
+                        let bytes: [u8; 16] = arr.value(row).try_into().unwrap();
+                        Value::Uuid(bytes)
                     }
                     _ => continue,
                 };

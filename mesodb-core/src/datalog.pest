@@ -1,6 +1,7 @@
 // mesodb-core/src/datalog.pest
 
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" | "," }
+COMMENT    = _{ ";" ~ (!"\n" ~ ANY)* }
 
 // --- Primitives ---
 ident    = @{ ASCII_ALPHA ~ (ASCII_ALPHANUMERIC | "_" | "-")* }
@@ -13,7 +14,8 @@ data_src = { "$" | "%" }
 float    = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
 integer  = @{ "-"? ~ ASCII_DIGIT+ }
 
-inner    = @{ (!"\"" ~ ANY)* }
+escape   = @{ "\\" ~ ANY }
+inner    = @{ (escape | (!("\"" | "\\") ~ ANY))* }
 string   = ${ "\"" ~ inner ~ "\"" }
 
 term = { blank | boolean | variable | keyword | string | float | integer | data_src }
