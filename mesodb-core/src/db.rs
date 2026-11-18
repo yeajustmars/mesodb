@@ -25,172 +25,402 @@ use crate::{
     types::{Result, Value},
 };
 
+struct PendingFlush {
+    batches: Vec<(u64, RecordBatch)>,
+    rows: usize,
+    bytes: usize,
+}
+
+struct FlushPayload {
+    max_tx_id: u64,
+    evict_tx_ids: Vec<u64>,
+    batch: RecordBatch,
+}
+
+enum WorkerCommand {
+    Flush {
+        payload: Option<FlushPayload>,
+        ack: Option<tokio::sync::oneshot::Sender<Result<()>>>,
+    },
+    Compact {
+        ack: tokio::sync::oneshot::Sender<Result<()>>,
+    },
+    Shutdown {
+        ack: tokio::sync::oneshot::Sender<()>,
+    },
+}
+
 pub struct MesoDb {
     /// The transactor is the single writer, guarded by a Tokio Mutex.
-    transactor: Mutex<Transactor>,
+    transactor: Arc<Mutex<Transactor>>,
     /// The WorldView is an atomic pointer. Swapping it takes nanoseconds.
     world_view: Arc<RwLock<Arc<WorldView>>>,
-    /// The channel to send newly minted memory batches to the background compactor.
-    flush_tx: mpsc::Sender<(u64, RecordBatch)>,
+    /// Accumulates un-flushed batches until row or byte thresholds are reached.
+    pending_flush: parking_lot::Mutex<PendingFlush>,
+    /// The channel to send commands and sealed MemTable batches to the background worker.
+    flush_tx: mpsc::Sender<WorkerCommand>,
 }
 
 impl MesoDb {
+    fn scan_parquet_manifest(pq_dir: &Path) -> (Vec<PathBuf>, Vec<PathBuf>, u64) {
+        let mut compacted = Vec::new();
+        let mut volatile = Vec::new();
+        let mut max_tx_id = 0u64;
+
+        if let Ok(entries) = std::fs::read_dir(pq_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(".tmp") {
+                    let _ = std::fs::remove_file(&path);
+                    continue;
+                }
+                if let Some(stem) = name
+                    .strip_prefix("compacted-")
+                    .and_then(|s| s.strip_suffix(".parquet"))
+                {
+                    if let Ok(tx_id) = stem.parse::<u64>() {
+                        max_tx_id = max_tx_id.max(tx_id);
+                    }
+                    compacted.push(path);
+                } else if let Some(stem) = name
+                    .strip_prefix("part-")
+                    .and_then(|s| s.strip_suffix(".parquet"))
+                {
+                    if let Ok(tx_id) = stem.parse::<u64>() {
+                        max_tx_id = max_tx_id.max(tx_id);
+                    }
+                    volatile.push(path);
+                }
+            }
+        }
+
+        compacted.sort();
+        volatile.sort();
+        (compacted, volatile, max_tx_id)
+    }
+
+    fn record_dirty_batch(
+        dirty_map: &mut ahash::AHashMap<
+            crate::types::AttributeId,
+            ahash::AHashSet<crate::types::EntityId>,
+        >,
+        batch: &RecordBatch,
+    ) {
+        if let (Some(e_col), Some(a_col)) = (
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>(),
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<arrow::array::UInt32Array>(),
+        ) {
+            for i in 0..batch.num_rows() {
+                dirty_map
+                    .entry(a_col.value(i))
+                    .or_default()
+                    .insert(e_col.value(i));
+            }
+        }
+    }
+
     pub fn open<P: AsRef<Path>>(path: P, schema: SchemaMap, config: Config) -> Result<Self> {
         let data_dir = path.as_ref().parent().unwrap().to_path_buf();
+        let pq_dir = data_dir.join("parquet");
         create_dir_all(&data_dir)?;
-        create_dir_all(data_dir.join("parquet"))?;
+        create_dir_all(&pq_dir)?;
+
+        let (initial_compacted, initial_volatile, max_persisted_tx_id) =
+            Self::scan_parquet_manifest(&pq_dir);
 
         // Initialize Tier 1 B+Trees (Owned by the background worker)
         let now_index = NowIndex::open(data_dir.join("now.idx"))?;
         let bitmap_store = BitmapStore::open(data_dir.join("bitmaps.idx"))?;
-        let avt_index = crate::btree::AvtIndex::open(data_dir.join("avt.idx"))?; // NEW
+        let avt_index = crate::btree::AvtIndex::open(data_dir.join("avt.idx"))?;
 
         // Take initial snapshots for WorldView
         let now_snap = Arc::new(now_index.snapshot());
         let bitmap_snap = Arc::new(bitmap_store.snapshot());
-        let avt_snap = Arc::new(avt_index.snapshot()); // NEW
+        let avt_snap = Arc::new(avt_index.snapshot());
 
-        let (transactor, recovered_batch) = Transactor::new(path, schema.clone(), config.clone())?;
+        let (transactor, recovered_batch) = Transactor::new_with_persisted_tx(
+            path,
+            schema.clone(),
+            config.clone(),
+            max_persisted_tx_id,
+        )?;
 
         let mut initial_ram = Vec::new();
-        let mut initial_dirty = ahash::AHashSet::new();
+        let mut initial_dirty = ahash::AHashMap::new();
         let empty_batch = MemTable::new(0).finish()?;
+        initial_ram.push((0, empty_batch));
 
+        let mut initial_flush_payload = None;
         if recovered_batch.num_rows() > 0 {
-            initial_ram.push((0, empty_batch.clone()));
-            initial_ram.push((transactor.current_tx_id, recovered_batch.clone()));
+            let recovery_tx_id = transactor.current_tx_id.saturating_sub(1);
+            initial_ram.push((recovery_tx_id, recovered_batch.clone()));
+            Self::record_dirty_batch(&mut initial_dirty, &recovered_batch);
 
-            if let Some(e_col) = recovered_batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::UInt64Array>()
-            {
-                for i in 0..recovered_batch.num_rows() {
-                    initial_dirty.insert(e_col.value(i));
-                }
-            }
-        } else {
-            initial_ram.push((0, empty_batch));
+            initial_flush_payload = Some(FlushPayload {
+                max_tx_id: recovery_tx_id,
+                evict_tx_ids: vec![recovery_tx_id],
+                batch: recovered_batch,
+            });
         }
+
+        let transactor = Arc::new(Mutex::new(transactor));
 
         let world_view = Arc::new(RwLock::new(Arc::new(WorldView {
             ram_batches: Arc::new(initial_ram),
+            compacted_files: Arc::new(initial_compacted),
+            volatile_files: Arc::new(initial_volatile),
             data_dir: data_dir.clone(),
             schema: Arc::new(schema),
-            timeline: Arc::new(transactor.timeline.clone()),
+            timeline: Arc::new(
+                transactor
+                    .try_lock()
+                    .map(|t| t.timeline.clone())
+                    .unwrap_or_default(),
+            ),
             now_index: now_snap,
             bitmap_index: bitmap_snap,
-            avt_index: avt_snap, // NEW
+            avt_index: avt_snap,
             dirty_entities: Arc::new(initial_dirty),
         })));
 
-        let (flush_tx, flush_rx) = mpsc::channel(config.compactor.backpressure_threshold);
+        let channel_cap = config.compactor.backpressure_threshold.max(1);
+        let (flush_tx, flush_rx) = mpsc::channel(channel_cap);
 
-        // Pass mutable B-Trees to the background worker
+        if let Some(payload) = initial_flush_payload {
+            let _ = flush_tx.try_send(WorkerCommand::Flush {
+                payload: Some(payload),
+                ack: None,
+            });
+        }
+
         Self::spawn_background_worker(
             data_dir,
             flush_rx,
+            transactor.clone(),
             world_view.clone(),
-            config.clone(),
+            config,
             now_index,
             bitmap_store,
-            avt_index, // NEW
+            avt_index,
         );
 
         Ok(Self {
-            transactor: Mutex::new(transactor),
+            transactor,
             world_view,
+            pending_flush: parking_lot::Mutex::new(PendingFlush {
+                batches: Vec::new(),
+                rows: 0,
+                bytes: 0,
+            }),
             flush_tx,
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_background_worker(
         data_dir: PathBuf,
-        mut flush_rx: mpsc::Receiver<(u64, RecordBatch)>,
+        mut flush_rx: mpsc::Receiver<WorkerCommand>,
+        transactor: Arc<Mutex<Transactor>>,
         world_view: Arc<RwLock<Arc<WorldView>>>,
         config: Config,
         mut now_index: crate::btree::NowIndex,
         mut bitmap_store: crate::bitmap::BitmapStore,
-        mut avt_index: crate::btree::AvtIndex, // NEW
+        mut avt_index: crate::btree::AvtIndex,
     ) {
         tokio::spawn(async move {
             let compactor = BackgroundCompactor::new(data_dir);
-            let mut uncompacted_files = Vec::new();
-            let mut evict_queue = Vec::with_capacity(20);
-            const EVICT_THRESHOLD: usize = 20;
+            let mut last_flushed_tx_id = 0u64;
+            let mut retired_files: Vec<(Arc<Vec<PathBuf>>, Vec<PathBuf>)> = Vec::new();
 
-            while let Some((tx_id, batch)) = flush_rx.recv().await {
-                if let Err(e) = Self::update_indexes_from_batch(
-                    &mut now_index,
-                    &mut bitmap_store,
-                    &mut avt_index,
-                    &batch,
-                ) {
-                    eprintln!(
-                        "Warning: Failed to update background indexes for Tx {}: {:?}",
-                        tx_id, e
-                    );
+            let reap_retired = |retired: &mut Vec<(Arc<Vec<PathBuf>>, Vec<PathBuf>)>| {
+                retired.retain(|(old_manifest, files)| {
+                    if Arc::strong_count(old_manifest) == 1 {
+                        for path in files {
+                            let _ = std::fs::remove_file(path);
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
+            };
+
+            let run_compaction = |compactor: BackgroundCompactor,
+                                  world_view: Arc<RwLock<Arc<WorldView>>>,
+                                  output_id: u64| async move {
+                let (files_to_compact, many_attr_ids) = {
+                    let view = world_view.read();
+                    (
+                        view.volatile_files.as_ref().clone(),
+                        view.schema.many_attribute_ids(),
+                    )
+                };
+
+                if files_to_compact.len() < 2 {
+                    return Ok::<Option<(Arc<Vec<PathBuf>>, Vec<PathBuf>)>, MesoError>(None);
                 }
 
-                let file_path = match compactor.flush_to_parquet(batch, tx_id) {
-                    Ok(path) => path,
-                    Err(e) => {
-                        eprintln!("Failed to flush Tx {} to Parquet: {:?}", tx_id, e);
-                        continue;
-                    }
+                let compacted_path = compactor
+                    .compact_retaining_sources(&files_to_compact, output_id, &many_attr_ids)
+                    .await?;
+
+                let old_manifest = {
+                    let mut writer = world_view.write();
+                    let world_view_mut = Arc::make_mut(&mut *writer);
+                    let prev_volatile = world_view_mut.volatile_files.clone();
+
+                    let mut next_volatile = prev_volatile.as_ref().clone();
+                    next_volatile.retain(|p| !files_to_compact.contains(p));
+                    world_view_mut.volatile_files = Arc::new(next_volatile);
+
+                    let compacted_mut = Arc::make_mut(&mut world_view_mut.compacted_files);
+                    compacted_mut.push(compacted_path);
+
+                    prev_volatile
                 };
-                uncompacted_files.push(file_path);
-                evict_queue.push(tx_id);
 
-                let trigger_compaction =
-                    uncompacted_files.len() >= config.compactor.backpressure_threshold;
-                let trigger_eviction = evict_queue.len() >= EVICT_THRESHOLD;
+                Ok(Some((old_manifest, files_to_compact)))
+            };
 
-                if trigger_eviction || trigger_compaction {
-                    let _ = now_index.flush();
-                    let _ = bitmap_store.flush();
-                    let _ = avt_index.flush(); // NEW
+            while let Some(cmd) = flush_rx.recv().await {
+                reap_retired(&mut retired_files);
 
-                    let new_now_snap = Arc::new(now_index.snapshot());
-                    let new_bitmap_snap = Arc::new(bitmap_store.snapshot());
-                    let new_avt_snap = Arc::new(avt_index.snapshot()); // NEW
+                match cmd {
+                    WorkerCommand::Flush { payload, ack } => {
+                        let Some(FlushPayload {
+                            max_tx_id,
+                            evict_tx_ids,
+                            batch,
+                        }) = payload
+                        else {
+                            if let Some(tx) = ack {
+                                let _ = tx.send(Ok(()));
+                            }
+                            continue;
+                        };
 
-                    {
-                        let mut writer = world_view.write();
-                        let world_view_mut = Arc::make_mut(&mut *writer);
-                        let ram_vec_mut = Arc::make_mut(&mut world_view_mut.ram_batches);
+                        let schema_snap = world_view.read().schema.clone();
+                        let step_res: Result<()> = (|| {
+                            Self::update_indexes_from_batch(
+                                &mut now_index,
+                                &mut bitmap_store,
+                                &mut avt_index,
+                                &schema_snap,
+                                &batch,
+                            )?;
 
-                        ram_vec_mut.retain(|(id, _)| !evict_queue.contains(id));
+                            // 1. Persist Tier-1/2/3 indexes first so Parquet presence guarantees index durability
+                            now_index.flush()?;
+                            bitmap_store.flush()?;
+                            avt_index.flush()?;
 
-                        let mut remaining_dirty = ahash::AHashSet::new();
-                        for (_, b) in ram_vec_mut.iter() {
-                            if let Some(e_col) = b
-                                .column(0)
-                                .as_any()
-                                .downcast_ref::<arrow::array::UInt64Array>()
+                            // 2. Atomically write Parquet part file
+                            let file_path = compactor.flush_to_parquet(batch, max_tx_id)?;
+
+                            let new_now_snap = Arc::new(now_index.snapshot());
+                            let new_bitmap_snap = Arc::new(bitmap_store.snapshot());
+                            let new_avt_snap = Arc::new(avt_index.snapshot());
+
+                            // 3. Atomically swap RAM batches, Parquet manifest, and index snapshots
                             {
-                                for i in 0..b.num_rows() {
-                                    remaining_dirty.insert(e_col.value(i));
+                                let mut writer = world_view.write();
+                                let world_view_mut = Arc::make_mut(&mut *writer);
+                                let ram_vec_mut = Arc::make_mut(&mut world_view_mut.ram_batches);
+
+                                ram_vec_mut.retain(|(id, _)| !evict_tx_ids.contains(id));
+
+                                let mut remaining_dirty = ahash::AHashMap::new();
+                                for (_, b) in ram_vec_mut.iter() {
+                                    Self::record_dirty_batch(&mut remaining_dirty, b);
+                                }
+
+                                let vol_mut = Arc::make_mut(&mut world_view_mut.volatile_files);
+                                vol_mut.push(file_path);
+
+                                world_view_mut.dirty_entities = Arc::new(remaining_dirty);
+                                world_view_mut.now_index = new_now_snap;
+                                world_view_mut.bitmap_index = new_bitmap_snap;
+                                world_view_mut.avt_index = new_avt_snap;
+                            }
+
+                            Ok(())
+                        })();
+
+                        if step_res.is_ok() {
+                            last_flushed_tx_id = last_flushed_tx_id.max(max_tx_id);
+
+                            // 4. Prune WAL entries already persisted to Parquet + indexes
+                            let mut tx_guard = transactor.lock().await;
+                            if let Err(e) = tx_guard.wal.checkpoint(max_tx_id) {
+                                eprintln!(
+                                    "Warning: WAL checkpoint failed at Tx {}: {:?}",
+                                    max_tx_id, e
+                                );
+                            }
+                        } else if let Err(ref e) = step_res {
+                            eprintln!(
+                                "Error flushing Tx {}; retaining RAM batches: {:?}",
+                                max_tx_id, e
+                            );
+                        }
+
+                        if let Some(tx) = ack {
+                            let _ = tx.send(step_res);
+                        }
+
+                        let volatile_count = world_view.read().volatile_files.len();
+                        if volatile_count >= config.compactor.backpressure_threshold {
+                            match run_compaction(
+                                compactor.clone(),
+                                world_view.clone(),
+                                last_flushed_tx_id,
+                            )
+                            .await
+                            {
+                                Ok(Some(retired)) => {
+                                    retired_files.push(retired);
+                                    reap_retired(&mut retired_files);
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    eprintln!(
+                                        "Background compaction failed for Tx {}: {:?}",
+                                        last_flushed_tx_id, e
+                                    );
                                 }
                             }
                         }
-                        world_view_mut.dirty_entities = Arc::new(remaining_dirty);
-                        world_view_mut.now_index = new_now_snap;
-                        world_view_mut.bitmap_index = new_bitmap_snap;
-                        world_view_mut.avt_index = new_avt_snap; // NEW
                     }
-                    evict_queue.clear();
-                }
-
-                if trigger_compaction {
-                    let files_to_compact = std::mem::take(&mut uncompacted_files);
-                    let compactor_clone = compactor.clone();
-
-                    tokio::spawn(async move {
-                        if let Err(e) = compactor_clone.compact(&files_to_compact, tx_id).await {
-                            eprintln!("Background compaction failed for Tx {}: {:?}", tx_id, e);
-                        }
-                    });
+                    WorkerCommand::Compact { ack } => {
+                        let res = match run_compaction(
+                            compactor.clone(),
+                            world_view.clone(),
+                            last_flushed_tx_id,
+                        )
+                        .await
+                        {
+                            Ok(Some(retired)) => {
+                                retired_files.push(retired);
+                                reap_retired(&mut retired_files);
+                                Ok(())
+                            }
+                            Ok(None) => Ok(()),
+                            Err(e) => Err(e),
+                        };
+                        let _ = ack.send(res);
+                    }
+                    WorkerCommand::Shutdown { ack } => {
+                        reap_retired(&mut retired_files);
+                        let _ = ack.send(());
+                        break;
+                    }
                 }
             }
         });
@@ -199,7 +429,8 @@ impl MesoDb {
     fn update_indexes_from_batch(
         now_index: &mut crate::btree::NowIndex,
         bitmap_store: &mut crate::bitmap::BitmapStore,
-        avt_index: &mut crate::btree::AvtIndex, // NEW
+        avt_index: &mut crate::btree::AvtIndex,
+        schema: &SchemaMap,
         batch: &RecordBatch,
     ) -> Result<()> {
         let e_col = batch
@@ -242,6 +473,11 @@ impl MesoDb {
             .as_any()
             .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
             .ok_or_else(|| MesoError::Serialization("Missing v_time".into()))?;
+        let v_uuid = batch
+            .column(8)
+            .as_any()
+            .downcast_ref::<arrow::array::FixedSizeBinaryArray>()
+            .ok_or_else(|| MesoError::Serialization("Missing v_uuid".into()))?;
         let op_col = batch
             .column(10)
             .as_any()
@@ -265,18 +501,32 @@ impl MesoDb {
                 Value::Ref(v_ref.value(i))
             } else if v_time.is_valid(i) {
                 Value::Timestamp(v_time.value(i))
+            } else if v_uuid.is_valid(i) {
+                let bytes: [u8; 16] = v_uuid
+                    .value(i)
+                    .try_into()
+                    .map_err(|_| MesoError::Serialization("Invalid 16-byte UUID".into()))?;
+                Value::Uuid(bytes)
             } else {
                 continue;
             };
 
+            let is_many = schema
+                .get_by_id(a)
+                .is_some_and(|attr| attr.cardinality == crate::schema::Cardinality::Many);
+
             if op {
-                let _ = now_index.put(e, a, &val);
+                if !is_many {
+                    let _ = now_index.put(e, a, &val);
+                }
                 let _ = bitmap_store.put(a, &val, e, true);
-                let _ = avt_index.put(a, &val, e, true); // NEW
+                let _ = avt_index.put(a, &val, e, true);
             } else {
-                let _ = now_index.delete(e, a);
+                if !is_many {
+                    let _ = now_index.delete(e, a);
+                }
                 let _ = bitmap_store.put(a, &val, e, false);
-                let _ = avt_index.put(a, &val, e, false); // NEW
+                let _ = avt_index.put(a, &val, e, false);
             }
         }
         Ok(())
@@ -304,7 +554,12 @@ impl MesoDb {
             let mut added_attrs = Vec::with_capacity(attributes.len());
 
             for attr in attributes {
-                let added = tx.transact_schema(&attr.ident, attr.value_type, attr.is_unique)?;
+                let added = tx.transact_schema_with_cardinality(
+                    &attr.ident,
+                    attr.value_type,
+                    attr.is_unique,
+                    attr.cardinality,
+                )?;
                 added_attrs.push(added);
             }
 
@@ -318,7 +573,6 @@ impl MesoDb {
             (added_attrs, tx.take_sync_rx())
         };
 
-        // Await the physical disk sync entirely outside the Transactor lock!
         if let Some(rx) = sync_rx {
             let _ = rx.await;
         }
@@ -328,44 +582,50 @@ impl MesoDb {
 
     /// DRY helper that handles the lock, the transaction, and the lock-free WorldView pointer swap.
     async fn execute(&self, facts: Vec<Fact>, custom_now: Option<i64>) -> Result<TxReport> {
-        let (report, sync_rx, trigger_flush) = {
+        let (report, sync_rx, sealed_batches) = {
             let mut tx = self.transactor.lock().await;
             let report = match custom_now {
                 Some(t) => tx.transact_at(facts, t)?,
                 None => tx.transact(facts)?,
             };
 
+            let mut sealed_batches = None;
+
             if report.datoms_written > 0 {
                 let batch_clone = report.batch.clone();
                 let new_schema = Arc::new(tx.schema.clone());
                 let new_timeline = Arc::new(tx.timeline.clone());
 
-                let mut writer = self.world_view.write();
-
-                let world_view_mut = Arc::make_mut(&mut *writer);
-                world_view_mut.schema = new_schema;
-                world_view_mut.timeline = new_timeline;
-
-                let ram_vec_mut = Arc::make_mut(&mut world_view_mut.ram_batches);
-                ram_vec_mut.push((report.tx_id, batch_clone.clone()));
-
-                // Insert dirty entities into WorldView
-                let dirty_mut = Arc::make_mut(&mut world_view_mut.dirty_entities);
-                if let Some(e_col) = batch_clone
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<arrow::array::UInt64Array>()
                 {
-                    for i in 0..batch_clone.num_rows() {
-                        dirty_mut.insert(e_col.value(i));
-                    }
+                    let mut writer = self.world_view.write();
+
+                    let world_view_mut = Arc::make_mut(&mut *writer);
+                    world_view_mut.schema = new_schema;
+                    world_view_mut.timeline = new_timeline;
+
+                    let ram_vec_mut = Arc::make_mut(&mut world_view_mut.ram_batches);
+                    ram_vec_mut.push((report.tx_id, batch_clone.clone()));
+
+                    // Insert dirty (entity, attribute) pairs into WorldView
+                    let dirty_mut = Arc::make_mut(&mut world_view_mut.dirty_entities);
+                    Self::record_dirty_batch(dirty_mut, &batch_clone);
+                }
+
+                let mut pending = self.pending_flush.lock();
+                pending.rows += batch_clone.num_rows();
+                pending.bytes += batch_clone.get_array_memory_size();
+                pending.batches.push((report.tx_id, batch_clone));
+
+                if pending.rows >= tx.config.storage.memtable_max_rows
+                    || pending.bytes >= tx.config.storage.memtable_max_bytes
+                {
+                    pending.rows = 0;
+                    pending.bytes = 0;
+                    sealed_batches = Some(std::mem::take(&mut pending.batches));
                 }
             }
 
-            let trigger_flush = report.datoms_written > 0
-                && report.batch.num_rows() >= tx.config.storage.memtable_max_rows;
-
-            (report, tx.take_sync_rx(), trigger_flush)
+            (report, tx.take_sync_rx(), sealed_batches)
         };
 
         // 1. Await the physical disk sync outside the Transactor lock
@@ -373,15 +633,35 @@ impl MesoDb {
             let _ = rx.await;
         }
 
-        // 2. Dispatch to the background compactor outside the lock
-        if trigger_flush
-            && self
+        // 2. Coalesce and dispatch sealed batches outside the lock
+        if let Some(batches) = sealed_batches {
+            let max_tx_id = batches.last().map_or(report.tx_id, |(id, _)| *id);
+            let evict_tx_ids: Vec<u64> = batches.iter().map(|(id, _)| *id).collect();
+            let coalesced = if batches.len() == 1 {
+                batches.into_iter().next().unwrap().1
+            } else {
+                let schema = batches[0].1.schema();
+                let raw_batches: Vec<RecordBatch> = batches.into_iter().map(|(_, b)| b).collect();
+                arrow::compute::concat_batches(&schema, &raw_batches).map_err(MesoError::Arrow)?
+            };
+
+            let payload = FlushPayload {
+                max_tx_id,
+                evict_tx_ids,
+                batch: coalesced,
+            };
+
+            if self
                 .flush_tx
-                .send((report.tx_id, report.batch.clone()))
+                .send(WorkerCommand::Flush {
+                    payload: Some(payload),
+                    ack: None,
+                })
                 .await
                 .is_err()
-        {
-            eprintln!("Warning: Background flusher disconnected.");
+            {
+                eprintln!("Warning: Background flusher disconnected.");
+            }
         }
 
         Ok(report)
@@ -400,9 +680,20 @@ impl MesoDb {
         view: &WorldView,
     ) -> Result<Option<Vec<RecordBatch>>> {
         // Must be a "Now" query
-        if options.history || options.as_of.is_some() || options.rules.is_some() {
+        if options.history
+            || options.as_of.is_some()
+            || options.rules.is_some()
+            || ast.in_vars.is_some()
+            || !options.inputs.is_empty()
+        {
             return Ok(None);
         }
+
+        let is_card_many = |a_id: crate::types::AttributeId| {
+            view.schema
+                .get_by_id(a_id)
+                .is_some_and(|attr| attr.cardinality == crate::schema::Cardinality::Many)
+        };
 
         // --- PATTERN 1 & 2: Single or Multi-Attribute EAV Point Lookup ---
         // Match [:find ?v1 ... :where [101 :attr1 ?v1] [101 :attr2 ?v2]]
@@ -461,11 +752,6 @@ impl MesoDb {
                 None => return Ok(None),
             };
 
-            // Fast O(1) dirty check!
-            if view.dirty_entities.contains(&e_id) {
-                return Ok(None); // Let DataFusion resolve pending RAM state
-            }
-
             // Direct B+Tree lookup
             let now_index = &view.now_index;
             let mut fields = Vec::new();
@@ -483,6 +769,10 @@ impl MesoDb {
                         Some(id) => id,
                         None => return Ok(Some(vec![])), // Attribute doesn't exist
                     };
+
+                    if is_card_many(a_id) || view.is_entity_attr_dirty(e_id, a_id) {
+                        return Ok(None); // Let DataFusion resolve Cardinality::Many or pending RAM state
+                    }
 
                     let clean_var = find_var.replace("?", "");
                     if let Some(val) = now_index.get(e_id, a_id)? {
@@ -526,7 +816,7 @@ impl MesoDb {
             if let Some(val) = literal_val
                 && let Some(a_id) = view.schema.get_id(a_ident)
             {
-                if !view.dirty_entities.is_empty() {
+                if view.is_attr_dirty(a_id) {
                     return Ok(None);
                 }
 
@@ -558,13 +848,28 @@ impl MesoDb {
         // Match [:find (pull 101 [:user/name :user/age]) :where ...]
         if ast.find.len() == 1
             && ast.where_clauses.len() == 1
+            && options.format != OutputFormat::Tabular
             && let crate::ast::FindSpec::Pull(var, pattern) = &ast.find[0]
-            && let crate::ast::WhereClause::DataPattern { e, .. } = &ast.where_clauses[0]
+            && pattern
+                .0
+                .iter()
+                .all(|attr| matches!(attr, crate::ast::PullAttribute::Simple(_)))
+            && let crate::ast::WhereClause::DataPattern {
+                e,
+                tx: None,
+                op: None,
+                ..
+            } = &ast.where_clauses[0]
             && let crate::ast::Term::Integer(e_id) = e
         {
             let entity_id = *e_id as u64;
-            if view.dirty_entities.contains(&entity_id) {
-                return Ok(None);
+            for pull_attr in &pattern.0 {
+                if let crate::ast::PullAttribute::Simple(a_ident) = pull_attr
+                    && let Some(a_id) = view.schema.get_id(a_ident)
+                    && (is_card_many(a_id) || view.is_entity_attr_dirty(entity_id, a_id))
+                {
+                    return Ok(None);
+                }
             }
 
             let now_index = &view.now_index;
@@ -668,7 +973,9 @@ impl MesoDb {
                 if let Some(val) = literal_val
                     && let Some(a_id1) = view.schema.get_id(a_kw1)
                     && let Some(a_id2) = view.schema.get_id(a_kw2)
-                    && view.dirty_entities.is_empty()
+                    && !is_card_many(a_id2)
+                    && !view.is_attr_dirty(a_id1)
+                    && !view.is_attr_dirty(a_id2)
                     && let Some(treemap) = view.bitmap_index.get(a_id1, &val)?
                 {
                     let mut results = Vec::new();
@@ -766,8 +1073,9 @@ impl MesoDb {
 
                 if is_valid
                     && bounds_applied
-                    && view.dirty_entities.is_empty()
                     && let Some(a_id) = view.schema.get_id(a_ident)
+                    && !view.is_attr_dirty(a_id)
+                    && (find_var == e_var || !is_card_many(a_id))
                 {
                     let kvs = view.now_index.range_scan(e_min, e_max, a_id)?;
                     if kvs.is_empty() {
@@ -848,62 +1156,125 @@ impl MesoDb {
                 let mut v_min = 0u64;
                 let mut v_max = u64::MAX;
                 let mut bounds_applied = false;
+                let mut has_numeric_bound = false;
+                let mut str_bounds: Vec<(&str, &str)> = Vec::new();
 
                 for (fn_name, args) in funcs {
                     if args.len() == 2
                         && let crate::ast::Term::Variable(arg_var) = &args[0]
                         && arg_var == v_var
                     {
-                        let enc_val = match &args[1] {
-                            crate::ast::Term::Integer(i) => Some(crate::page::encode_i64(*i)),
-                            crate::ast::Term::Float(f) => Some(crate::page::encode_f64(*f)),
-                            _ => None,
-                        };
-
-                        if let Some(lim) = enc_val {
-                            match fn_name.as_str() {
-                                ">" => v_min = v_min.max(lim.saturating_add(1)),
-                                ">=" => v_min = v_min.max(lim),
-                                "<" => v_max = v_max.min(lim.saturating_sub(1)),
-                                "<=" => v_max = v_max.min(lim),
-                                _ => is_valid = false,
+                        match &args[1] {
+                            crate::ast::Term::Integer(i) => {
+                                let lim = crate::page::encode_i64(*i);
+                                match fn_name.as_str() {
+                                    ">" => v_min = v_min.max(lim.saturating_add(1)),
+                                    ">=" => v_min = v_min.max(lim),
+                                    "<" => v_max = v_max.min(lim.saturating_sub(1)),
+                                    "<=" => v_max = v_max.min(lim),
+                                    _ => is_valid = false,
+                                }
+                                has_numeric_bound = true;
+                                bounds_applied = true;
                             }
-                            bounds_applied = true;
-                        } else {
-                            is_valid = false;
+                            crate::ast::Term::Float(f) => {
+                                let lim = crate::page::encode_f64(*f);
+                                match fn_name.as_str() {
+                                    ">" => v_min = v_min.max(lim.saturating_add(1)),
+                                    ">=" => v_min = v_min.max(lim),
+                                    "<" => v_max = v_max.min(lim.saturating_sub(1)),
+                                    "<=" => v_max = v_max.min(lim),
+                                    _ => is_valid = false,
+                                }
+                                has_numeric_bound = true;
+                                bounds_applied = true;
+                            }
+                            crate::ast::Term::String(s) => {
+                                let lim = crate::page::encode_bytes_prefix(s.as_bytes());
+                                match fn_name.as_str() {
+                                    ">" | ">=" => v_min = v_min.max(lim),
+                                    "<" | "<=" => v_max = v_max.min(lim),
+                                    _ => is_valid = false,
+                                }
+                                str_bounds.push((fn_name.as_str(), s.as_str()));
+                                bounds_applied = true;
+                            }
+                            _ => is_valid = false,
                         }
                     } else {
                         is_valid = false;
                     }
                 }
 
+                if has_numeric_bound && !str_bounds.is_empty() {
+                    is_valid = false;
+                }
+
                 if is_valid
                     && bounds_applied
-                    && view.dirty_entities.is_empty()
                     && let Some(a_id) = view.schema.get_id(a_ident)
+                    && !view.is_attr_dirty(a_id)
+                    && (find_var == e_var || !is_card_many(a_id))
                 {
-                    // Execute the scan against the 24-byte B-Tree keys!
-                    let e_ids = view.avt_index.range_scan(a_id, v_min, v_max)?;
-                    if e_ids.is_empty() {
+                    let candidate_ids = view.avt_index.range_scan(a_id, v_min, v_max)?;
+                    if candidate_ids.is_empty() {
                         return Ok(Some(vec![]));
                     }
 
                     let clean_var = find_var.replace("?", "");
 
-                    let (field, array) = if find_var == e_var {
+                    let (field, array) = if !str_bounds.is_empty() {
+                        let mut matched_e = Vec::new();
+                        let mut matched_v = Vec::new();
+
+                        for e_id in candidate_ids {
+                            if let Some(Value::String(val_str)) = view.now_index.get(e_id, a_id)? {
+                                let passes = str_bounds.iter().all(|(op, bound)| match *op {
+                                    ">" => val_str.as_str() > *bound,
+                                    ">=" => val_str.as_str() >= *bound,
+                                    "<" => val_str.as_str() < *bound,
+                                    "<=" => val_str.as_str() <= *bound,
+                                    _ => false,
+                                });
+                                if passes {
+                                    matched_e.push(e_id);
+                                    if find_var != e_var {
+                                        matched_v.push(Value::String(val_str));
+                                    }
+                                }
+                            }
+                        }
+
+                        if matched_e.is_empty() {
+                            return Ok(Some(vec![]));
+                        }
+
+                        if find_var == e_var {
+                            (
+                                arrow::datatypes::Field::new(
+                                    &clean_var,
+                                    arrow::datatypes::DataType::UInt64,
+                                    true,
+                                ),
+                                Arc::new(arrow::array::UInt64Array::from(matched_e))
+                                    as Arc<dyn arrow::array::Array>,
+                            )
+                        } else {
+                            Self::vals_to_arrow_column(&clean_var, &matched_v)
+                        }
+                    } else if find_var == e_var {
                         (
                             arrow::datatypes::Field::new(
                                 &clean_var,
                                 arrow::datatypes::DataType::UInt64,
                                 true,
                             ),
-                            Arc::new(arrow::array::UInt64Array::from(e_ids))
+                            Arc::new(arrow::array::UInt64Array::from(candidate_ids))
                                 as Arc<dyn arrow::array::Array>,
                         )
                     } else {
-                        // If they asked for the value instead of the entity, fetch it via O(1) point lookups
-                        let mut v_vec = Vec::with_capacity(e_ids.len());
-                        for e_id in e_ids {
+                        let mut v_vec = Vec::with_capacity(candidate_ids.len());
+                        for e_id in candidate_ids {
                             if let Some(val) = view.now_index.get(e_id, a_id)? {
                                 v_vec.push(val);
                             }
@@ -1109,22 +1480,17 @@ impl MesoDb {
         let pq_options =
             datafusion::prelude::ParquetReadOptions::default().schema(arrow_schema.as_ref());
 
-        // 1. Separate Physical Isolated Streams to Preserve Predicate Pushdown
-        let mut compacted_paths = vec![];
-        let mut volatile_paths = vec![];
-        let pq_dir = view.data_dir.join("parquet");
-
-        if let Ok(entries) = std::fs::read_dir(&pq_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                let path = entry.path().to_string_lossy().to_string();
-                if name.starts_with("compacted-") && name.ends_with(".parquet") {
-                    compacted_paths.push(path);
-                } else if name.starts_with("part-") && name.ends_with(".parquet") {
-                    volatile_paths.push(path);
-                }
-            }
-        }
+        // 1. Read Physical Isolated Streams from the atomic WorldView manifest
+        let compacted_paths: Vec<String> = view
+            .compacted_files
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        let volatile_paths: Vec<String> = view
+            .volatile_files
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
 
         if !compacted_paths.is_empty() {
             let df = ctx
@@ -1216,35 +1582,102 @@ impl MesoDb {
                 ),
             };
 
-            format!(
-                r#"
-                WITH
-                volatile_filtered AS (
-                    SELECT * FROM volatile_datoms {vol_filter}
-                ),
-                volatile_bounds AS (
-                    SELECT *, LEAD(valid_from) OVER (PARTITION BY e, a ORDER BY valid_from ASC, t ASC, op ASC) as next_from
-                    FROM volatile_filtered
-                ),
-                active_volatile AS (
-                    SELECT e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid, t, op, valid_from, next_from, COALESCE(next_from, valid_to) as valid_to
-                    FROM volatile_bounds
-                    WHERE op = true {active_vol_filter}
-                ),
-                volatile_mask AS (
-                    SELECT DISTINCT e, a FROM volatile_filtered
-                ),
-                surviving_compacted AS (
-                    SELECT c.e, c.a, c.v_bool, c.v_int, c.v_float, c.v_str, c.v_ref, c.v_time, c.v_uuid, c.t, c.op, c.valid_from, (CASE WHEN false THEN c.valid_from ELSE NULL END) as next_from, c.valid_to
-                    FROM compacted_datoms c
-                    WHERE c.op = true {comp_filter}
-                      AND NOT EXISTS (SELECT 1 FROM volatile_mask m WHERE m.e = c.e AND m.a = c.a)
+            let many_attr_ids = view.schema.many_attribute_ids();
+            if many_attr_ids.is_empty() {
+                format!(
+                    r#"
+                    WITH
+                    volatile_filtered AS (
+                        SELECT * FROM volatile_datoms {vol_filter}
+                    ),
+                    volatile_bounds AS (
+                        SELECT *, LEAD(valid_from) OVER (PARTITION BY e, a ORDER BY valid_from ASC, t ASC, op ASC) as next_from
+                        FROM volatile_filtered
+                    ),
+                    active_volatile AS (
+                        SELECT e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid, t, op, valid_from, next_from, COALESCE(next_from, valid_to) as valid_to
+                        FROM volatile_bounds
+                        WHERE op = true {active_vol_filter}
+                    ),
+                    volatile_mask AS (
+                        SELECT DISTINCT e, a FROM volatile_filtered
+                    ),
+                    surviving_compacted AS (
+                        SELECT c.e, c.a, c.v_bool, c.v_int, c.v_float, c.v_str, c.v_ref, c.v_time, c.v_uuid, c.t, c.op, c.valid_from, (CASE WHEN false THEN c.valid_from ELSE NULL END) as next_from, c.valid_to
+                        FROM compacted_datoms c
+                        WHERE c.op = true {comp_filter}
+                          AND NOT EXISTS (SELECT 1 FROM volatile_mask m WHERE m.e = c.e AND m.a = c.a)
+                    )
+                    SELECT * FROM surviving_compacted
+                    UNION ALL
+                    SELECT * FROM active_volatile
+                    "#
                 )
-                SELECT * FROM surviving_compacted
-                UNION ALL
-                SELECT * FROM active_volatile
-                "#
-            )
+            } else {
+                let in_list = many_attr_ids
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    r#"
+                    WITH
+                    volatile_filtered AS (
+                        SELECT * FROM volatile_datoms {vol_filter}
+                    ),
+                    volatile_bounds AS (
+                        SELECT *,
+                            CASE WHEN a IN ({in_list}) THEN
+                                LEAD(valid_from) OVER (
+                                    PARTITION BY e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid
+                                    ORDER BY valid_from ASC, t ASC, op ASC
+                                )
+                            ELSE
+                                LEAD(valid_from) OVER (
+                                    PARTITION BY e, a
+                                    ORDER BY valid_from ASC, t ASC, op ASC
+                                )
+                            END as next_from
+                        FROM volatile_filtered
+                    ),
+                    active_volatile AS (
+                        SELECT e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid, t, op, valid_from, next_from, COALESCE(next_from, valid_to) as valid_to
+                        FROM volatile_bounds
+                        WHERE op = true {active_vol_filter}
+                    ),
+                    volatile_mask_one AS (
+                        SELECT DISTINCT e, a FROM volatile_filtered WHERE a NOT IN ({in_list})
+                    ),
+                    volatile_mask_many AS (
+                        SELECT DISTINCT e, a, v_bool, v_int, v_float, v_str, v_ref, v_time, v_uuid
+                        FROM volatile_filtered WHERE a IN ({in_list})
+                    ),
+                    surviving_compacted AS (
+                        SELECT c.e, c.a, c.v_bool, c.v_int, c.v_float, c.v_str, c.v_ref, c.v_time, c.v_uuid, c.t, c.op, c.valid_from, (CASE WHEN false THEN c.valid_from ELSE NULL END) as next_from, c.valid_to
+                        FROM compacted_datoms c
+                        WHERE c.op = true {comp_filter}
+                          AND (
+                              (c.a NOT IN ({in_list}) AND NOT EXISTS (SELECT 1 FROM volatile_mask_one m WHERE m.e = c.e AND m.a = c.a))
+                              OR
+                              (c.a IN ({in_list}) AND NOT EXISTS (
+                                  SELECT 1 FROM volatile_mask_many m
+                                  WHERE m.e = c.e AND m.a = c.a
+                                    AND (m.v_bool = c.v_bool OR (m.v_bool IS NULL AND c.v_bool IS NULL))
+                                    AND (m.v_int = c.v_int OR (m.v_int IS NULL AND c.v_int IS NULL))
+                                    AND (m.v_float = c.v_float OR (m.v_float IS NULL AND c.v_float IS NULL))
+                                    AND (m.v_str = c.v_str OR (m.v_str IS NULL AND c.v_str IS NULL))
+                                    AND (m.v_ref = c.v_ref OR (m.v_ref IS NULL AND c.v_ref IS NULL))
+                                    AND (m.v_time = c.v_time OR (m.v_time IS NULL AND c.v_time IS NULL))
+                                    AND (m.v_uuid = c.v_uuid OR (m.v_uuid IS NULL AND c.v_uuid IS NULL))
+                              ))
+                          )
+                    )
+                    SELECT * FROM surviving_compacted
+                    UNION ALL
+                    SELECT * FROM active_volatile
+                    "#
+                )
+            }
         };
 
         let resolved_df = ctx
@@ -1260,6 +1693,7 @@ impl MesoDb {
             options.format.clone(),
             options.as_of,
             ruleset,
+            &options.inputs,
         );
 
         let final_df = planner.plan(&ast).await?;
@@ -1372,18 +1806,115 @@ impl MesoDb {
         let batches = self.query_with_options(query_str, opts).await?;
         Ok(formatter::to_edn_string(&batches, &ast.find))
     }
+
+    fn seal_pending_flush(&self) -> Result<Option<FlushPayload>> {
+        let batches = {
+            let mut pending = self.pending_flush.lock();
+            if pending.batches.is_empty() {
+                return Ok(None);
+            }
+            pending.rows = 0;
+            pending.bytes = 0;
+            std::mem::take(&mut pending.batches)
+        };
+
+        let max_tx_id = batches.last().map_or(0, |(id, _)| *id);
+        let evict_tx_ids: Vec<u64> = batches.iter().map(|(id, _)| *id).collect();
+        let coalesced = if batches.len() == 1 {
+            batches.into_iter().next().unwrap().1
+        } else {
+            let schema = batches[0].1.schema();
+            let raw_batches: Vec<RecordBatch> = batches.into_iter().map(|(_, b)| b).collect();
+            arrow::compute::concat_batches(&schema, &raw_batches).map_err(MesoError::Arrow)?
+        };
+
+        Ok(Some(FlushPayload {
+            max_tx_id,
+            evict_tx_ids,
+            batch: coalesced,
+        }))
+    }
+
+    /// Forces all pending RAM batches to flush to disk and updates Tier-1/2/3 indexes.
+    pub async fn flush(&self) -> Result<()> {
+        let payload = self.seal_pending_flush()?;
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        self.flush_tx
+            .send(WorkerCommand::Flush {
+                payload,
+                ack: Some(ack_tx),
+            })
+            .await
+            .map_err(|_| MesoError::Serialization("Background worker disconnected".into()))?;
+
+        ack_rx
+            .await
+            .map_err(|_| MesoError::Serialization("Background flush aborted".into()))?
+    }
+
+    /// Flushes any pending RAM batches and runs Option A bitemporal compaction on volatile Parquet files.
+    pub async fn compact(&self) -> Result<()> {
+        self.flush().await?;
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        self.flush_tx
+            .send(WorkerCommand::Compact { ack: ack_tx })
+            .await
+            .map_err(|_| MesoError::Serialization("Background worker disconnected".into()))?;
+
+        ack_rx
+            .await
+            .map_err(|_| MesoError::Serialization("Background compaction aborted".into()))?
+    }
+
+    /// Flushes all pending data and cleanly terminates the background worker.
+    pub async fn shutdown(&self) -> Result<()> {
+        self.flush().await?;
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        if self
+            .flush_tx
+            .send(WorkerCommand::Shutdown { ack: ack_tx })
+            .await
+            .is_ok()
+        {
+            let _ = ack_rx.await;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
 pub struct WorldView {
     pub ram_batches: Arc<Vec<(u64, RecordBatch)>>,
+    pub compacted_files: Arc<Vec<PathBuf>>,
+    pub volatile_files: Arc<Vec<PathBuf>>,
     pub data_dir: PathBuf,
     pub schema: Arc<SchemaMap>,
     pub timeline: Arc<SchemaTimeline>,
     pub now_index: Arc<crate::btree::NowIndexSnapshot>,
     pub avt_index: Arc<crate::btree::AvtIndexSnapshot>,
-    pub bitmap_index: Arc<crate::bitmap::BitmapSnapshot>, // Swapped out AveIndex
-    pub dirty_entities: Arc<ahash::AHashSet<crate::types::EntityId>>,
+    pub bitmap_index: Arc<crate::bitmap::BitmapSnapshot>,
+    pub dirty_entities:
+        Arc<ahash::AHashMap<crate::types::AttributeId, ahash::AHashSet<crate::types::EntityId>>>,
+}
+
+impl WorldView {
+    #[inline(always)]
+    pub fn is_entity_attr_dirty(
+        &self,
+        e: crate::types::EntityId,
+        a: crate::types::AttributeId,
+    ) -> bool {
+        self.dirty_entities
+            .get(&a)
+            .is_some_and(|entities| entities.contains(&e))
+    }
+
+    #[inline(always)]
+    pub fn is_attr_dirty(&self, a: crate::types::AttributeId) -> bool {
+        self.dirty_entities
+            .get(&a)
+            .is_some_and(|entities| !entities.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -1395,12 +1926,21 @@ pub enum OutputFormat {
     Json,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryInput {
+    Scalar(Value),
+    Collection(Vec<Value>),
+    Tuple(Vec<Value>),
+    Relation(Vec<Vec<Value>>),
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct QueryOptions {
     pub as_of: Option<i64>,
     pub format: OutputFormat,
     pub rules: Option<String>,
     pub history: bool,
+    pub inputs: Vec<QueryInput>,
 }
 
 #[derive(Debug, Clone)]
@@ -1408,9 +1948,8 @@ pub struct AttributeDefinition {
     pub ident: String,
     pub value_type: ValueType,
     pub is_unique: bool,
+    pub cardinality: crate::schema::Cardinality,
 }
-
-// Ensure you retain the existing `mod tests { ... }` block entirely here!
 
 // --- TESTS ---
 #[cfg(test)]
@@ -1649,6 +2188,7 @@ mod tests {
             format: OutputFormat::Tabular,
             rules: None,
             history: false,
+            inputs: Vec::new(),
         };
         let res_150 = db.query_with_options(query, opts_150).await.unwrap();
         let col_150 = res_150[0]
@@ -1723,6 +2263,7 @@ mod tests {
             as_of: None,
             rules: None,
             history: false,
+            inputs: Vec::new(),
         };
         let res_json = db.query_with_options(query, opts_json).await.unwrap();
         let json_str = res_json[0]
@@ -1742,6 +2283,7 @@ mod tests {
             as_of: None,
             rules: None,
             history: false,
+            inputs: Vec::new(),
         };
         let res_edn = db.query_with_options(query, opts_edn).await.unwrap();
         let edn_str = res_edn[0]
@@ -2170,11 +2712,13 @@ mod tests {
                 ident: ":product/sku".into(),
                 value_type: ValueType::String,
                 is_unique: true,
+                cardinality: crate::schema::Cardinality::One,
             },
             AttributeDefinition {
                 ident: ":product/price".into(),
                 value_type: ValueType::Float64,
                 is_unique: false,
+                cardinality: crate::schema::Cardinality::One,
             },
         ];
 
@@ -3083,6 +3627,8 @@ mod tests {
                 avt_index: current_view.avt_index.clone(),
                 bitmap_index: current_view.bitmap_index.clone(),
                 dirty_entities: current_view.dirty_entities.clone(),
+                compacted_files: current_view.compacted_files.clone(),
+                volatile_files: current_view.volatile_files.clone(),
             });
         });
 
@@ -3275,6 +3821,8 @@ mod tests {
                 avt_index: current_view.avt_index.clone(),
                 bitmap_index: current_view.bitmap_index.clone(),
                 dirty_entities: current_view.dirty_entities.clone(),
+                compacted_files: current_view.compacted_files.clone(),
+                volatile_files: current_view.volatile_files.clone(),
             });
         });
 
@@ -3284,6 +3832,7 @@ mod tests {
             ident: ":new/racing_attr".into(),
             value_type: ValueType::String,
             is_unique: false,
+            cardinality: crate::schema::Cardinality::One,
         };
         db.transact_schema(vec![attr_def]).await.unwrap();
 
@@ -3865,5 +4414,811 @@ mod tests {
         e_ids.sort();
         // Since price = e * 10, target entities are 2, 3, and 4
         assert_eq!(e_ids, vec![2, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn test_cumulative_memtable_row_threshold_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":item/val", ValueType::Int64, false);
+
+        let mut config = Config::default();
+        config.storage.memtable_max_rows = 3;
+        config.compactor.backpressure_threshold = 10;
+
+        let db = MesoDb::open(dir.path().join("cum_rows.db"), schema, config).unwrap();
+
+        // Three 1-row transactions: individually below threshold (3), cumulatively hit 3
+        for i in 1..=3 {
+            db.transact(vec![Fact {
+                e: i,
+                ident: ":item/val".into(),
+                v: Value::Int64(i as i64 * 10),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            }])
+            .await
+            .unwrap();
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let view = db.world_view.read().clone();
+        assert_eq!(
+            view.ram_batches.len(),
+            1,
+            "All 3 cumulative batches should be evicted from RAM once threshold is reached"
+        );
+        assert!(
+            view.dirty_entities.is_empty(),
+            "Dirty entities should clear after cumulative flush"
+        );
+
+        let res = db
+            .query_native(r#"[:find ?v :where [2 :item/val ?v]]"#)
+            .await
+            .unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].get("v"), Some(&Value::Int64(20)));
+    }
+
+    #[tokio::test]
+    async fn test_cumulative_memtable_byte_threshold_flush() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":doc/body", ValueType::String, false);
+
+        let mut config = Config::default();
+        config.storage.memtable_max_rows = 100_000;
+        config.storage.memtable_max_bytes = 2048; // 2 KB byte cap
+        config.compactor.backpressure_threshold = 10;
+
+        let db = MesoDb::open(dir.path().join("cum_bytes.db"), schema, config).unwrap();
+
+        let large_payload = "x".repeat(1500);
+        for i in 1..=2 {
+            db.transact(vec![Fact {
+                e: i,
+                ident: ":doc/body".into(),
+                v: Value::String(large_payload.clone()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            }])
+            .await
+            .unwrap();
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let view = db.world_view.read().clone();
+        assert_eq!(
+            view.ram_batches.len(),
+            1,
+            "Byte threshold should trigger flush and RAM eviction even when row count is low"
+        );
+        assert!(view.dirty_entities.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_startup_wal_recovery_populates_tier1_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wal_idx_recovery.db");
+
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/name", ValueType::String, false);
+
+        // Keep memtable large so data stays only in the WAL before drop
+        let mut config = Config::default();
+        config.storage.memtable_max_rows = 50_000;
+
+        {
+            let db = MesoDb::open(&db_path, schema.clone(), config.clone()).unwrap();
+            db.transact(vec![Fact {
+                e: 55,
+                ident: ":user/name".into(),
+                v: Value::String("RecoveredAlice".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            }])
+            .await
+            .unwrap();
+        }
+
+        // Reopen and allow background worker to index the WAL-recovered batch
+        let recovered_db = MesoDb::open(&db_path, schema, config).unwrap();
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+        let view = recovered_db.world_view.read().clone();
+        assert!(
+            view.dirty_entities.is_empty(),
+            "Recovered batch should be indexed and evicted from dirty_entities"
+        );
+        assert_eq!(
+            view.now_index.get(55, 100).unwrap(),
+            Some(Value::String("RecoveredAlice".into())),
+            "NowIndex must be populated from WAL recovery"
+        );
+
+        let res = recovered_db
+            .query_native(r#"[:find ?n :where [55 :user/name ?n]]"#)
+            .await
+            .unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(
+            res[0].get("n"),
+            Some(&Value::String("RecoveredAlice".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wal_checkpoint_and_idempotent_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wal_checkpoint.db");
+
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/name", ValueType::String, false);
+
+        let config = Config::default();
+        let initial_wal_len;
+
+        {
+            let db = MesoDb::open(&db_path, schema.clone(), config.clone()).unwrap();
+            for i in 1..=20 {
+                db.transact(vec![Fact {
+                    e: i,
+                    ident: ":user/name".into(),
+                    v: Value::String(format!("User_{}", i)),
+                    op: true,
+                    cas_old_v: None,
+                    valid_time: None,
+                }])
+                .await
+                .unwrap();
+            }
+
+            let pre_flush_len = std::fs::metadata(&db_path).unwrap().len();
+            assert!(pre_flush_len > 0);
+
+            // Explicit flush persists Parquet + Tier-1 indexes and checkpoints the WAL
+            db.flush().await.unwrap();
+            initial_wal_len = std::fs::metadata(&db_path).unwrap().len();
+            assert!(
+                initial_wal_len < pre_flush_len,
+                "WAL should shrink after checkpointing flushed transactions"
+            );
+
+            db.shutdown().await.unwrap();
+        }
+
+        // Reopen and verify zero duplicate rows in history or current queries
+        let reopened = MesoDb::open(&db_path, schema, config).unwrap();
+        let hist = reopened
+            .history_native(r#"[:find ?v ?op :where [10 :user/name ?v _ ?op]]"#)
+            .await
+            .unwrap();
+        assert_eq!(
+            hist.len(),
+            1,
+            "Restart must not duplicate already-persisted Parquet datoms"
+        );
+        assert_eq!(hist[0].get("v"), Some(&Value::String("User_10".into())));
+    }
+
+    #[tokio::test]
+    async fn test_explicit_compact_and_atomic_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":order/total", ValueType::Int64, false);
+
+        let mut config = Config::default();
+        config.compactor.backpressure_threshold = 100; // Prevent auto-compaction
+
+        let db = MesoDb::open(dir.path().join("explicit_compact.db"), schema, config).unwrap();
+
+        for i in 1..=3 {
+            db.transact(vec![Fact {
+                e: i,
+                ident: ":order/total".into(),
+                v: Value::Int64(i as i64 * 100),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            }])
+            .await
+            .unwrap();
+            db.flush().await.unwrap();
+        }
+
+        assert_eq!(db.world_view.read().volatile_files.len(), 3);
+        assert_eq!(db.world_view.read().compacted_files.len(), 0);
+
+        db.compact().await.unwrap();
+
+        let view = db.world_view.read().clone();
+        assert_eq!(view.volatile_files.len(), 0);
+        assert_eq!(view.compacted_files.len(), 1);
+
+        let res = db
+            .query_native(r#"[:find (sum ?t) :where [?e :order/total ?t]]"#)
+            .await
+            .unwrap();
+        assert_eq!(res[0].get("sum_t"), Some(&Value::Int64(600)));
+    }
+
+    #[tokio::test]
+    async fn test_attribute_scoped_dirty_tracking_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/name", ValueType::String, false);
+        schema.add_attribute(":user/status", ValueType::String, false);
+
+        // Large threshold so subsequent writes stay in RAM
+        let mut config = Config::default();
+        config.storage.memtable_max_rows = 100_000;
+
+        let db = MesoDb::open(dir.path().join("scoped_dirty.db"), schema, config).unwrap();
+
+        db.transact(vec![
+            Fact {
+                e: 1,
+                ident: ":user/name".into(),
+                v: Value::String("Alice".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 1,
+                ident: ":user/status".into(),
+                v: Value::String("active".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+        ])
+        .await
+        .unwrap();
+
+        // Flush initial batch to Tier-1/2 indexes
+        db.flush().await.unwrap();
+        assert!(db.world_view.read().dirty_entities.is_empty());
+
+        // Mutate ONLY :user/status in RAM without flushing
+        db.transact(vec![Fact {
+            e: 1,
+            ident: ":user/status".into(),
+            v: Value::String("paused".into()),
+            op: true,
+            cas_old_v: None,
+            valid_time: None,
+        }])
+        .await
+        .unwrap();
+
+        let view = db.world_view.read().clone();
+        let name_attr = view.schema.get_id(":user/name").unwrap();
+        let status_attr = view.schema.get_id(":user/status").unwrap();
+
+        // :user/name must remain completely clean for fast-path queries
+        assert!(!view.is_attr_dirty(name_attr));
+        assert!(!view.is_entity_attr_dirty(1, name_attr));
+        assert!(view.is_attr_dirty(status_attr));
+        assert!(view.is_entity_attr_dirty(1, status_attr));
+
+        let fast_name = db
+            .try_fast_path(
+                &parser::parse_query(r#"[:find ?n :where [1 :user/name ?n]]"#).unwrap(),
+                &QueryOptions::default(),
+                &view,
+            )
+            .unwrap();
+        assert!(
+            fast_name.is_some(),
+            "Fast path for :user/name must remain active when only :user/status is dirty"
+        );
+
+        let dirty_status = db
+            .try_fast_path(
+                &parser::parse_query(r#"[:find ?s :where [1 :user/status ?s]]"#).unwrap(),
+                &QueryOptions::default(),
+                &view,
+            )
+            .unwrap();
+        assert!(
+            dirty_status.is_none(),
+            "Fast path for dirty :user/status must fall back to DataFusion"
+        );
+
+        let resolved = db
+            .query_native(r#"[:find ?s :where [1 :user/status ?s]]"#)
+            .await
+            .unwrap();
+        assert_eq!(resolved[0].get("s"), Some(&Value::String("paused".into())));
+    }
+
+    #[tokio::test]
+    async fn test_fast_path_string_range_scan_and_uuid_indexing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":item/code", ValueType::String, false);
+        schema.add_attribute(":item/uuid", ValueType::Uuid, false);
+
+        let db =
+            MesoDb::open(dir.path().join("fp_str_uuid.db"), schema, Config::default()).unwrap();
+
+        let u_target = [0xAB; 16];
+        db.transact(vec![
+            // Long strings sharing an identical 8-byte prefix ("product_")
+            Fact {
+                e: 1,
+                ident: ":item/code".into(),
+                v: Value::String("product_100".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 2,
+                ident: ":item/code".into(),
+                v: Value::String("product_200".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 3,
+                ident: ":item/code".into(),
+                v: Value::String("product_300".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 2,
+                ident: ":item/uuid".into(),
+                v: Value::Uuid(u_target),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+        ])
+        .await
+        .unwrap();
+
+        db.flush().await.unwrap();
+
+        // Verify strict > and < on strings sharing an 8-byte prefix via try_fast_path
+        let view = db.world_view.read().clone();
+        let ast = parser::parse_query(
+            r#"[:find ?e :where [?e :item/code ?c] [(> ?c "product_100")] [(< ?c "product_300")]]"#,
+        )
+        .unwrap();
+        let fast_res = db
+            .try_fast_path(&ast, &QueryOptions::default(), &view)
+            .unwrap()
+            .expect("String range scan must hit fast path");
+        assert_eq!(fast_res[0].num_rows(), 1);
+        let e_col = fast_res[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt64Array>()
+            .unwrap();
+        assert_eq!(e_col.value(0), 2);
+
+        // Verify UUID was indexed into NowIndex and BitmapStore
+        let uuid_attr = view.schema.get_id(":item/uuid").unwrap();
+        assert_eq!(
+            view.now_index.get(2, uuid_attr).unwrap(),
+            Some(Value::Uuid(u_target))
+        );
+        let bm = view
+            .bitmap_index
+            .get(uuid_attr, &Value::Uuid(u_target))
+            .unwrap()
+            .unwrap();
+        assert!(bm.contains(2));
+    }
+
+    #[tokio::test]
+    async fn test_sql_single_quote_escaping_and_polymorphic_attr_var() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/name", ValueType::String, false);
+        schema.add_attribute(":user/age", ValueType::Int64, false);
+
+        let db = MesoDb::open(dir.path().join("quote_poly.db"), schema, Config::default()).unwrap();
+
+        db.transact(vec![
+            Fact {
+                e: 1,
+                ident: ":user/name".into(),
+                v: Value::String("O'Reilly".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 1,
+                ident: ":user/age".into(),
+                v: Value::Int64(42),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+        ])
+        .await
+        .unwrap();
+
+        // String literal containing single quote must not break SQL planning
+        let res_quote = db
+            .query_native(r#"[:find ?e :where [?e :user/name "O'Reilly"]]"#)
+            .await
+            .unwrap();
+        assert_eq!(res_quote.len(), 1);
+        assert_eq!(res_quote[0].get("e"), Some(&Value::Ref(1)));
+
+        // Unbound attribute variable [1 ?a ?v] must resolve both String and Int64 values
+        let res_poly = db
+            .query_native(r#"[:find ?a ?v :where [1 ?a ?v]]"#)
+            .await
+            .unwrap();
+        assert_eq!(res_poly.len(), 2);
+        let vals: Vec<Value> = res_poly
+            .iter()
+            .filter_map(|row| row.get("v").cloned())
+            .collect();
+        assert!(vals.contains(&Value::String("O'Reilly".into())));
+        assert!(vals.contains(&Value::String("42".into())));
+    }
+
+    #[tokio::test]
+    async fn test_or_join_not_join_and_constant_pull_wildcard_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/name", ValueType::String, false);
+        schema.add_attribute(":user/role", ValueType::String, false);
+        schema.add_attribute(":user/suspended", ValueType::Boolean, false);
+
+        let db = MesoDb::open(dir.path().join("joins_pull.db"), schema, Config::default()).unwrap();
+
+        db.transact(vec![
+            Fact {
+                e: 1,
+                ident: ":user/name".into(),
+                v: Value::String("Alice".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 1,
+                ident: ":user/role".into(),
+                v: Value::String("admin".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 2,
+                ident: ":user/name".into(),
+                v: Value::String("Bob".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 2,
+                ident: ":user/role".into(),
+                v: Value::String("staff".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 2,
+                ident: ":user/suspended".into(),
+                v: Value::Boolean(true),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+        ])
+        .await
+        .unwrap();
+
+        db.flush().await.unwrap();
+
+        // or-join projects only [?e] across branches with differing internal variables
+        let or_res = db
+            .query_native(
+                r#"[:find ?e
+                    :where (or-join [?e]
+                             [?e :user/role "admin"]
+                             [?e :user/suspended true])]"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(or_res.len(), 2);
+
+        // not-join correlates strictly on [?e], ignoring ?any_val
+        let not_res = db
+            .query_native(
+                r#"[:find ?e
+                    :where [?e :user/name ?any_val]
+                           (not-join [?e] [?e :user/suspended ?any_val])]"#,
+            )
+            .await
+            .unwrap();
+        assert_eq!(not_res.len(), 1);
+        assert_eq!(not_res[0].get("e"), Some(&Value::Ref(1)));
+
+        // Pull with wildcard [*] must fall back to PullEngine and populate all attributes
+        let json = db
+            .query_json(r#"[:find (pull ?e [*]) :where [?e :user/name _] [(= ?e 1)]]"#)
+            .await
+            .unwrap();
+        assert!(json.contains(r#""user/name":"Alice""#));
+        assert!(json.contains(r#""user/role":"admin""#));
+    }
+
+    #[tokio::test]
+    async fn test_parameterized_in_bindings_scalar_collection_tuple_relation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/name", ValueType::String, false);
+        schema.add_attribute(":user/dept", ValueType::String, false);
+        schema.add_attribute(":user/level", ValueType::Int64, false);
+
+        let db =
+            MesoDb::open(dir.path().join("in_bindings.db"), schema, Config::default()).unwrap();
+
+        db.transact(vec![
+            Fact {
+                e: 1,
+                ident: ":user/name".into(),
+                v: Value::String("Alice".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 1,
+                ident: ":user/dept".into(),
+                v: Value::String("eng".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 1,
+                ident: ":user/level".into(),
+                v: Value::Int64(5),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 2,
+                ident: ":user/name".into(),
+                v: Value::String("Bob".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 2,
+                ident: ":user/dept".into(),
+                v: Value::String("ops".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 2,
+                ident: ":user/level".into(),
+                v: Value::Int64(4),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 3,
+                ident: ":user/name".into(),
+                v: Value::String("Carol".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 3,
+                ident: ":user/dept".into(),
+                v: Value::String("eng".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 3,
+                ident: ":user/level".into(),
+                v: Value::Int64(3),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+        ])
+        .await
+        .unwrap();
+
+        // 1. Scalar :in binding
+        let scalar_res = db
+            .query_native_with_options(
+                r#"[:find ?name :in $ ?target_dept :where [?e :user/dept ?target_dept] [?e :user/name ?name]]"#,
+                QueryOptions {
+                    inputs: vec![QueryInput::Scalar(Value::String("ops".into()))],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(scalar_res.len(), 1);
+        assert_eq!(
+            scalar_res[0].get("name"),
+            Some(&Value::String("Bob".into()))
+        );
+
+        // 2. Collection :in [?e ...] binding
+        let coll_res = db
+            .query_native_with_options(
+                r#"[:find ?name :in $ [?e ...] :where [?e :user/name ?name]]"#,
+                QueryOptions {
+                    inputs: vec![QueryInput::Collection(vec![
+                        Value::Int64(1),
+                        Value::Int64(3),
+                    ])],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(coll_res.len(), 2);
+
+        // 3. Tuple :in [?dept ?lvl] binding
+        let tuple_res = db
+            .query_native_with_options(
+                r#"[:find ?name :in $ [?dept ?lvl] :where [?e :user/dept ?dept] [?e :user/level ?lvl] [?e :user/name ?name]]"#,
+                QueryOptions {
+                    inputs: vec![QueryInput::Tuple(vec![
+                        Value::String("eng".into()),
+                        Value::Int64(5),
+                    ])],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(tuple_res.len(), 1);
+        assert_eq!(
+            tuple_res[0].get("name"),
+            Some(&Value::String("Alice".into()))
+        );
+
+        // 4. Relation :in [[?dept ?lvl]] binding
+        let rel_res = db
+            .query_native_with_options(
+                r#"[:find ?name :in $ [[?dept ?lvl]] :where [?e :user/dept ?dept] [?e :user/level ?lvl] [?e :user/name ?name]]"#,
+                QueryOptions {
+                    inputs: vec![QueryInput::Relation(vec![
+                        vec![Value::String("ops".into()), Value::Int64(4)],
+                        vec![Value::String("eng".into()), Value::Int64(3)],
+                    ])],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(rel_res.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cardinality_many_accumulation_retraction_and_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut schema = SchemaMap::new();
+        schema.add_attribute(":user/name", ValueType::String, false);
+        schema.add_attribute_with_cardinality(
+            ":user/tag",
+            ValueType::String,
+            false,
+            crate::schema::Cardinality::Many,
+        );
+
+        let db = MesoDb::open(dir.path().join("card_many.db"), schema, Config::default()).unwrap();
+
+        // Assert multiple tags on the same entity without overwriting prior values
+        db.transact(vec![
+            Fact {
+                e: 1,
+                ident: ":user/name".into(),
+                v: Value::String("Alice".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 1,
+                ident: ":user/tag".into(),
+                v: Value::String("rust".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 1,
+                ident: ":user/tag".into(),
+                v: Value::String("datalog".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+        ])
+        .await
+        .unwrap();
+
+        db.flush().await.unwrap();
+
+        // Add a third tag and retract one specific tag ("rust")
+        db.transact(vec![
+            Fact {
+                e: 1,
+                ident: ":user/tag".into(),
+                v: Value::String("systems".into()),
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            },
+            Fact {
+                e: 1,
+                ident: ":user/tag".into(),
+                v: Value::String("rust".into()),
+                op: false,
+                cas_old_v: None,
+                valid_time: None,
+            },
+        ])
+        .await
+        .unwrap();
+
+        let tags_res = db
+            .query_native(r#"[:find ?tag :where [1 :user/tag ?tag]]"#)
+            .await
+            .unwrap();
+        let mut tags: Vec<String> = tags_res
+            .iter()
+            .filter_map(|row| match row.get("tag") {
+                Some(Value::String(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        tags.sort();
+        assert_eq!(tags, vec!["datalog".to_string(), "systems".to_string()]);
+
+        // Verify Pull renders Cardinality::Many as an array
+        let pull_json = db
+            .query_json(
+                r#"[:find (pull ?e [:user/name :user/tag]) :where [?e :user/name "Alice"]]"#,
+            )
+            .await
+            .unwrap();
+        assert!(pull_json.contains("\"user/tag\":["));
+
+        // Verify Option A compaction preserves all surviving multi-valued members
+        db.compact().await.unwrap();
+        let post_compact = db
+            .query_native(r#"[:find ?tag :where [1 :user/tag ?tag]]"#)
+            .await
+            .unwrap();
+        assert_eq!(post_compact.len(), 2);
     }
 }

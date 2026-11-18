@@ -67,6 +67,21 @@ pub struct OverflowPage {
 unsafe impl bytemuck::Zeroable for OverflowPage {}
 unsafe impl bytemuck::Pod for OverflowPage {}
 
+pub const METAPAGE_INLINE_FREE_CAP: usize = 1020;
+pub const FREELIST_PAGE_CAP: usize = 1022;
+
+#[repr(C, align(64))]
+#[derive(Copy, Clone)]
+pub struct FreeListPage {
+    pub next_page_id: u32,
+    pub count: u32,
+    pub pages: [u32; FREELIST_PAGE_CAP], // 4 + 4 + 4088 = 4096 bytes
+}
+
+// Manually implement bytemuck traits to bypass array length limits in the derive macro
+unsafe impl bytemuck::Zeroable for FreeListPage {}
+unsafe impl bytemuck::Pod for FreeListPage {}
+
 // --- AVT INDEX (Attribute -> Value -> Entity) ---
 
 pub const AV_NUM_CELLS: usize = 101;
@@ -141,6 +156,16 @@ pub fn decode_f64(v: u64) -> f64 {
     f64::from_bits(bits)
 }
 
+/// Packs up to the first 8 bytes in big-endian order so lexicographical byte order
+/// maps monotonically to `u64` sort order.
+#[inline(always)]
+pub fn encode_bytes_prefix(bytes: &[u8]) -> u64 {
+    let mut buf = [0u8; 8];
+    let len = bytes.len().min(8);
+    buf[..len].copy_from_slice(&bytes[..len]);
+    u64::from_be_bytes(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,6 +184,12 @@ mod tests {
             std::mem::size_of::<AvNodePage>(),
             PAGE_SIZE,
             "AvNodePage must exactly match the 4KB OS Page size"
+        );
+
+        assert_eq!(
+            std::mem::size_of::<FreeListPage>(),
+            PAGE_SIZE,
+            "FreeListPage must exactly match the 4KB OS Page size"
         );
     }
 

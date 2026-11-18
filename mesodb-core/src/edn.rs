@@ -1,6 +1,5 @@
-// mesodb-core/src/edn.rs
-
 use chrono::DateTime;
+use std::borrow::Cow;
 use std::iter::Peekable;
 use std::str::Chars;
 
@@ -11,14 +10,84 @@ use crate::types::{Result, Value};
 #[derive(Debug, PartialEq)]
 enum RawToken<'a> {
     Keyword(&'a str),
-    String(&'a str),
+    String(Cow<'a, str>),
     Int(i64),
     Float(f64),
-    Boolean(bool), // NEW
+    Boolean(bool),
+    Nil,
     Inst(i64),
+    Uuid([u8; 16]),
     Symbol(&'a str),
     LeftBracket,
     RightBracket,
+    LeftBrace,
+    RightBrace,
+    HashBrace,
+}
+
+fn is_delimiter(c: char) -> bool {
+    c.is_whitespace() || matches!(c, ',' | ';' | '[' | ']' | '{' | '}' | '(' | ')' | '"')
+}
+
+fn unescape_edn_str(raw: &str) -> Result<Cow<'_, str>> {
+    if !raw.contains('\\') {
+        return Ok(Cow::Borrowed(raw));
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some(other) => {
+                    return Err(MesoError::Serialization(format!(
+                        "Unsupported escape sequence '\\{other}' in EDN string"
+                    )));
+                }
+                None => {
+                    return Err(MesoError::Serialization(
+                        "Unterminated escape sequence in EDN string".into(),
+                    ));
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Ok(Cow::Owned(out))
+}
+
+fn parse_uuid_bytes(s: &str) -> Result<[u8; 16]> {
+    let bytes = s.as_bytes();
+    if bytes.len() != 36
+        || bytes[8] != b'-'
+        || bytes[13] != b'-'
+        || bytes[18] != b'-'
+        || bytes[23] != b'-'
+    {
+        return Err(MesoError::Serialization(format!(
+            "Invalid #uuid format: {s}"
+        )));
+    }
+    let mut out = [0u8; 16];
+    let mut out_idx = 0;
+    let mut i = 0;
+    while i < 36 {
+        if bytes[i] == b'-' {
+            i += 1;
+            continue;
+        }
+        let hex_pair = &s[i..i + 2];
+        out[out_idx] = u8::from_str_radix(hex_pair, 16)
+            .map_err(|_| MesoError::Serialization(format!("Invalid #uuid hex: {s}")))?;
+        out_idx += 1;
+        i += 2;
+    }
+    Ok(out)
 }
 
 struct EdnLexer<'a> {
@@ -53,10 +122,33 @@ impl<'a> EdnLexer<'a> {
         while let Some(&c) = self.peek_char() {
             if c.is_whitespace() || c == ',' {
                 self.next_char();
+            } else if c == ';' {
+                while let Some(ch) = self.next_char() {
+                    if ch == '\n' {
+                        break;
+                    }
+                }
             } else {
                 break;
             }
         }
+    }
+
+    fn read_quoted_raw(&mut self, unterminated_msg: &str) -> Result<&'a str> {
+        self.next_char(); // Consume opening quote
+        let start = self.byte_idx;
+        let mut escaping = false;
+        while let Some(c) = self.next_char() {
+            if escaping {
+                escaping = false;
+            } else if c == '\\' {
+                escaping = true;
+            } else if c == '"' {
+                let end = self.byte_idx - 1;
+                return Ok(&self.input[start..end]);
+            }
+        }
+        Err(MesoError::Serialization(unterminated_msg.into()))
     }
 
     fn next_token(&mut self) -> Result<Option<RawToken<'a>>> {
@@ -76,64 +168,66 @@ impl<'a> EdnLexer<'a> {
                 self.next_char();
                 Ok(Some(RawToken::RightBracket))
             }
+            '{' => {
+                self.next_char();
+                Ok(Some(RawToken::LeftBrace))
+            }
+            '}' => {
+                self.next_char();
+                Ok(Some(RawToken::RightBrace))
+            }
             '"' => {
-                self.next_char(); // Consume opening quote
-                let start = self.byte_idx;
-                let mut escaping = false;
-                while let Some(c) = self.next_char() {
-                    if escaping {
-                        escaping = false;
-                    } else if c == '\\' {
-                        escaping = true;
-                    } else if c == '"' {
-                        let end = self.byte_idx - 1;
-                        return Ok(Some(RawToken::String(&self.input[start..end])));
-                    }
-                }
-                Err(MesoError::Serialization(
-                    "Unterminated string literal".into(),
-                ))
+                let raw = self.read_quoted_raw("Unterminated string literal")?;
+                let unescaped = unescape_edn_str(raw)?;
+                Ok(Some(RawToken::String(unescaped)))
             }
             '#' => {
                 self.next_char(); // Consume '#'
+                if self.peek_char() == Some(&'{') {
+                    self.next_char();
+                    return Ok(Some(RawToken::HashBrace));
+                }
+
                 let mut tag = String::new();
                 while let Some(&c) = self.peek_char() {
-                    if c.is_whitespace() || c == '"' || c == '[' || c == ']' {
+                    if is_delimiter(c) {
                         break;
                     }
                     tag.push(self.next_char().unwrap());
                 }
 
-                if tag == "inst" {
-                    self.skip_whitespace_and_commas();
-                    if self.next_char() != Some('"') {
-                        return Err(MesoError::Serialization(
-                            "Expected string literal after #inst".into(),
-                        ));
-                    }
-                    let start = self.byte_idx;
-                    while let Some(c) = self.next_char() {
-                        if c == '"' {
-                            let end = self.byte_idx - 1;
-                            let dt_str = &self.input[start..end];
-                            let dt = DateTime::parse_from_rfc3339(dt_str).map_err(|e| {
-                                MesoError::Serialization(format!("Invalid #inst format: {e}"))
-                            })?;
-                            return Ok(Some(RawToken::Inst(dt.timestamp_micros())));
+                match tag.as_str() {
+                    "inst" => {
+                        self.skip_whitespace_and_commas();
+                        if self.peek_char() != Some(&'"') {
+                            return Err(MesoError::Serialization(
+                                "Expected string literal after #inst".into(),
+                            ));
                         }
+                        let dt_str = self.read_quoted_raw("Unterminated #inst literal")?;
+                        let dt = DateTime::parse_from_rfc3339(dt_str).map_err(|e| {
+                            MesoError::Serialization(format!("Invalid #inst format: {e}"))
+                        })?;
+                        Ok(Some(RawToken::Inst(dt.timestamp_micros())))
                     }
-                    Err(MesoError::Serialization(
-                        "Unterminated #inst literal".into(),
-                    ))
-                } else {
-                    Err(MesoError::Serialization(format!("Unknown tag: #{tag}")))
+                    "uuid" => {
+                        self.skip_whitespace_and_commas();
+                        if self.peek_char() != Some(&'"') {
+                            return Err(MesoError::Serialization(
+                                "Expected string literal after #uuid".into(),
+                            ));
+                        }
+                        let uuid_str = self.read_quoted_raw("Unterminated #uuid literal")?;
+                        let bytes = parse_uuid_bytes(uuid_str)?;
+                        Ok(Some(RawToken::Uuid(bytes)))
+                    }
+                    _ => Err(MesoError::Serialization(format!("Unknown tag: #{tag}"))),
                 }
             }
             _ => {
-                // Parse numbers, keywords, and symbols via slice bounds matching
                 let start = self.byte_idx;
                 while let Some(&c) = self.peek_char() {
-                    if c.is_whitespace() || c == ',' || c == '[' || c == ']' || c == '"' {
+                    if is_delimiter(c) {
                         break;
                     }
                     self.next_char();
@@ -141,12 +235,21 @@ impl<'a> EdnLexer<'a> {
                 let end = self.byte_idx;
                 let slice = &self.input[start..end];
 
+                if slice.is_empty() {
+                    let unexpected = self.next_char().unwrap();
+                    return Err(MesoError::Serialization(format!(
+                        "Unexpected delimiter '{unexpected}' in EDN input"
+                    )));
+                }
+
                 if slice.starts_with(':') {
                     Ok(Some(RawToken::Keyword(slice)))
                 } else if slice == "true" {
                     Ok(Some(RawToken::Boolean(true)))
                 } else if slice == "false" {
                     Ok(Some(RawToken::Boolean(false)))
+                } else if slice == "nil" {
+                    Ok(Some(RawToken::Nil))
                 } else if let Ok(i) = slice.parse::<i64>() {
                     Ok(Some(RawToken::Int(i)))
                 } else if let Ok(f) = slice.parse::<f64>() {
@@ -159,10 +262,24 @@ impl<'a> EdnLexer<'a> {
     }
 }
 
+fn token_to_value(tok: RawToken<'_>) -> Result<Value> {
+    match tok {
+        RawToken::String(s) => Ok(Value::String(s.into_owned())),
+        RawToken::Keyword(k) => Ok(Value::String(k.to_string())),
+        RawToken::Int(i) => Ok(Value::Int64(i)),
+        RawToken::Float(f) => Ok(Value::Float64(f)),
+        RawToken::Boolean(b) => Ok(Value::Boolean(b)),
+        RawToken::Inst(t) => Ok(Value::Timestamp(t)),
+        RawToken::Uuid(u) => Ok(Value::Uuid(u)),
+        _ => Err(MesoError::Serialization(
+            "Unsupported structural primitive inside value cell".into(),
+        )),
+    }
+}
+
 pub fn parse_transaction(input: &str) -> Result<Vec<Fact>> {
     let mut lexer = EdnLexer::new(input);
 
-    // Outer boundary must be a vector enclosure
     match lexer.next_token()? {
         Some(RawToken::LeftBracket) => {}
         _ => {
@@ -178,7 +295,7 @@ pub fn parse_transaction(input: &str) -> Result<Vec<Fact>> {
         lexer.skip_whitespace_and_commas();
         match lexer.peek_char() {
             Some(']') => {
-                lexer.next_char(); // Consume final closing bracket
+                lexer.next_char();
                 break;
             }
             None => {
@@ -191,9 +308,12 @@ pub fn parse_transaction(input: &str) -> Result<Vec<Fact>> {
                     let fact = parse_fact_vector(&mut lexer)?;
                     facts.push(fact);
                 }
+                Some(RawToken::LeftBrace) => {
+                    parse_fact_map(&mut lexer, &mut facts)?;
+                }
                 _ => {
                     return Err(MesoError::Serialization(
-                        "Expected inner fact assertion vector starting with '['".into(),
+                        "Expected inner fact vector '[' or entity map '{'".into(),
                     ));
                 }
             },
@@ -232,9 +352,16 @@ fn parse_fact_vector(lexer: &mut EdnLexer<'_>) -> Result<Fact> {
         ));
     }
 
-    let op = match &tokens[0] {
-        RawToken::Keyword(k) if *k == ":db/add" => true,
-        RawToken::Keyword(k) if *k == ":db/retract" => false,
+    let mut iter = tokens.into_iter();
+    let op_tok = iter.next().unwrap();
+    let e_tok = iter.next().unwrap();
+    let a_tok = iter.next().unwrap();
+    let v_tok = iter.next().unwrap();
+    let vt_tok = iter.next();
+
+    let op = match op_tok {
+        RawToken::Keyword(":db/add") => true,
+        RawToken::Keyword(":db/retract") => false,
         _ => {
             return Err(MesoError::Serialization(
                 "First argument in a fact clause must be either :db/add or :db/retract".into(),
@@ -242,8 +369,8 @@ fn parse_fact_vector(lexer: &mut EdnLexer<'_>) -> Result<Fact> {
         }
     };
 
-    let e = match &tokens[1] {
-        RawToken::Int(i) => *i as u64,
+    let e = match e_tok {
+        RawToken::Int(i) if i >= 0 => i as u64,
         _ => {
             return Err(MesoError::Serialization(
                 "Entity ID must resolve to an unsigned integer".into(),
@@ -251,7 +378,7 @@ fn parse_fact_vector(lexer: &mut EdnLexer<'_>) -> Result<Fact> {
         }
     };
 
-    let ident = match &tokens[2] {
+    let ident = match a_tok {
         RawToken::Keyword(k) => k.to_string(),
         _ => {
             return Err(MesoError::Serialization(
@@ -260,24 +387,12 @@ fn parse_fact_vector(lexer: &mut EdnLexer<'_>) -> Result<Fact> {
         }
     };
 
-    let v = match &tokens[3] {
-        RawToken::String(s) => Value::String(s.to_string()),
-        RawToken::Keyword(k) => Value::String(k.to_string()), // Keyword coercion matching old engine constraints
-        RawToken::Int(i) => Value::Int64(*i),
-        RawToken::Float(f) => Value::Float64(*f),
-        RawToken::Boolean(b) => Value::Boolean(*b), // NEW
-        RawToken::Inst(t) => Value::Timestamp(*t),
-        _ => {
-            return Err(MesoError::Serialization(
-                "Unsupported structural primitive inside value cell".into(),
-            ));
-        }
-    };
+    let v = token_to_value(v_tok)?;
 
     let mut valid_time = None;
-    if tokens.len() >= 5 {
-        match &tokens[4] {
-            RawToken::Inst(t) => valid_time = Some(*t),
+    if let Some(vt) = vt_tok {
+        match vt {
+            RawToken::Inst(t) => valid_time = Some(t),
             _ => {
                 return Err(MesoError::Serialization(
                     "Valid-time parameter (5th cell index) must be an #inst literal timestamp"
@@ -295,6 +410,96 @@ fn parse_fact_vector(lexer: &mut EdnLexer<'_>) -> Result<Fact> {
         cas_old_v: None,
         valid_time,
     })
+}
+
+fn parse_fact_map(lexer: &mut EdnLexer<'_>, out_facts: &mut Vec<Fact>) -> Result<()> {
+    let mut entity_id: Option<u64> = None;
+    let mut attrs: Vec<(String, Vec<Value>)> = Vec::new();
+
+    loop {
+        lexer.skip_whitespace_and_commas();
+        match lexer.peek_char() {
+            Some('}') => {
+                lexer.next_char();
+                break;
+            }
+            None => {
+                return Err(MesoError::Serialization(
+                    "Unterminated entity map in transaction".into(),
+                ));
+            }
+            _ => {
+                let key_tok = lexer.next_token()?.ok_or_else(|| {
+                    MesoError::Serialization("Unexpected EOF in entity map".into())
+                })?;
+                let key = match key_tok {
+                    RawToken::Keyword(k) => k,
+                    _ => {
+                        return Err(MesoError::Serialization(
+                            "Entity map keys must be keywords".into(),
+                        ));
+                    }
+                };
+
+                let val_tok = lexer.next_token()?.ok_or_else(|| {
+                    MesoError::Serialization("Missing value for key in entity map".into())
+                })?;
+
+                if key == ":db/id" {
+                    match val_tok {
+                        RawToken::Int(i) if i >= 0 => entity_id = Some(i as u64),
+                        _ => {
+                            return Err(MesoError::Serialization(
+                                ":db/id in entity map must be an unsigned integer".into(),
+                            ));
+                        }
+                    }
+                } else if matches!(val_tok, RawToken::HashBrace) {
+                    let mut set_vals = Vec::new();
+                    loop {
+                        lexer.skip_whitespace_and_commas();
+                        match lexer.peek_char() {
+                            Some('}') => {
+                                lexer.next_char();
+                                break;
+                            }
+                            None => {
+                                return Err(MesoError::Serialization(
+                                    "Unterminated set '#{' in entity map".into(),
+                                ));
+                            }
+                            _ => {
+                                let elem = lexer.next_token()?.unwrap();
+                                set_vals.push(token_to_value(elem)?);
+                            }
+                        }
+                    }
+                    attrs.push((key.to_string(), set_vals));
+                } else {
+                    attrs.push((key.to_string(), vec![token_to_value(val_tok)?]));
+                }
+            }
+        }
+    }
+
+    let e = entity_id.ok_or_else(|| {
+        MesoError::Serialization("Entity map transaction requires a :db/id key".into())
+    })?;
+
+    for (ident, vals) in attrs {
+        for v in vals {
+            out_facts.push(Fact {
+                e,
+                ident: ident.clone(),
+                v,
+                op: true,
+                cas_old_v: None,
+                valid_time: None,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -318,7 +523,7 @@ mod tests {
         );
         assert_eq!(
             lexer.next_token().unwrap(),
-            Some(RawToken::String("Delta Force"))
+            Some(RawToken::String(Cow::Borrowed("Delta Force")))
         );
 
         let inst_tok = lexer.next_token().unwrap().unwrap();
@@ -385,25 +590,41 @@ mod tests {
         let facts = parse_transaction(raw_input).expect("Failed to parse brutal escape sequences");
         assert_eq!(facts.len(), 3);
 
-        // Note: The lexer extracts the raw slice between the OUTER quotes.
-        // It does not unescape the string in memory, which is the correct zero-allocation behavior.
         if let Value::String(s) = &facts[0].v {
-            assert_eq!(s, "fn main() { println!(\\\"Hello\\\"); }");
+            assert_eq!(s, r#"fn main() { println!("Hello"); }"#);
         } else {
             panic!("Expected String value for Fact 0");
         }
 
         if let Value::String(s) = &facts[1].v {
-            assert_eq!(s, "C:\\\\Temp\\\\");
+            assert_eq!(s, r"C:\Temp\");
         } else {
             panic!("Expected String value for Fact 1");
         }
 
         if let Value::String(s) = &facts[2].v {
-            assert_eq!(s, "\\\\\\\"\\\\\\\\\\\"");
+            assert_eq!(s, "\\\"\\\\\"");
         } else {
             panic!("Expected String value for Fact 2");
         }
+    }
+
+    #[test]
+    fn test_edn_comments_uuid_and_map_transactions() {
+        let input = r#"[
+            ; Line comment before vector fact
+            [:db/add 1 :user/id #uuid "550e8400-e29b-41d4-a716-446655440000"]
+            ; Map assertion with multi-valued set
+            {:db/id 2, :user/name "Alice\nSmith", :user/tag #{"rust" "datalog"}}
+        ]"#;
+
+        let facts = parse_transaction(input).unwrap();
+        assert_eq!(facts.len(), 4);
+        assert!(matches!(facts[0].v, Value::Uuid(_)));
+        assert_eq!(facts[1].e, 2);
+        assert_eq!(facts[1].v, Value::String("Alice\nSmith".into()));
+        assert_eq!(facts[2].v, Value::String("rust".into()));
+        assert_eq!(facts[3].v, Value::String("datalog".into()));
     }
 
     #[test]

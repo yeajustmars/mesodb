@@ -114,7 +114,7 @@ impl Wal {
             ));
         }
 
-        self.file.write_all(&len.to_ne_bytes())?;
+        self.file.write_all(&len.to_le_bytes())?;
         self.file.write_all(&bytes)?;
 
         // Queue the sync request instead of blocking the thread
@@ -145,7 +145,7 @@ impl Wal {
             if self.file.read_exact(&mut len_bytes).is_err() {
                 break;
             }
-            let len = u64::from_ne_bytes(len_bytes);
+            let len = u64::from_le_bytes(len_bytes);
 
             let current_pos = self.file.stream_position()?;
             if len > (file_len - current_pos) {
@@ -212,7 +212,7 @@ impl Wal {
                 .map_err(|e| MesoError::Serialization(e.to_string()))?;
             let len = bytes.len() as u64;
 
-            tmp_file.write_all(&len.to_ne_bytes())?;
+            tmp_file.write_all(&len.to_le_bytes())?;
             tmp_file.write_all(&bytes)?;
         }
         tmp_file.sync_all()?;
@@ -345,6 +345,7 @@ mod tests {
                 ident: ":test/new".into(),
                 value_type: crate::schema::ValueType::String,
                 is_unique: false,
+                cardinality: crate::schema::Cardinality::One,
             },
         };
         wal.append_entry(

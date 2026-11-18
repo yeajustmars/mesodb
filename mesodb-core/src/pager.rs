@@ -17,7 +17,7 @@ use crate::{
 /// Readers hold an immutable Arc to the memory map. They can never be blocked.
 #[derive(Clone)]
 pub struct ReadPager {
-    mmap: Arc<Mmap>,
+    pub(crate) mmap: Arc<Mmap>,
     pub num_pages: u32,
 }
 
@@ -148,7 +148,7 @@ mod tests {
         };
 
         let mut payload = [0u8; 8];
-        payload[0..8].copy_from_slice(&35i64.to_ne_bytes());
+        payload[0..8].copy_from_slice(&35i64.to_le_bytes());
 
         node.values[0] = IndexValue {
             type_tag: 1, // Simulated ValueType::Int64
@@ -172,7 +172,7 @@ mod tests {
         assert_eq!(recovered_node.keys[0].a, 99);
 
         let val_bytes = recovered_node.values[0].payload;
-        let age = i64::from_ne_bytes(val_bytes);
+        let age = i64::from_le_bytes(val_bytes);
         assert_eq!(age, 35);
     }
 }

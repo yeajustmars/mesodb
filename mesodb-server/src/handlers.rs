@@ -115,6 +115,7 @@ pub async fn handle_query(
             mesodb_core::db::OutputFormat::Json
         },
         history: false,
+        inputs: Vec::new(),
     };
 
     // Route directly to the highly-optimized zero-copy formatter
@@ -167,6 +168,7 @@ pub async fn handle_schema(
             ident: attr.ident,
             value_type: vt,
             is_unique: attr.is_unique,
+            cardinality: mesodb_core::schema::Cardinality::One,
         });
     }
 

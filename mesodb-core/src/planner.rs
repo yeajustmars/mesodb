@@ -19,6 +19,11 @@ use crate::{
     udf,
 };
 
+type PlanPartFroms = Vec<String>;
+type PlanPartWheres = Vec<String>;
+type PlanPartVars = HashMap<String, String>;
+type PlanParts = (PlanPartFroms, PlanPartWheres, PlanPartVars);
+
 pub struct QueryPlanner<'a> {
     ctx: &'a SessionContext,
     view: &'a WorldView,
@@ -26,14 +31,11 @@ pub struct QueryPlanner<'a> {
     format: OutputFormat,
     as_of: Option<i64>,
     ruleset: Option<RuleSet>,
+    inputs: &'a [crate::db::QueryInput],
 }
 
-type PlanPartFroms = Vec<String>;
-type PlanPartWheres = Vec<String>;
-type PlanPartVars = HashMap<String, String>;
-type PlanParts = (PlanPartFroms, PlanPartWheres, PlanPartVars);
-
 impl<'a> QueryPlanner<'a> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ctx: &'a SessionContext,
         view: &'a WorldView,
@@ -41,6 +43,7 @@ impl<'a> QueryPlanner<'a> {
         format: OutputFormat,
         as_of: Option<i64>,
         ruleset: Option<RuleSet>,
+        inputs: &'a [crate::db::QueryInput],
     ) -> Self {
         Self {
             ctx,
@@ -49,10 +52,15 @@ impl<'a> QueryPlanner<'a> {
             format,
             as_of,
             ruleset,
+            inputs,
         }
     }
 
-    fn build_logical_plan(&self, clauses: &[WhereClause]) -> Result<PlanParts, MesoError> {
+    fn build_logical_plan(
+        &self,
+        clauses: &[WhereClause],
+        initial_vars: PlanPartVars,
+    ) -> Result<PlanParts, MesoError> {
         let target_tx = if let Some(t) = self.as_of {
             self.view.timeline.tx_for_timestamp(t)
         } else {
@@ -62,8 +70,9 @@ impl<'a> QueryPlanner<'a> {
 
         let mut from_tables = Vec::new();
         let mut where_conditions = Vec::new();
-        let mut var_to_column = HashMap::new();
+        let mut var_to_column = initial_vars;
         let mut alias_counter = 0;
+
         let prefix = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -125,8 +134,8 @@ impl<'a> QueryPlanner<'a> {
 
                     match v {
                         Term::Variable(var_name) => {
-                            let col_type = if let Some(attr) = current_attr {
-                                match attr.value_type {
+                            let col_ref = if let Some(attr) = current_attr {
+                                let col_type = match attr.value_type {
                                     ValueType::Boolean => "v_bool",
                                     ValueType::Int64 => "v_int",
                                     ValueType::Float64 => "v_float",
@@ -134,12 +143,15 @@ impl<'a> QueryPlanner<'a> {
                                     ValueType::Ref => "v_ref",
                                     ValueType::Timestamp => "v_time",
                                     ValueType::Uuid => "v_uuid",
-                                }
+                                };
+                                format!("{}.{}", alias, col_type)
                             } else {
-                                "v_str"
+                                format!(
+                                    "COALESCE({a}.v_str, CAST({a}.v_int AS VARCHAR), CAST({a}.v_float AS VARCHAR), CAST({a}.v_bool AS VARCHAR), CAST({a}.v_ref AS VARCHAR), CAST({a}.v_time AS VARCHAR), format_uuid({a}.v_uuid))",
+                                    a = alias
+                                )
                             };
 
-                            let col_ref = format!("{}.{}", alias, col_type);
                             if let Some(existing_col) = var_to_column.get(var_name) {
                                 where_conditions.push(format!("{} = {}", existing_col, col_ref));
                             } else {
@@ -147,16 +159,17 @@ impl<'a> QueryPlanner<'a> {
                             }
                         }
                         Term::String(s) => {
-                            where_conditions.push(format!("{}.v_str = '{}'", alias, s))
+                            let escaped = s.replace('\'', "''");
+                            where_conditions.push(format!("{}.v_str = '{}'", alias, escaped));
                         }
                         Term::Integer(i) => {
-                            where_conditions.push(format!("{}.v_int = {}", alias, i))
+                            where_conditions.push(format!("{}.v_int = {}", alias, i));
                         }
                         Term::Boolean(b) => {
-                            where_conditions.push(format!("{}.v_bool = {}", alias, b))
+                            where_conditions.push(format!("{}.v_bool = {}", alias, b));
                         }
                         Term::Float(f) => {
-                            where_conditions.push(format!("{}.v_float = {}", alias, f))
+                            where_conditions.push(format!("{}.v_float = {}", alias, f));
                         }
                         _ => {}
                     }
@@ -175,12 +188,20 @@ impl<'a> QueryPlanner<'a> {
                         && let Some(a_id) = self.view.schema.get_id(kw)
                         && let Ok(Some(treemap)) = self.view.bitmap_index.get(a_id, &lit)
                     {
-                        let udf_name = format!("in_bitmap_{}_{}", a_id, bitmap::hash_value(&lit));
+                        let udf_name =
+                            format!("in_bitmap_{}_{:032x}", a_id, bitmap::hash_value(&lit));
+                        let dirty_for_attr = Arc::new(
+                            self.view
+                                .dirty_entities
+                                .get(&a_id)
+                                .cloned()
+                                .unwrap_or_default(),
+                        );
 
                         let udf = datafusion::logical_expr::ScalarUDF::from(udf::InBitmapUDF::new(
                             treemap,
                             udf_name.clone(),
-                            self.view.dirty_entities.clone(), // Passed here
+                            dirty_for_attr,
                         ));
                         self.ctx.register_udf(udf);
 
@@ -242,7 +263,9 @@ impl<'a> QueryPlanner<'a> {
                                 where_conditions.push(format!("{}.col{} = {}", alias, i, val))
                             }
                             Term::String(val) => {
-                                where_conditions.push(format!("{}.col{} = '{}'", alias, i, val))
+                                let escaped = val.replace('\'', "''");
+                                where_conditions
+                                    .push(format!("{}.col{} = '{}'", alias, i, escaped));
                             }
                             _ => {}
                         }
@@ -262,7 +285,7 @@ impl<'a> QueryPlanner<'a> {
                                 .unwrap_or_else(|| "NULL".into()),
                             Term::Integer(i) => i.to_string(),
                             Term::Float(f) => f.to_string(),
-                            Term::String(s) => format!("'{}'", s),
+                            Term::String(s) => format!("'{}'", s.replace('\'', "''")),
                             Term::Boolean(b) => b.to_string(),
                             _ => "NULL".into(),
                         })
@@ -296,7 +319,7 @@ impl<'a> QueryPlanner<'a> {
                     }
                 }
                 WhereClause::Or {
-                    join_vars: _,
+                    join_vars,
                     clauses: or_clauses,
                 } => {
                     if or_clauses.is_empty() {
@@ -307,13 +330,13 @@ impl<'a> QueryPlanner<'a> {
                     alias_counter += 1;
 
                     let mut union_branches = Vec::new();
-                    let mut projected_vars: Vec<String> = Vec::new();
+                    let mut projected_vars: Vec<String> = join_vars.clone().unwrap_or_default();
 
                     for (idx, clause) in or_clauses.iter().enumerate() {
                         let (sub_froms, sub_wheres, sub_vars) =
-                            self.build_logical_plan(std::slice::from_ref(clause))?;
+                            self.build_logical_plan(std::slice::from_ref(clause), HashMap::new())?;
 
-                        if idx == 0 {
+                        if join_vars.is_none() && idx == 0 {
                             for k in sub_vars.keys() {
                                 if !k.starts_with("__lit") {
                                     projected_vars.push(k.clone());
@@ -325,6 +348,11 @@ impl<'a> QueryPlanner<'a> {
                         for var in &projected_vars {
                             if let Some(col) = sub_vars.get(var) {
                                 selects.push(format!("{} AS \"{}\"", col, var));
+                            } else if join_vars.is_some() {
+                                return Err(MesoError::PlanError(format!(
+                                    "or-join variable {} is unbound in branch {}",
+                                    var, idx
+                                )));
                             } else {
                                 selects.push(format!("NULL AS \"{}\"", var));
                             }
@@ -356,15 +384,34 @@ impl<'a> QueryPlanner<'a> {
                     }
                 }
                 WhereClause::Not {
-                    join_vars: _,
+                    join_vars,
                     clauses: not_clauses,
                 } => {
-                    let (sub_froms, sub_wheres, sub_vars) = self.build_logical_plan(not_clauses)?;
+                    let (sub_froms, sub_wheres, sub_vars) =
+                        self.build_logical_plan(not_clauses, HashMap::new())?;
 
                     let mut correlation_links = Vec::new();
-                    for (var, outer_col) in &var_to_column {
-                        if let Some(inner_col) = sub_vars.get(var) {
+                    if let Some(jvars) = join_vars {
+                        for var in jvars {
+                            let outer_col = var_to_column.get(var).ok_or_else(|| {
+                                MesoError::PlanError(format!(
+                                    "not-join variable {} is unbound in outer query",
+                                    var
+                                ))
+                            })?;
+                            let inner_col = sub_vars.get(var).ok_or_else(|| {
+                                MesoError::PlanError(format!(
+                                    "not-join variable {} is unbound in not-join body",
+                                    var
+                                ))
+                            })?;
                             correlation_links.push(format!("{} = {}", outer_col, inner_col));
+                        }
+                    } else {
+                        for (var, outer_col) in &var_to_column {
+                            if let Some(inner_col) = sub_vars.get(var) {
+                                correlation_links.push(format!("{} = {}", outer_col, inner_col));
+                            }
                         }
                     }
 
@@ -384,6 +431,11 @@ impl<'a> QueryPlanner<'a> {
     }
 
     pub async fn plan(&self, query: &Query) -> Result<DataFrame, MesoError> {
+        self.ctx
+            .register_udf(datafusion::logical_expr::ScalarUDF::from(
+                udf::FormatUuidUDF::new(),
+            ));
+
         let mut has_pull = false;
         let mut select_vars = Vec::new();
         let mut aggregate_vars = Vec::new();
@@ -427,7 +479,8 @@ impl<'a> QueryPlanner<'a> {
                 let mut col_count = 0;
                 for def in defs {
                     col_count = def.head.args.len();
-                    let (froms, wheres, var_map) = self.build_logical_plan(&def.body)?;
+                    let (froms, wheres, var_map) =
+                        self.build_logical_plan(&def.body, HashMap::new())?;
                     let mut selects = Vec::new();
 
                     for (i, arg) in def.head.args.iter().enumerate() {
@@ -459,8 +512,12 @@ impl<'a> QueryPlanner<'a> {
             }
         }
 
-        let (from_tables, where_conditions, var_to_column) =
-            self.build_logical_plan(&query.where_clauses)?;
+        let (mut from_tables, mut where_conditions, in_var_map) = self.bind_in_clause(query)?;
+        let (clause_froms, clause_wheres, var_to_column) =
+            self.build_logical_plan(&query.where_clauses, in_var_map)?;
+        from_tables.extend(clause_froms);
+        where_conditions.extend(clause_wheres);
+
         let mut select_clauses = Vec::new();
         let mut group_by_clauses = Vec::new();
 
@@ -594,5 +651,306 @@ impl<'a> QueryPlanner<'a> {
         } else {
             Ok(df)
         }
+    }
+
+    fn build_input_memtable(cols: &[Vec<Value>]) -> Result<Arc<DataFusionMemTable>, MesoError> {
+        let mut fields = Vec::with_capacity(cols.len());
+        let mut arrays: Vec<Arc<dyn ArrowArray>> = Vec::with_capacity(cols.len());
+
+        for (idx, col_vals) in cols.iter().enumerate() {
+            let col_name = format!("col{}", idx);
+            if col_vals.is_empty() {
+                fields.push(ArrowField::new(&col_name, ArrowDataType::UInt64, true));
+                arrays.push(Arc::new(ArrowUInt64Array::from(Vec::<u64>::new())));
+                continue;
+            }
+
+            match &col_vals[0] {
+                Value::Boolean(_) => {
+                    let mut vals = Vec::with_capacity(col_vals.len());
+                    for v in col_vals {
+                        match v {
+                            Value::Boolean(b) => vals.push(*b),
+                            _ => {
+                                return Err(MesoError::InvalidQuery(
+                                    "Mixed types in :in collection/relation column".into(),
+                                ));
+                            }
+                        }
+                    }
+                    fields.push(ArrowField::new(&col_name, ArrowDataType::Boolean, true));
+                    arrays.push(Arc::new(arrow::array::BooleanArray::from(vals)));
+                }
+                Value::Int64(_) => {
+                    let mut vals = Vec::with_capacity(col_vals.len());
+                    for v in col_vals {
+                        match v {
+                            Value::Int64(i) => vals.push(*i),
+                            _ => {
+                                return Err(MesoError::InvalidQuery(
+                                    "Mixed types in :in collection/relation column".into(),
+                                ));
+                            }
+                        }
+                    }
+                    fields.push(ArrowField::new(&col_name, ArrowDataType::Int64, true));
+                    arrays.push(Arc::new(arrow::array::Int64Array::from(vals)));
+                }
+                Value::Float64(_) => {
+                    let mut vals = Vec::with_capacity(col_vals.len());
+                    for v in col_vals {
+                        match v {
+                            Value::Float64(f) => vals.push(*f),
+                            _ => {
+                                return Err(MesoError::InvalidQuery(
+                                    "Mixed types in :in collection/relation column".into(),
+                                ));
+                            }
+                        }
+                    }
+                    fields.push(ArrowField::new(&col_name, ArrowDataType::Float64, true));
+                    arrays.push(Arc::new(arrow::array::Float64Array::from(vals)));
+                }
+                Value::String(_) => {
+                    let mut vals = Vec::with_capacity(col_vals.len());
+                    for v in col_vals {
+                        match v {
+                            Value::String(s) => vals.push(s.clone()),
+                            _ => {
+                                return Err(MesoError::InvalidQuery(
+                                    "Mixed types in :in collection/relation column".into(),
+                                ));
+                            }
+                        }
+                    }
+                    fields.push(ArrowField::new(&col_name, ArrowDataType::Utf8, true));
+                    arrays.push(Arc::new(arrow::array::StringArray::from(vals)));
+                }
+                Value::Ref(_) => {
+                    let mut vals = Vec::with_capacity(col_vals.len());
+                    for v in col_vals {
+                        match v {
+                            Value::Ref(r) => vals.push(*r),
+                            _ => {
+                                return Err(MesoError::InvalidQuery(
+                                    "Mixed types in :in collection/relation column".into(),
+                                ));
+                            }
+                        }
+                    }
+                    fields.push(ArrowField::new(&col_name, ArrowDataType::UInt64, true));
+                    arrays.push(Arc::new(ArrowUInt64Array::from(vals)));
+                }
+                Value::Timestamp(_) => {
+                    let mut vals = Vec::with_capacity(col_vals.len());
+                    for v in col_vals {
+                        match v {
+                            Value::Timestamp(t) => vals.push(*t),
+                            _ => {
+                                return Err(MesoError::InvalidQuery(
+                                    "Mixed types in :in collection/relation column".into(),
+                                ));
+                            }
+                        }
+                    }
+                    fields.push(ArrowField::new(
+                        &col_name,
+                        ArrowDataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                        true,
+                    ));
+                    arrays.push(Arc::new(arrow::array::TimestampMicrosecondArray::from(
+                        vals,
+                    )));
+                }
+                Value::Uuid(_) => {
+                    let mut vals = Vec::with_capacity(col_vals.len());
+                    for v in col_vals {
+                        match v {
+                            Value::Uuid(u) => vals.push(*u),
+                            _ => {
+                                return Err(MesoError::InvalidQuery(
+                                    "Mixed types in :in collection/relation column".into(),
+                                ));
+                            }
+                        }
+                    }
+                    fields.push(ArrowField::new(
+                        &col_name,
+                        ArrowDataType::FixedSizeBinary(16),
+                        true,
+                    ));
+                    let arr = arrow::array::FixedSizeBinaryArray::try_from_iter(vals.iter())
+                        .map_err(MesoError::Arrow)?;
+                    arrays.push(Arc::new(arr));
+                }
+            }
+        }
+
+        let schema = Arc::new(ArrowSchema::new(fields));
+        let batch = RecordBatch::try_new(schema.clone(), arrays).map_err(MesoError::Arrow)?;
+        let provider = DataFusionMemTable::try_new(schema, vec![vec![batch]])
+            .map_err(MesoError::DataFusion)?;
+        Ok(Arc::new(provider))
+    }
+
+    fn bind_in_clause(&self, query: &Query) -> Result<PlanParts, MesoError> {
+        let mut from_tables = Vec::new();
+        let mut where_conditions = Vec::new();
+        let mut var_to_column: PlanPartVars = HashMap::new();
+
+        let Some(in_specs) = &query.in_vars else {
+            if !self.inputs.is_empty() {
+                return Err(MesoError::InvalidQuery(
+                    "Inputs were provided for a query without an :in clause".into(),
+                ));
+            }
+            return Ok((from_tables, where_conditions, var_to_column));
+        };
+
+        let mut input_idx = 0usize;
+        for (spec_idx, spec) in in_specs.iter().enumerate() {
+            match spec {
+                crate::ast::InSpec::DataSource(_) => {}
+                crate::ast::InSpec::Variable(var) => {
+                    let input = self.inputs.get(input_idx).ok_or_else(|| {
+                        MesoError::InvalidQuery(format!("Missing scalar :in argument for {}", var))
+                    })?;
+                    input_idx += 1;
+
+                    let crate::db::QueryInput::Scalar(val) = input else {
+                        return Err(MesoError::InvalidQuery(format!(
+                            "Expected QueryInput::Scalar for {}",
+                            var
+                        )));
+                    };
+
+                    let tbl_name = format!("__in_{}", spec_idx);
+                    let alias = format!("in_{}", spec_idx);
+                    let provider = Self::build_input_memtable(&[vec![val.clone()]])?;
+                    self.ctx.register_table(&tbl_name, provider)?;
+                    from_tables.push(format!("{} AS {}", tbl_name, alias));
+
+                    let col_ref = format!("{}.col0", alias);
+                    if let Some(existing) = var_to_column.get(var) {
+                        where_conditions.push(format!("{} = {}", existing, col_ref));
+                    } else {
+                        var_to_column.insert(var.clone(), col_ref);
+                    }
+                }
+                crate::ast::InSpec::Collection(var) => {
+                    let input = self.inputs.get(input_idx).ok_or_else(|| {
+                        MesoError::InvalidQuery(format!(
+                            "Missing collection :in argument for [{} ...]",
+                            var
+                        ))
+                    })?;
+                    input_idx += 1;
+
+                    let crate::db::QueryInput::Collection(vals) = input else {
+                        return Err(MesoError::InvalidQuery(format!(
+                            "Expected QueryInput::Collection for [{} ...]",
+                            var
+                        )));
+                    };
+
+                    let tbl_name = format!("__in_{}", spec_idx);
+                    let alias = format!("in_{}", spec_idx);
+                    let provider = Self::build_input_memtable(std::slice::from_ref(vals))?;
+                    self.ctx.register_table(&tbl_name, provider)?;
+                    from_tables.push(format!("{} AS {}", tbl_name, alias));
+
+                    let col_ref = format!("{}.col0", alias);
+                    if let Some(existing) = var_to_column.get(var) {
+                        where_conditions.push(format!("{} = {}", existing, col_ref));
+                    } else {
+                        var_to_column.insert(var.clone(), col_ref);
+                    }
+                }
+                crate::ast::InSpec::Tuple(vars) => {
+                    let input = self.inputs.get(input_idx).ok_or_else(|| {
+                        MesoError::InvalidQuery("Missing tuple :in argument".into())
+                    })?;
+                    input_idx += 1;
+
+                    let crate::db::QueryInput::Tuple(vals) = input else {
+                        return Err(MesoError::InvalidQuery("Expected QueryInput::Tuple".into()));
+                    };
+                    if vals.len() != vars.len() {
+                        return Err(MesoError::InvalidQuery(format!(
+                            "Tuple :in arity mismatch: expected {}, got {}",
+                            vars.len(),
+                            vals.len()
+                        )));
+                    }
+
+                    let cols: Vec<Vec<Value>> = vals.iter().map(|v| vec![v.clone()]).collect();
+                    let tbl_name = format!("__in_{}", spec_idx);
+                    let alias = format!("in_{}", spec_idx);
+                    let provider = Self::build_input_memtable(&cols)?;
+                    self.ctx.register_table(&tbl_name, provider)?;
+                    from_tables.push(format!("{} AS {}", tbl_name, alias));
+
+                    for (col_i, var) in vars.iter().enumerate() {
+                        let col_ref = format!("{}.col{}", alias, col_i);
+                        if let Some(existing) = var_to_column.get(var) {
+                            where_conditions.push(format!("{} = {}", existing, col_ref));
+                        } else {
+                            var_to_column.insert(var.clone(), col_ref);
+                        }
+                    }
+                }
+                crate::ast::InSpec::Relation(vars) => {
+                    let input = self.inputs.get(input_idx).ok_or_else(|| {
+                        MesoError::InvalidQuery("Missing relation :in argument".into())
+                    })?;
+                    input_idx += 1;
+
+                    let crate::db::QueryInput::Relation(rows) = input else {
+                        return Err(MesoError::InvalidQuery(
+                            "Expected QueryInput::Relation".into(),
+                        ));
+                    };
+
+                    let mut cols = vec![Vec::with_capacity(rows.len()); vars.len()];
+                    for row in rows {
+                        if row.len() != vars.len() {
+                            return Err(MesoError::InvalidQuery(format!(
+                                "Relation :in row arity mismatch: expected {}, got {}",
+                                vars.len(),
+                                row.len()
+                            )));
+                        }
+                        for (col_i, val) in row.iter().enumerate() {
+                            cols[col_i].push(val.clone());
+                        }
+                    }
+
+                    let tbl_name = format!("__in_{}", spec_idx);
+                    let alias = format!("in_{}", spec_idx);
+                    let provider = Self::build_input_memtable(&cols)?;
+                    self.ctx.register_table(&tbl_name, provider)?;
+                    from_tables.push(format!("{} AS {}", tbl_name, alias));
+
+                    for (col_i, var) in vars.iter().enumerate() {
+                        let col_ref = format!("{}.col{}", alias, col_i);
+                        if let Some(existing) = var_to_column.get(var) {
+                            where_conditions.push(format!("{} = {}", existing, col_ref));
+                        } else {
+                            var_to_column.insert(var.clone(), col_ref);
+                        }
+                    }
+                }
+            }
+        }
+
+        if input_idx != self.inputs.len() {
+            return Err(MesoError::InvalidQuery(format!(
+                "Too many :in arguments supplied: expected {}, got {}",
+                input_idx,
+                self.inputs.len()
+            )));
+        }
+
+        Ok((from_tables, where_conditions, var_to_column))
     }
 }

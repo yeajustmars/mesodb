@@ -11,6 +11,9 @@ pub struct IndexManager {
     /// Flattened EAVT Index: (EntityId, AttributeId) -> flat timeline vector
     pub eavt: AHashMap<(EntityId, AttributeId), Timeline<Value>>,
 
+    /// Multi-valued EAVT Index: (EntityId, AttributeId, Value) -> membership timeline
+    pub eavt_many: AHashMap<(EntityId, AttributeId, Value), Timeline<()>>,
+
     /// Two-Level Unique Index: AttributeId -> Value -> flat timeline vector
     /// This structure allows us to query by `&Value` without cloning!
     pub unique_index: AHashMap<AttributeId, AHashMap<Value, Timeline<EntityId>>>,
@@ -75,6 +78,29 @@ impl IndexManager {
             let unique_timeline = val_map.entry(v.clone()).or_default();
             Self::insert_timeline(unique_timeline, valid_time, None);
         }
+    }
+
+    pub fn insert_many(&mut self, e: EntityId, a: AttributeId, v: Value, valid_time: i64) {
+        let timeline = self.eavt_many.entry((e, a, v)).or_default();
+        Self::insert_timeline(timeline, valid_time, Some(()));
+    }
+
+    pub fn remove_many(&mut self, e: EntityId, a: AttributeId, v: Value, valid_time: i64) {
+        let timeline = self.eavt_many.entry((e, a, v)).or_default();
+        Self::insert_timeline(timeline, valid_time, None);
+    }
+
+    pub fn has_many_value_at(
+        &self,
+        e: EntityId,
+        a: AttributeId,
+        v: &Value,
+        valid_time: i64,
+    ) -> bool {
+        self.eavt_many
+            .get(&(e, a, v.clone()))
+            .and_then(|timeline| timeline.iter().rev().find(|(t, _)| *t <= valid_time))
+            .is_some_and(|(_, opt_present)| opt_present.is_some())
     }
 
     pub fn get_value_at(&self, e: EntityId, a: AttributeId, valid_time: i64) -> Option<&Value> {

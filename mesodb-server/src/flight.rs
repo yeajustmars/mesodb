@@ -58,6 +58,7 @@ impl FlightService for MesoFlightServer {
             rules: query_req.rules,
             format: OutputFormat::Arrow,
             history: false,
+            inputs: Vec::new(),
         };
 
         // 2. Execute the query using the core engine (assuming this returns a Vec<RecordBatch>)
@@ -184,6 +185,7 @@ impl FlightService for MesoFlightServer {
             rules: query_req.rules,
             format: mesodb_core::db::OutputFormat::Arrow,
             history: false,
+            inputs: Vec::new(),
         };
 
         // 2. Execute the query to capture the schema natively from DataFusion

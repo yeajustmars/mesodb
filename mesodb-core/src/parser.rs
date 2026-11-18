@@ -54,6 +54,18 @@ pub fn parse_query(query_str: &str) -> Result<Query, MesoError> {
                         Rule::data_src => {
                             in_vars.push(InSpec::DataSource(inner.as_str().to_string()))
                         }
+                        Rule::in_collection => {
+                            let var = inner.into_inner().next().unwrap().as_str().to_string();
+                            in_vars.push(InSpec::Collection(var));
+                        }
+                        Rule::in_tuple => {
+                            let vars = inner.into_inner().map(|p| p.as_str().to_string()).collect();
+                            in_vars.push(InSpec::Tuple(vars));
+                        }
+                        Rule::in_rel => {
+                            let vars = inner.into_inner().map(|p| p.as_str().to_string()).collect();
+                            in_vars.push(InSpec::Relation(vars));
+                        }
                         _ => {}
                     }
                 }
@@ -61,7 +73,7 @@ pub fn parse_query(query_str: &str) -> Result<Query, MesoError> {
             }
             Rule::where_clause => {
                 for where_elem in pair.into_inner() {
-                    query.where_clauses.push(parse_where_elem(where_elem));
+                    query.where_clauses.push(parse_where_elem(where_elem)?);
                 }
             }
             _ => {}
@@ -90,21 +102,62 @@ fn parse_pull_pattern(pair: pest::iterators::Pair<Rule>) -> PullPattern {
     PullPattern(attrs)
 }
 
-fn parse_term(pair: pest::iterators::Pair<Rule>) -> Term {
+fn unescape_datalog_str(raw: &str) -> String {
+    if !raw.contains('\\') {
+        return raw.to_string();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn parse_term(pair: pest::iterators::Pair<Rule>) -> Result<Term, MesoError> {
     let inner = pair.into_inner().next().unwrap();
     match inner.as_rule() {
-        Rule::variable => Term::Variable(inner.as_str().to_string()),
-        Rule::keyword => Term::Keyword(inner.as_str().to_string()),
+        Rule::variable => Ok(Term::Variable(inner.as_str().to_string())),
+        Rule::keyword => Ok(Term::Keyword(inner.as_str().to_string())),
         Rule::string => {
             let s = inner.into_inner().next().map(|p| p.as_str()).unwrap_or("");
-            Term::String(s.to_string())
+            Ok(Term::String(unescape_datalog_str(s)))
         }
-        Rule::integer => Term::Integer(inner.as_str().parse().unwrap()),
-        Rule::float => Term::Float(inner.as_str().parse().unwrap()),
-        Rule::boolean => Term::Boolean(inner.as_str() == "true"),
-        Rule::blank => Term::Blank,
-        Rule::data_src => Term::DataSource(inner.as_str().to_string()),
-        _ => Term::Blank,
+        Rule::integer => {
+            let val = inner.as_str().parse::<i64>().map_err(|e| {
+                MesoError::ParseError(format!(
+                    "Invalid integer literal '{}': {}",
+                    inner.as_str(),
+                    e
+                ))
+            })?;
+            Ok(Term::Integer(val))
+        }
+        Rule::float => {
+            let val = inner.as_str().parse::<f64>().map_err(|e| {
+                MesoError::ParseError(format!("Invalid float literal '{}': {}", inner.as_str(), e))
+            })?;
+            Ok(Term::Float(val))
+        }
+        Rule::boolean => Ok(Term::Boolean(inner.as_str() == "true")),
+        Rule::blank => Ok(Term::Blank),
+        Rule::data_src => Ok(Term::DataSource(inner.as_str().to_string())),
+        _ => Ok(Term::Blank),
     }
 }
 
@@ -150,33 +203,7 @@ pub fn parse_ruleset(rules_str: &str) -> Result<RuleSet, MesoError> {
             let mut body = Vec::new();
 
             for where_elem in inner {
-                let elem_inner = where_elem.into_inner().next().unwrap();
-                match elem_inner.as_rule() {
-                    Rule::data_pattern => {
-                        let mut terms = Vec::new();
-                        for part in elem_inner.into_inner() {
-                            terms.push(parse_term(part));
-                        }
-                        if terms.len() >= 2 {
-                            let e = terms[0].clone();
-                            let a = terms[1].clone();
-                            let v = terms.get(2).cloned().unwrap_or(Term::Blank);
-                            let tx = terms.get(3).cloned();
-                            let op = terms.get(4).cloned();
-                            body.push(WhereClause::DataPattern { e, a, v, tx, op });
-                        }
-                    }
-                    Rule::rule_expr => {
-                        let mut rule_inner = elem_inner.into_inner();
-                        let nested_rule_name = rule_inner.next().unwrap().as_str().to_string();
-                        let nested_args = rule_inner.map(parse_term).collect();
-                        body.push(WhereClause::RuleExpr {
-                            rule_name: nested_rule_name,
-                            args: nested_args,
-                        });
-                    }
-                    _ => {}
-                }
+                body.push(parse_where_elem(where_elem)?);
             }
             rules.push(RuleDef { head, body });
         }
@@ -185,13 +212,13 @@ pub fn parse_ruleset(rules_str: &str) -> Result<RuleSet, MesoError> {
     Ok(RuleSet { rules })
 }
 
-fn parse_where_elem(where_elem: pest::iterators::Pair<Rule>) -> WhereClause {
+fn parse_where_elem(where_elem: pest::iterators::Pair<Rule>) -> Result<WhereClause, MesoError> {
     let inner = where_elem.into_inner().next().unwrap();
     match inner.as_rule() {
         Rule::data_pattern => {
             let mut terms = Vec::new();
             for part in inner.into_inner() {
-                terms.push(parse_term(part));
+                terms.push(parse_term(part)?);
             }
 
             let e = terms.first().cloned().unwrap_or(Term::Blank);
@@ -200,13 +227,13 @@ fn parse_where_elem(where_elem: pest::iterators::Pair<Rule>) -> WhereClause {
             let tx = terms.get(3).cloned();
             let op = terms.get(4).cloned();
 
-            WhereClause::DataPattern { e, a, v, tx, op }
+            Ok(WhereClause::DataPattern { e, a, v, tx, op })
         }
         Rule::rule_expr => {
             let mut rule_inner = inner.into_inner();
             let rule_name = rule_inner.next().unwrap().as_str().to_string();
-            let args = rule_inner.map(parse_term).collect();
-            WhereClause::RuleExpr { rule_name, args }
+            let args = rule_inner.map(parse_term).collect::<Result<Vec<_>, _>>()?;
+            Ok(WhereClause::RuleExpr { rule_name, args })
         }
         Rule::fn_clause => {
             let mut fn_inner = inner.into_inner();
@@ -214,14 +241,16 @@ fn parse_where_elem(where_elem: pest::iterators::Pair<Rule>) -> WhereClause {
             let mut fn_expr_inner = fn_expr_pair.into_inner();
 
             let fn_name = fn_expr_inner.next().unwrap().as_str().to_string();
-            let args: Vec<Term> = fn_expr_inner.map(parse_term).collect();
+            let args: Vec<Term> = fn_expr_inner
+                .map(parse_term)
+                .collect::<Result<Vec<_>, _>>()?;
             let binding = fn_inner.next().map(parse_binding);
 
-            WhereClause::Function {
+            Ok(WhereClause::Function {
                 fn_name,
                 args,
                 binding,
-            }
+            })
         }
         Rule::or_clause | Rule::not_clause => {
             let is_or = inner.as_rule() == Rule::or_clause;
@@ -235,16 +264,16 @@ fn parse_where_elem(where_elem: pest::iterators::Pair<Rule>) -> WhereClause {
                         join_vars = Some(vars);
                     }
                     Rule::where_elem => {
-                        clauses.push(parse_where_elem(part));
+                        clauses.push(parse_where_elem(part)?);
                     }
                     _ => unreachable!(),
                 }
             }
 
             if is_or {
-                WhereClause::Or { join_vars, clauses }
+                Ok(WhereClause::Or { join_vars, clauses })
             } else {
-                WhereClause::Not { join_vars, clauses }
+                Ok(WhereClause::Not { join_vars, clauses })
             }
         }
         _ => unreachable!(),

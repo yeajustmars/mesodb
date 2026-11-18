@@ -1,0 +1,704 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>mesodb-bench::flight - Lena Project</title>
+  <link rel="stylesheet" href="..&#x2f;..&#x2f;assets/layout.css">
+  <link rel="stylesheet" href="..&#x2f;..&#x2f;assets/themes.css">
+  
+  <script src="..&#x2f;..&#x2f;assets/theme.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="..&#x2f;..&#x2f;assets/search_index.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <script>mermaid.initialize({ startOnLoad: true, theme: 'neutral' });</script>
+</head>
+<body>
+  
+  <div class="layout">
+    <nav class="sidebar">
+      <div class="sidebar-header">
+        <a href="..&#x2f;..&#x2f;index.html">Lena Project</a>
+        <span class="version">0.1.11</span>
+      </div>
+      <input type="text" id="search-box" placeholder="Search symbols (/) ..." autocomplete="off" />
+      <div id="search-results" class="search-popover hidden"></div>
+      <div class="theme-controls">
+        <select id="theme-selector">
+          <option value="grayscale">Grayscale</option>
+          <option value="navy">Navy</option>
+          <option value="green">Green</option>
+          <option value="poimandres">Poimandres</option>
+          <option value="gruvbox">Gruvbox</option>
+        </select>
+        <button id="mode-toggle" title="Toggle Light/Dark Mode">🌓</button>
+        <button id="toggle-nav-tree" title="Expand/Collapse All Folders">↕️</button>
+      </div>
+      <ul class="nav-tree">
+        
+        <li class="nav-language">
+          <span class="group-title">rust</span>
+          
+          <div class="nav-package">
+            <span class="pkg-title">mesodb-bench</span>
+            
+    <ul class="nav-modules">
+      
+        
+          
+          <li>
+            <details data-nav-id="rust-mesodb-bench-.">
+              <summary class="mod-group-title">.</summary>
+              
+    <ul class="nav-modules">
+      
+        
+          
+          <li>
+            <details data-nav-id="rust-mesodb-bench-.-mesodb-bench">
+              <summary class="mod-group-title">mesodb-bench</summary>
+              
+    <ul class="nav-modules">
+      
+        
+          
+          <li>
+            <details data-nav-id="rust-mesodb-bench-.-mesodb-bench-benches">
+              <summary class="mod-group-title">benches</summary>
+              
+    <ul class="nav-modules">
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-bench/mesodb-bench::compiler.html">compiler</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-bench/mesodb-bench::fast_path.html">fast_path</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-bench/mesodb-bench::flight.html">flight</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-bench/mesodb-bench::ingestion.html">ingestion</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-bench/mesodb-bench::query.html">query</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-bench/mesodb-bench::velocity_sentinel.html">velocity_sentinel</a>
+          </li>
+        
+      
+    </ul>
+  
+            </details>
+          </li>
+        
+      
+        
+          
+          <li>
+            <details data-nav-id="rust-mesodb-bench-.-mesodb-bench-tests">
+              <summary class="mod-group-title">tests</summary>
+              
+    <ul class="nav-modules">
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-bench/mesodb-bench::datalog_exhaustion.html">datalog_exhaustion</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-bench/mesodb-bench::disaster_recovery.html">disaster_recovery</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-bench/mesodb-bench::temporal_collisions.html">temporal_collisions</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-bench/mesodb-bench::volatile_shadowing.html">volatile_shadowing</a>
+          </li>
+        
+      
+    </ul>
+  
+            </details>
+          </li>
+        
+      
+    </ul>
+  
+            </details>
+          </li>
+        
+      
+    </ul>
+  
+            </details>
+          </li>
+        
+      
+    </ul>
+  
+          </div>
+          
+          <div class="nav-package">
+            <span class="pkg-title">mesodb-cli</span>
+            
+    <ul class="nav-modules">
+      
+        
+          
+          <li>
+            <details data-nav-id="rust-mesodb-cli-.">
+              <summary class="mod-group-title">.</summary>
+              
+    <ul class="nav-modules">
+      
+        
+          
+          <li>
+            <details data-nav-id="rust-mesodb-cli-.-mesodb-cli">
+              <summary class="mod-group-title">mesodb-cli</summary>
+              
+    <ul class="nav-modules">
+      
+        
+          
+          <li>
+            <details data-nav-id="rust-mesodb-cli-.-mesodb-cli-src">
+              <summary class="mod-group-title">src</summary>
+              
+    <ul class="nav-modules">
+      
+        
+          
+          <li>
+            <details data-nav-id="rust-mesodb-cli-.-mesodb-cli-src-commands">
+              <summary class="mod-group-title">commands</summary>
+              
+    <ul class="nav-modules">
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-cli/mesodb-cli::config.html">config</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-cli/mesodb-cli::query.html">query</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-cli/mesodb-cli::transact.html">transact</a>
+          </li>
+        
+      
+    </ul>
+  
+            </details>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-cli/mesodb-cli::edn.html">edn</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-cli/mesodb-cli::main.html">main</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-cli/mesodb-cli::repl.html">repl</a>
+          </li>
+        
+      
+        
+          
+          <li>
+            <details data-nav-id="rust-mesodb-cli-.-mesodb-cli-src-tutor">
+              <summary class="mod-group-title">tutor</summary>
+              
+    <ul class="nav-modules">
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-cli/mesodb-cli::hr_story.html">hr_story</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-cli/mesodb-cli::mod.html">mod</a>
+          </li>
+        
+      
+    </ul>
+  
+            </details>
+          </li>
+        
+      
+    </ul>
+  
+            </details>
+          </li>
+        
+      
+    </ul>
+  
+            </details>
+          </li>
+        
+      
+    </ul>
+  
+            </details>
+          </li>
+        
+      
+    </ul>
+  
+          </div>
+          
+          <div class="nav-package">
+            <span class="pkg-title">mesodb-core</span>
+            
+    <ul class="nav-modules">
+      
+        
+          
+          <li>
+            <details data-nav-id="rust-mesodb-core-.">
+              <summary class="mod-group-title">.</summary>
+              
+    <ul class="nav-modules">
+      
+        
+          
+          <li>
+            <details data-nav-id="rust-mesodb-core-.-mesodb-core">
+              <summary class="mod-group-title">mesodb-core</summary>
+              
+    <ul class="nav-modules">
+      
+        
+          
+          <li>
+            <details data-nav-id="rust-mesodb-core-.-mesodb-core-src">
+              <summary class="mod-group-title">src</summary>
+              
+    <ul class="nav-modules">
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-core/mesodb-core::ast.html">ast</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-core/mesodb-core::bitmap.html">bitmap</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-core/mesodb-core::btree.html">btree</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-core/mesodb-core::config.html">config</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-core/mesodb-core::datom.html">datom</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-core/mesodb-core::db.html">db</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-core/mesodb-core::edn.html">edn</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-core/mesodb-core::error.html">error</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-core/mesodb-core::formatter.html">formatter</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-core/mesodb-core::index.html">index</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-core/mesodb-core::lib.html">lib</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-core/mesodb-core::memtable.html">memtable</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-core/mesodb-core::page.html">page</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-core/mesodb-core::pager.html">pager</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-core/mesodb-core::parser.html">parser</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-core/mesodb-core::planner.html">planner</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-core/mesodb-core::pull.html">pull</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-core/mesodb-core::schema.html">schema</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-core/mesodb-core::storage.html">storage</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-core/mesodb-core::transactor.html">transactor</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-core/mesodb-core::types.html">types</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-core/mesodb-core::udf.html">udf</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-core/mesodb-core::wal.html">wal</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-core/mesodb-core::wire.html">wire</a>
+          </li>
+        
+      
+    </ul>
+  
+            </details>
+          </li>
+        
+      
+    </ul>
+  
+            </details>
+          </li>
+        
+      
+    </ul>
+  
+            </details>
+          </li>
+        
+      
+    </ul>
+  
+          </div>
+          
+          <div class="nav-package">
+            <span class="pkg-title">mesodb-doc</span>
+            
+    <ul class="nav-modules">
+      
+        
+          
+          <li>
+            <details data-nav-id="rust-mesodb-doc-.">
+              <summary class="mod-group-title">.</summary>
+              
+    <ul class="nav-modules">
+      
+        
+          
+          <li>
+            <details data-nav-id="rust-mesodb-doc-.-mesodb-doc">
+              <summary class="mod-group-title">mesodb-doc</summary>
+              
+    <ul class="nav-modules">
+      
+        
+          
+          <li>
+            <details data-nav-id="rust-mesodb-doc-.-mesodb-doc-src">
+              <summary class="mod-group-title">src</summary>
+              
+    <ul class="nav-modules">
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-doc/mesodb-doc::lib.html">lib</a>
+          </li>
+        
+      
+    </ul>
+  
+            </details>
+          </li>
+        
+      
+    </ul>
+  
+            </details>
+          </li>
+        
+      
+    </ul>
+  
+            </details>
+          </li>
+        
+      
+    </ul>
+  
+          </div>
+          
+          <div class="nav-package">
+            <span class="pkg-title">mesodb-server</span>
+            
+    <ul class="nav-modules">
+      
+        
+          
+          <li>
+            <details data-nav-id="rust-mesodb-server-.">
+              <summary class="mod-group-title">.</summary>
+              
+    <ul class="nav-modules">
+      
+        
+          
+          <li>
+            <details data-nav-id="rust-mesodb-server-.-mesodb-server">
+              <summary class="mod-group-title">mesodb-server</summary>
+              
+    <ul class="nav-modules">
+      
+        
+          
+          <li>
+            <details data-nav-id="rust-mesodb-server-.-mesodb-server-src">
+              <summary class="mod-group-title">src</summary>
+              
+    <ul class="nav-modules">
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-server/mesodb-server::dto.html">dto</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-server/mesodb-server::flight.html">flight</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-server/mesodb-server::handlers.html">handlers</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-server/mesodb-server::lib.html">lib</a>
+          </li>
+        
+      
+        
+          <li>
+            <a href="..&#x2f;..&#x2f;rust/mesodb-server/mesodb-server::main.html">main</a>
+          </li>
+        
+      
+    </ul>
+  
+            </details>
+          </li>
+        
+      
+    </ul>
+  
+            </details>
+          </li>
+        
+      
+    </ul>
+  
+            </details>
+          </li>
+        
+      
+    </ul>
+  
+          </div>
+          
+        </li>
+        
+      </ul>
+    </nav>
+    <main class="content">
+      
+  <h1>mesodb-bench::flight</h1>
+  <p class="file-path">Source: <code>.&#x2f;mesodb-bench&#x2f;benches&#x2f;flight.rs</code></p>
+  
+  <hr />
+  <section class="symbols">
+    
+      <div class="symbol-card" id="bench_flight_ipc">
+        <div class="symbol-header">
+          <span class="badge badge-fn">Function</span>
+          <h3 class="symbol-name">bench_flight_ipc</h3>
+          <span class="symbol-line">Line 1</span>
+        </div>
+        
+          <pre class="symbol-sig"><code>fn bench_flight_ipc(c: &amp;mut Criterion)</code></pre>
+        
+        
+        
+          <div class="neighborhood-graph">
+            <h4>Call Neighborhood</h4>
+            <pre class="mermaid">graph LR
+  classDef current fill:#2563eb,stroke:#1d4ed8,stroke-width:2px,color:#fff;
+  classDef neighbor fill:#f1f5f9,stroke:#cbd5e1,stroke-width:1px,color:#0f172a;
+  node_target[&quot;bench_flight_ipc&quot;]:::current
+  node_target --&gt; e_0[&quot;setup_bench_server&quot;]:::neighbor</pre>
+          </div>
+        
+      </div>
+    
+      <div class="symbol-card" id="setup_bench_server">
+        <div class="symbol-header">
+          <span class="badge badge-fn">Function</span>
+          <h3 class="symbol-name">setup_bench_server</h3>
+          <span class="symbol-line">Line 1</span>
+        </div>
+        
+          <pre class="symbol-sig"><code>fn setup_bench_server() -&gt; (
+    tokio::task::JoinHandle&lt;()&gt;,
+    FlightServiceClient&lt;Channel&gt;,
+    Arc&lt;MesoDb&gt;,
+)</code></pre>
+        
+        
+        
+          <div class="neighborhood-graph">
+            <h4>Call Neighborhood</h4>
+            <pre class="mermaid">graph LR
+  classDef current fill:#2563eb,stroke:#1d4ed8,stroke-width:2px,color:#fff;
+  classDef neighbor fill:#f1f5f9,stroke:#cbd5e1,stroke-width:1px,color:#0f172a;
+  node_target[&quot;setup_bench_server&quot;]:::current
+  c_0[&quot;bench_flight_ipc&quot;]:::neighbor --&gt; node_target</pre>
+          </div>
+        
+      </div>
+    
+      <div class="symbol-card" id="flight">
+        <div class="symbol-header">
+          <span class="badge badge-unknown">Unknown</span>
+          <h3 class="symbol-name">flight</h3>
+          
+        </div>
+        
+        
+        
+      </div>
+    
+  </section>
+
+    </main>
+  </div>
+  <script>window.ROOT_REL = "../../";</script>
+  <script src="..&#x2f;..&#x2f;assets/search.js"></script>
+</body>
+</html>

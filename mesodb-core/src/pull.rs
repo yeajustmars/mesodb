@@ -17,8 +17,7 @@ use crate::{
     ast::{PullAttribute, PullPattern},
     db::OutputFormat,
     error::MesoError,
-    schema::SchemaMap,
-    schema::ValueType,
+    schema::{Cardinality, SchemaMap, ValueType},
 };
 
 pub struct PullEngine<'a> {
@@ -30,7 +29,6 @@ pub struct PullEngine<'a> {
 
 type EntityMap = HashMap<u64, Map<String, JsonValue>>;
 
-// 2. Define the alias for the Pin<Box<dyn Future>>
 type PullEntitiesFuture<'b> =
     Pin<Box<dyn Future<Output = Result<EntityMap, MesoError>> + Send + 'b>>;
 
@@ -54,10 +52,7 @@ impl<'a> PullEngine<'a> {
         entity_ids: &[u64],
         pattern: &PullPattern,
     ) -> Result<ArrowStringArray, MesoError> {
-        // 1. Execute the batched fetch for all entities
         let mut doc_map = self.pull_entities(entity_ids, pattern).await?;
-
-        // 2. Format them back in the exact order they were requested
         let mut results = Vec::with_capacity(entity_ids.len());
 
         for &e in entity_ids {
@@ -77,7 +72,6 @@ impl<'a> PullEngine<'a> {
         Ok(ArrowStringArray::from(results))
     }
 
-    // The Recursive, BATCHED Graph Walker
     fn pull_entities<'b>(
         &'b self,
         e_ids: &'b [u64],
@@ -113,7 +107,6 @@ impl<'a> PullEngine<'a> {
 
             let mut all_batches = Vec::new();
 
-            // CHUNKING: Protect the SQL parser by executing in chunks of 1000 IDs
             for chunk in e_ids.chunks(1000) {
                 let in_list = chunk
                     .iter()
@@ -130,14 +123,12 @@ impl<'a> PullEngine<'a> {
                 all_batches.extend(batches);
             }
 
-            // Initialize the output map with empty docs so requested IDs always exist
             let mut docs: HashMap<u64, Map<String, JsonValue>> =
                 HashMap::with_capacity(e_ids.len());
             for &e in e_ids {
                 docs.insert(e, Map::new());
             }
 
-            // Track target IDs for recursive sub-queries
             let mut sub_fetches: HashMap<String, HashSet<u64>> = HashMap::new();
 
             for batch in all_batches {
@@ -209,7 +200,6 @@ impl<'a> PullEngine<'a> {
                         ValueType::Ref if ref_col.is_valid(i) => {
                             let target_e = ref_col.value(i);
                             if requested_maps.contains_key(ident) {
-                                // Add to our batched fetch list and place a temporary placeholder!
                                 sub_fetches
                                     .entry(ident.clone())
                                     .or_default()
@@ -223,29 +213,46 @@ impl<'a> PullEngine<'a> {
                     if json_val != JsonValue::Null {
                         let e = e_col.value(i);
                         if let Some(doc) = docs.get_mut(&e) {
-                            doc.insert(ident.clone(), json_val);
+                            if attr_meta.cardinality == Cardinality::Many {
+                                let arr = doc
+                                    .entry(ident.clone())
+                                    .or_insert_with(|| JsonValue::Array(Vec::new()));
+                                if let JsonValue::Array(items) = arr
+                                    && !items.contains(&json_val)
+                                {
+                                    items.push(json_val);
+                                }
+                            } else {
+                                doc.insert(ident.clone(), json_val);
+                            }
                         }
                     }
                 }
             }
 
-            // --- THE RECURSIVE BATCH RESOLUTION ---
             for (ident, target_set) in sub_fetches {
                 let target_vec: Vec<u64> = target_set.into_iter().collect();
                 let sub_pattern = requested_maps.get(&ident).unwrap();
-
-                // Fetch ALL sub-documents in one massive call
                 let sub_results = self.pull_entities(&target_vec, sub_pattern).await?;
 
-                // Patch the parent documents with the retrieved JSON objects
                 for doc in docs.values_mut() {
-                    if let Some(val) = doc.get_mut(&ident)
-                        && let Some(target_e_num) = val.as_u64()
-                    {
-                        if let Some(sub_doc) = sub_results.get(&target_e_num) {
-                            *val = JsonValue::Object(sub_doc.clone());
-                        } else {
-                            *val = JsonValue::Object(Map::new()); // Empty object if target doesn't exist
+                    if let Some(val) = doc.get_mut(&ident) {
+                        if let Some(target_e_num) = val.as_u64() {
+                            if let Some(sub_doc) = sub_results.get(&target_e_num) {
+                                *val = JsonValue::Object(sub_doc.clone());
+                            } else {
+                                *val = JsonValue::Object(Map::new());
+                            }
+                        } else if let Some(arr) = val.as_array_mut() {
+                            for item in arr.iter_mut() {
+                                if let Some(target_e_num) = item.as_u64() {
+                                    if let Some(sub_doc) = sub_results.get(&target_e_num) {
+                                        *item = JsonValue::Object(sub_doc.clone());
+                                    } else {
+                                        *item = JsonValue::Object(Map::new());
+                                    }
+                                }
+                            }
                         }
                     }
                 }

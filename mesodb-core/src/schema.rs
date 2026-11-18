@@ -18,12 +18,20 @@ pub enum ValueType {
     Uuid,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Archive, Serialize, Deserialize)]
+pub enum Cardinality {
+    #[default]
+    One,
+    Many,
+}
+
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
 pub struct Attribute {
     pub id: AttributeId,
     pub ident: String,
     pub value_type: ValueType,
     pub is_unique: bool,
+    pub cardinality: Cardinality,
 }
 
 #[derive(Debug, Clone, Archive, Serialize, Deserialize)]
@@ -38,7 +46,7 @@ pub enum SchemaMutation {
 #[derive(Debug, Clone)]
 pub struct SchemaTimeline {
     versions: BTreeMap<u64, Arc<SchemaMap>>,
-    time_index: BTreeMap<i64, u64>, // NEW: Maps Timestamp -> TxId
+    time_index: BTreeMap<i64, u64>,
     latest_tx: u64,
 }
 
@@ -48,7 +56,7 @@ impl Default for SchemaTimeline {
         versions.insert(0, Arc::new(SchemaMap::new()));
 
         let mut time_index = BTreeMap::new();
-        time_index.insert(0, 0); // Genesis time
+        time_index.insert(0, 0);
 
         Self {
             versions,
@@ -121,6 +129,16 @@ impl SchemaMap {
         value_type: ValueType,
         is_unique: bool,
     ) -> Arc<Attribute> {
+        self.add_attribute_with_cardinality(ident, value_type, is_unique, Cardinality::One)
+    }
+
+    pub fn add_attribute_with_cardinality(
+        &mut self,
+        ident: &str,
+        value_type: ValueType,
+        is_unique: bool,
+        cardinality: Cardinality,
+    ) -> Arc<Attribute> {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -129,6 +147,7 @@ impl SchemaMap {
             ident: ident.to_string(),
             value_type,
             is_unique,
+            cardinality,
         });
 
         self.by_ident.insert(ident.to_string(), attr.clone());
@@ -151,6 +170,17 @@ impl SchemaMap {
 
     pub fn contains_ident(&self, ident: &str) -> bool {
         self.by_ident.contains_key(ident)
+    }
+
+    pub fn many_attribute_ids(&self) -> Vec<AttributeId> {
+        let mut ids: Vec<AttributeId> = self
+            .by_id
+            .values()
+            .filter(|attr| attr.cardinality == Cardinality::Many)
+            .map(|attr| attr.id)
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 
     pub fn validate_value(&self, ident: &str, value: &Value) -> Result<()> {
@@ -198,6 +228,7 @@ mod tests {
         assert_eq!(email_attr.id, 100);
         assert_eq!(email_attr.ident, ":user/email");
         assert!(email_attr.is_unique);
+        assert_eq!(email_attr.cardinality, Cardinality::One);
 
         let age_attr = schema.add_attribute(":user/age", ValueType::Int64, false);
         assert_eq!(age_attr.id, 101);
@@ -215,21 +246,16 @@ mod tests {
         let mut schema = SchemaMap::new();
         schema.add_attribute(":user/age", ValueType::Int64, false);
 
-        // Valid
         assert!(
             schema
                 .validate_value(":user/age", &Value::Int64(30))
                 .is_ok()
         );
-
-        // Invalid Type
         assert!(
             schema
                 .validate_value(":user/age", &Value::String("30".into()))
                 .is_err()
         );
-
-        // Missing Attribute
         assert!(
             schema
                 .validate_value(":user/ghost", &Value::Int64(30))
@@ -249,27 +275,20 @@ mod tests {
 
     #[test]
     fn test_schema_timeline_time_travel() {
-        let mut timeline = SchemaTimeline::new(); // Implicitly creates Tx 0 at T 0
+        let mut timeline = SchemaTimeline::new();
 
-        // Schema V1 at T = 1000
         let mut schema1 = SchemaMap::new();
         schema1.add_attribute(":v1/attr", ValueType::String, false);
         timeline.append_version(1, 1000, schema1);
 
-        // Schema V2 at T = 2000
         let mut schema2 = SchemaMap::new();
         schema2.add_attribute(":v2/attr", ValueType::Int64, false);
         timeline.append_version(2, 2000, schema2);
 
-        // 1. Exact matches
         assert_eq!(timeline.tx_for_timestamp(1000), 1);
         assert_eq!(timeline.tx_for_timestamp(2000), 2);
-
-        // 2. In-between times (Should floor to the highest Tx <= Timestamp)
         assert_eq!(timeline.tx_for_timestamp(1500), 1);
         assert_eq!(timeline.tx_for_timestamp(2999), 2);
-
-        // 3. Before genesis
         assert_eq!(timeline.tx_for_timestamp(500), 0);
     }
 }

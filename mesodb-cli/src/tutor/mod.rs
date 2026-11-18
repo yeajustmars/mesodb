@@ -121,6 +121,7 @@ impl TutorSession {
                 history: input.contains("history"), // Basic history detection
                 as_of: None,
                 rules: None,
+                inputs: Vec::new(),
             };
 
             // FIX: Use query_native so we can easily iterate the rows!
